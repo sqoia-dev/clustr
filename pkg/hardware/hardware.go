@@ -23,12 +23,13 @@ type DMIInfo struct {
 
 // SystemInfo is the complete hardware profile for a node.
 type SystemInfo struct {
-	Hostname string
-	CPUs     []CPU
-	Memory   MemoryInfo
-	Disks    []Disk
-	NICs     []NIC
-	DMI      DMIInfo
+	Hostname  string
+	CPUs      []CPU
+	Memory    MemoryInfo
+	Disks     []Disk
+	NICs      []NIC
+	DMI       DMIInfo
+	IBDevices []IBDevice
 }
 
 // Discover runs all hardware discovery routines and returns a consolidated
@@ -65,6 +66,11 @@ func Discover() (*SystemInfo, error) {
 	dmi, err := DiscoverDMI()
 	if err == nil {
 		info.DMI = *dmi
+	}
+
+	ibDevices, err := DiscoverIBDevices()
+	if err == nil {
+		info.IBDevices = ibDevices
 	}
 
 	return info, nil
