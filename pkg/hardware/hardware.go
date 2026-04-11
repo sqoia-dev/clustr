@@ -30,6 +30,7 @@ type SystemInfo struct {
 	NICs      []NIC
 	DMI       DMIInfo
 	IBDevices []IBDevice
+	MDArrays  []MDArray
 }
 
 // Discover runs all hardware discovery routines and returns a consolidated
@@ -71,6 +72,11 @@ func Discover() (*SystemInfo, error) {
 	ibDevices, err := DiscoverIBDevices()
 	if err == nil {
 		info.IBDevices = ibDevices
+	}
+
+	mdArrays, err := DiscoverMDArrays()
+	if err == nil {
+		info.MDArrays = mdArrays
 	}
 
 	return info, nil
