@@ -7,43 +7,42 @@ import (
 	"os"
 )
 
-// Config holds the full runtime configuration for clonr components.
-type Config struct {
-	Server   ServerConfig `json:"server"`
-	Storage  StorageConfig `json:"storage"`
-	Log      LogConfig    `json:"log"`
-}
-
-// ServerConfig controls the clonr-serverd HTTP listener.
+// ServerConfig holds all runtime configuration for clonr-serverd.
+// Values can be loaded from a JSON file or from environment variables.
 type ServerConfig struct {
-	Addr string `json:"addr"` // default ":8080"
+	ListenAddr string `json:"listen_addr"` // default ":8080"
+	ImageDir   string `json:"image_dir"`   // default "/var/lib/clonr/images"
+	DBPath     string `json:"db_path"`     // default "/var/lib/clonr/clonr.db"
+	AuthToken  string `json:"auth_token"`  // from CLONR_AUTH_TOKEN; empty = auth disabled
+	LogLevel   string `json:"log_level"`   // debug, info, warn, error — default "info"
 }
 
-// StorageConfig controls where images and the metadata database are stored.
-type StorageConfig struct {
-	ImageDir string `json:"image_dir"` // default /var/lib/clonr/images
-	DBPath   string `json:"db_path"`   // default /var/lib/clonr/clonr.db
+// Config holds the full runtime configuration for clonr components.
+// Kept for JSON-file based loading compatibility.
+type Config struct {
+	Server ServerConfig `json:"server"`
 }
 
-// LogConfig controls structured logging output.
-type LogConfig struct {
-	Level  string `json:"level"`  // debug, info, warn, error
-	Format string `json:"format"` // json, console
+// LoadServerConfig populates ServerConfig from environment variables with
+// sensible production defaults. Environment variables take precedence over defaults.
+func LoadServerConfig() ServerConfig {
+	return ServerConfig{
+		ListenAddr: envOrDefault("CLONR_LISTEN_ADDR", ":8080"),
+		ImageDir:   envOrDefault("CLONR_IMAGE_DIR", "/var/lib/clonr/images"),
+		DBPath:     envOrDefault("CLONR_DB_PATH", "/var/lib/clonr/clonr.db"),
+		AuthToken:  os.Getenv("CLONR_AUTH_TOKEN"),
+		LogLevel:   envOrDefault("CLONR_LOG_LEVEL", "info"),
+	}
 }
 
 // Default returns a Config with sensible production defaults.
 func Default() *Config {
 	return &Config{
 		Server: ServerConfig{
-			Addr: ":8080",
-		},
-		Storage: StorageConfig{
-			ImageDir: "/var/lib/clonr/images",
-			DBPath:   "/var/lib/clonr/clonr.db",
-		},
-		Log: LogConfig{
-			Level:  "info",
-			Format: "json",
+			ListenAddr: ":8080",
+			ImageDir:   "/var/lib/clonr/images",
+			DBPath:     "/var/lib/clonr/clonr.db",
+			LogLevel:   "info",
 		},
 	}
 }
@@ -61,4 +60,11 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}
 	return cfg, nil
+}
+
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
