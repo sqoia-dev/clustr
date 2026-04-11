@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/sqoia-dev/clonr/pkg/api"
+	"github.com/sqoia-dev/clonr/pkg/chroot"
 	"github.com/sqoia-dev/clonr/pkg/client"
 	"github.com/sqoia-dev/clonr/pkg/config"
 	"github.com/sqoia-dev/clonr/pkg/deploy"
@@ -66,6 +68,7 @@ func init() {
 		newImageListCmd(),
 		newImageDetailsCmd(),
 		newImagePullCmd(),
+		newImageImportISOCmd(),
 	)
 	rootCmd.AddCommand(imageCmd)
 
@@ -100,6 +103,7 @@ func init() {
 	rootCmd.AddCommand(newDeployCmd())
 	rootCmd.AddCommand(newFixEFIBootCmd())
 	rootCmd.AddCommand(newLogsCmd())
+	rootCmd.AddCommand(newShellCmd())
 }
 
 // clientFromFlags builds an API client resolving server/token from flags then env.
@@ -364,6 +368,7 @@ func newDeployCmd() *cobra.Command {
 		flagDisk      string
 		flagMountRoot string
 		flagFixEFI    bool
+		flagAuto      bool
 	)
 
 	cmd := &cobra.Command{
@@ -376,8 +381,17 @@ func newDeployCmd() *cobra.Command {
   4. Preflight: validate disk size and architecture
   5. Deploy: download and write the image
   6. Finalize: apply hostname, network, SSH keys
-  7. Fix EFI boot entries (if --fix-efi is set)`,
+  7. Fix EFI boot entries (if --fix-efi is set)
+
+With --auto: discovers hardware, registers with the server, and waits for an
+admin to assign a base image before proceeding with deployment. Intended for
+PXE-booted nodes running from initramfs.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// --auto mode: register with server, wait for image assignment, then deploy.
+			if flagAuto {
+				return runAutoDeployMode()
+			}
+
 			if flagImage == "" {
 				return fmt.Errorf("--image is required")
 			}
@@ -543,12 +557,199 @@ func newDeployCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&flagImage, "image", "", "Image ID to deploy (required)")
+	cmd.Flags().StringVar(&flagImage, "image", "", "Image ID to deploy (required without --auto)")
 	cmd.Flags().StringVar(&flagDisk, "disk", "", "Target block device, e.g. /dev/nvme0n1 (auto-detected if omitted)")
 	cmd.Flags().StringVar(&flagMountRoot, "mount-root", "", "Temporary mount point directory (auto-created if omitted)")
 	cmd.Flags().BoolVar(&flagFixEFI, "fix-efi", false, "Repair EFI boot entries after deployment")
+	cmd.Flags().BoolVar(&flagAuto, "auto", false,
+		"Auto mode: register with server, wait for image assignment, then deploy (for PXE-booted nodes)")
 
 	return cmd
+}
+
+// runAutoDeployMode implements deploy --auto.
+// It discovers hardware, registers the node with the server, then waits until
+// an admin assigns a base image, at which point it proceeds with full deployment.
+func runAutoDeployMode() error {
+	ctx := context.Background()
+	c := clientFromFlags()
+
+	// Step 1: Discover hardware.
+	fmt.Fprintln(os.Stderr, "[auto] Discovering hardware...")
+	hw, err := hardware.Discover()
+	if err != nil {
+		return fmt.Errorf("hardware discovery: %w", err)
+	}
+
+	primaryMAC := primaryMACFromHW(hw)
+	if primaryMAC == "" {
+		return fmt.Errorf("no usable NIC found — cannot register node")
+	}
+
+	// Set up remote log writer once we have the MAC.
+	remoteWriter := client.NewRemoteLogWriter(c, primaryMAC, hw.Hostname, client.WithComponent("deploy"))
+	defer remoteWriter.Close()
+	multi := zerolog.MultiLevelWriter(zerolog.ConsoleWriter{Out: os.Stderr}, remoteWriter)
+	deployLog := zerolog.New(multi).With().Timestamp().Logger()
+
+	deployLog.Info().Str("mac", primaryMAC).Str("hostname", hw.Hostname).
+		Msg("hardware discovered, registering with server")
+
+	// Step 2: Register with the server (upsert).
+	hwJSON, err := json.Marshal(hw)
+	if err != nil {
+		return fmt.Errorf("marshal hardware profile: %w", err)
+	}
+
+	fmt.Fprintln(os.Stderr, "[auto] Registering with server...")
+	regResp, err := c.RegisterNode(ctx, api.RegisterRequest{HardwareProfile: hwJSON})
+	if err != nil {
+		return fmt.Errorf("register node: %w", err)
+	}
+
+	deployLog.Info().
+		Str("action", regResp.Action).
+		Str("node_id", regResp.NodeConfig.ID).
+		Msg("registered with server")
+
+	// Step 3: Act on server directive.
+	switch regResp.Action {
+	case "deploy":
+		fmt.Fprintln(os.Stderr, "[auto] Image assigned — proceeding with deployment")
+		return runAutoDeployImage(ctx, c, *regResp.NodeConfig, deployLog)
+
+	case "wait":
+		fmt.Fprintln(os.Stderr, "[auto] Waiting for admin to assign an image (polling every 30s)...")
+		deployLog.Info().Msg("entering wait loop — assign an image via the clonr UI or API")
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-sleepCtx(ctx, 30*time.Second):
+			}
+
+			nodeCfg, err := c.GetNodeConfigByMAC(ctx, primaryMAC)
+			if err != nil {
+				deployLog.Warn().Err(err).Msg("poll failed, retrying")
+				continue
+			}
+			if nodeCfg.BaseImageID != "" {
+				deployLog.Info().Str("image_id", nodeCfg.BaseImageID).Msg("image assigned, starting deployment")
+				fmt.Fprintln(os.Stderr, "[auto] Image assigned — proceeding with deployment")
+				return runAutoDeployImage(ctx, c, *nodeCfg, deployLog)
+			}
+			deployLog.Debug().Msg("no image assigned yet, still waiting")
+		}
+
+	case "capture":
+		fmt.Fprintln(os.Stderr, "[auto] Capture mode not yet implemented")
+		deployLog.Info().Msg("capture action received — not yet implemented")
+		return nil
+
+	default:
+		return fmt.Errorf("unknown action from server: %s", regResp.Action)
+	}
+}
+
+// sleepCtx returns a channel that closes after d, or immediately if ctx is done.
+func sleepCtx(ctx context.Context, d time.Duration) <-chan struct{} {
+	ch := make(chan struct{})
+	go func() {
+		defer close(ch)
+		select {
+		case <-ctx.Done():
+		case <-time.After(d):
+		}
+	}()
+	return ch
+}
+
+// runAutoDeployImage performs the full deployment given a NodeConfig with an assigned image.
+// The node config must have BaseImageID set.
+func runAutoDeployImage(ctx context.Context, c *client.Client, nodeCfg api.NodeConfig, deployLog zerolog.Logger) error {
+	cfg := config.LoadClientConfig()
+	if flagServer != "" {
+		cfg.ServerURL = flagServer
+	}
+
+	// Fetch image details.
+	img, err := c.GetImage(ctx, nodeCfg.BaseImageID)
+	if err != nil {
+		return fmt.Errorf("fetch image %s: %w", nodeCfg.BaseImageID, err)
+	}
+	if img.Status != api.ImageStatusReady {
+		return fmt.Errorf("image %s is not ready (status: %s)", img.ID, img.Status)
+	}
+
+	deployLog.Info().Str("image", img.Name).Str("version", img.Version).
+		Str("format", string(img.Format)).Msg("image details fetched")
+
+	// Resolve hardware for preflight.
+	hw, err := hardware.Discover()
+	if err != nil {
+		return fmt.Errorf("hardware discovery for preflight: %w", err)
+	}
+
+	mountRoot, err := os.MkdirTemp("", "clonr-auto-deploy-*")
+	if err != nil {
+		return fmt.Errorf("create temp mount root: %w", err)
+	}
+	defer os.RemoveAll(mountRoot)
+
+	var deployer deploy.Deployer
+	switch img.Format {
+	case api.ImageFormatBlock:
+		deployer = &deploy.BlockDeployer{}
+	default:
+		deployer = &deploy.FilesystemDeployer{}
+	}
+
+	deployLog.Info().Msg("running preflight checks")
+	if err := deployer.Preflight(ctx, img.DiskLayout, *hw); err != nil {
+		return fmt.Errorf("preflight: %w", err)
+	}
+
+	blobURL := cfg.ServerURL + "/api/v1/images/" + img.ID + "/blob"
+	deployLog.Info().Str("url", blobURL).Msg("starting image write")
+
+	opts := deploy.DeployOpts{
+		ImageURL:   blobURL,
+		AuthToken:  cfg.AuthToken,
+		TargetDisk: "", // auto-detect
+		Format:     string(img.Format),
+		MountRoot:  mountRoot,
+	}
+
+	progressFn := func(written, total int64, phase string) {
+		if total > 0 {
+			pct := float64(written) / float64(total) * 100
+			fmt.Fprintf(os.Stderr, "\r    %s: %.1f%% (%s / %s)",
+				phase, pct, humanBytes(written), humanBytes(total))
+		} else {
+			fmt.Fprintf(os.Stderr, "\r    %s: %s written", phase, humanBytes(written))
+		}
+	}
+
+	start := time.Now()
+	if err := deployer.Deploy(ctx, opts, progressFn); err != nil {
+		fmt.Fprintln(os.Stderr)
+		return fmt.Errorf("deploy: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "\n    Image written in %s\n", time.Since(start).Round(time.Second))
+
+	deployLog.Info().Msg("applying node configuration")
+	if err := deployer.Finalize(ctx, nodeCfg, mountRoot); err != nil {
+		return fmt.Errorf("finalize: %w", err)
+	}
+
+	deployLog.Info().Str("hostname", nodeCfg.Hostname).Str("duration",
+		time.Since(start).Round(time.Second).String()).Msg("auto-deployment complete")
+
+	fmt.Printf("\n[auto] Deployment complete.\n")
+	fmt.Printf("  Node:     %s\n", nodeCfg.Hostname)
+	fmt.Printf("  Image:    %s %s\n", img.Name, img.Version)
+	fmt.Printf("  Duration: %s\n", time.Since(start).Round(time.Second))
+	return nil
 }
 
 // ─── fix-efiboot ─────────────────────────────────────────────────────────────
@@ -984,4 +1185,127 @@ func primaryMACFromHW(hw *hardware.SystemInfo) string {
 		return nic.MAC
 	}
 	return ""
+}
+
+// ─── image import-iso ────────────────────────────────────────────────────────
+
+// newImageImportISOCmd creates "clonr image import-iso <path>".
+// It passes the absolute ISO path to the server via POST /api/v1/factory/import-path.
+// This requires the CLI and server share a filesystem (same host or NFS mount).
+func newImageImportISOCmd() *cobra.Command {
+	var (
+		flagName    string
+		flagVersion string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "import-iso <path>",
+		Short: "Import an ISO image into the server's image store",
+		Long: `import-iso passes a server-local ISO path to clonr-serverd, which mounts
+the ISO, extracts the root filesystem, and creates a new BaseImage.
+
+The ISO file must be accessible from the server process (same host or shared
+mount). The command returns immediately; poll with "clonr image details <id>".`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			isoPath := args[0]
+			if flagName == "" {
+				base := filepath.Base(isoPath)
+				flagName = strings.TrimSuffix(base, filepath.Ext(base))
+			}
+
+			absPath, err := filepath.Abs(isoPath)
+			if err != nil {
+				return fmt.Errorf("resolve path: %w", err)
+			}
+
+			ctx := context.Background()
+			c := clientFromFlags()
+
+			fmt.Fprintf(os.Stderr, "Importing ISO %s as %q...\n", absPath, flagName)
+			img, err := c.ImportISOPath(ctx, absPath, flagName, flagVersion)
+			if err != nil {
+				return fmt.Errorf("import iso: %w", err)
+			}
+
+			fmt.Printf("ISO import initiated:\n")
+			fmt.Printf("  ID:     %s\n", img.ID)
+			fmt.Printf("  Name:   %s\n", img.Name)
+			fmt.Printf("  Status: %s\n", img.Status)
+			fmt.Printf("\nPoll status with: clonr image details %s\n", img.ID)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&flagName, "name", "", "Image name (default: ISO filename without extension)")
+	cmd.Flags().StringVar(&flagVersion, "version", "1.0.0", "Image version")
+	return cmd
+}
+
+// ─── shell ───────────────────────────────────────────────────────────────────
+
+// newShellCmd creates "clonr shell <image-id>".
+//
+// Flow (local path — CLI on same host as server):
+//  1. Verify image is ready/building.
+//  2. Open a server-side session (triggers vfs mounts on the server).
+//  3. Create a local chroot.Session against the returned rootfs path.
+//  4. Drop into an interactive shell (stdin/stdout/stderr attached).
+//  5. Close the server-side session on exit (unmounts vfs).
+func newShellCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "shell <image-id>",
+		Short: "Open an interactive chroot shell inside an image",
+		Long: `shell drops you into an interactive bash shell inside the specified image's
+root filesystem. The image must have status "ready" or "building".
+
+The chroot mounts /proc, /sys, /dev, /dev/pts, and /run before dropping you
+into the shell. All mounts are cleaned up on exit.
+
+NOTE: Requires root privileges and that the CLI runs on the same host as
+clonr-serverd (rootfs is accessed directly via local filesystem path).`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			imageID := args[0]
+			ctx := context.Background()
+			c := clientFromFlags()
+
+			img, err := c.GetImage(ctx, imageID)
+			if err != nil {
+				return fmt.Errorf("get image: %w", err)
+			}
+			if img.Status != api.ImageStatusReady && img.Status != api.ImageStatusBuilding {
+				return fmt.Errorf("image %s has status %q — must be ready or building", img.ID, img.Status)
+			}
+			fmt.Fprintf(os.Stderr, "Opening shell in image: %s %s (%s)\n", img.Name, img.Version, img.ID)
+
+			// Open a server-side session to trigger vfs mounts.
+			sess, err := c.OpenShellSession(ctx, imageID)
+			if err != nil {
+				return fmt.Errorf("open shell session: %w", err)
+			}
+			defer func() {
+				if closeErr := c.CloseShellSession(context.Background(), imageID, sess.SessionID); closeErr != nil {
+					fmt.Fprintf(os.Stderr, "warning: close session: %v\n", closeErr)
+				}
+			}()
+
+			// Create a local chroot.Session using the server's rootfs path.
+			// Skip Enter() — the server-side session owns the mounts.
+			localSess, err := chroot.NewSession(sess.RootDir)
+			if err != nil {
+				return fmt.Errorf("create local chroot: %w", err)
+			}
+			defer func() { _ = localSess.Close() }()
+
+			fmt.Fprintf(os.Stderr, "Entering chroot at %s\n", sess.RootDir)
+			fmt.Fprintf(os.Stderr, "Type 'exit' to leave the chroot.\n")
+
+			if err := localSess.Shell(); err != nil {
+				fmt.Fprintf(os.Stderr, "shell exited: %v\n", err)
+			}
+			return nil
+		},
+	}
+	return cmd
 }

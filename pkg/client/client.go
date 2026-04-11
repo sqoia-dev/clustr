@@ -116,6 +116,69 @@ func (c *Client) DownloadBlob(ctx context.Context, imageID string, w io.Writer) 
 	return nil
 }
 
+// ImportISOPath instructs the server to import an ISO from a server-local path.
+func (c *Client) ImportISOPath(ctx context.Context, path, name, version string) (*api.BaseImage, error) {
+	body := struct {
+		Path    string `json:"path"`
+		Name    string `json:"name"`
+		Version string `json:"version"`
+	}{Path: path, Name: name, Version: version}
+	var img api.BaseImage
+	if err := c.post(ctx, "/api/v1/factory/import-path", body, &img); err != nil {
+		return nil, err
+	}
+	return &img, nil
+}
+
+// CaptureNode instructs the server to capture a node's filesystem into a new image.
+func (c *Client) CaptureNode(ctx context.Context, req api.CaptureRequest) (*api.BaseImage, error) {
+	var img api.BaseImage
+	if err := c.post(ctx, "/api/v1/factory/capture", req, &img); err != nil {
+		return nil, err
+	}
+	return &img, nil
+}
+
+// OpenShellSession creates a server-side chroot session for imageID.
+func (c *Client) OpenShellSession(ctx context.Context, imageID string) (*api.ShellSessionResponse, error) {
+	var sess api.ShellSessionResponse
+	if err := c.post(ctx, "/api/v1/images/"+imageID+"/shell-session", nil, &sess); err != nil {
+		return nil, err
+	}
+	return &sess, nil
+}
+
+// CloseShellSession closes a server-side chroot session.
+func (c *Client) CloseShellSession(ctx context.Context, imageID, sessionID string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete,
+		c.BaseURL+"/api/v1/images/"+imageID+"/shell-session/"+sessionID, nil)
+	if err != nil {
+		return fmt.Errorf("client: build request: %w", err)
+	}
+	c.setHeaders(req)
+	return c.do(req, nil)
+}
+
+// ExecInSession runs a command inside a server-side chroot session.
+func (c *Client) ExecInSession(ctx context.Context, imageID, sessionID, command string, args []string) (*api.ExecResponse, error) {
+	req := api.ExecRequest{Command: command, Args: args}
+	var resp api.ExecResponse
+	if err := c.post(ctx, "/api/v1/images/"+imageID+"/shell-session/"+sessionID+"/exec", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// RegisterNode calls POST /api/v1/nodes/register with the given hardware profile JSON.
+// Used by clonr in --auto mode on PXE boot to register itself with the server.
+func (c *Client) RegisterNode(ctx context.Context, req api.RegisterRequest) (*api.RegisterResponse, error) {
+	var resp api.RegisterResponse
+	if err := c.post(ctx, "/api/v1/nodes/register", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // Health checks the server's health endpoint.
 func (c *Client) Health(ctx context.Context) (*api.HealthResponse, error) {
 	var h api.HealthResponse
