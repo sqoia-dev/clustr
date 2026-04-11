@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/sqoia-dev/clonr/pkg/api"
@@ -121,6 +123,47 @@ func (c *Client) Health(ctx context.Context) (*api.HealthResponse, error) {
 		return nil, err
 	}
 	return &h, nil
+}
+
+// SendLogs ships a batch of log entries to POST /api/v1/logs.
+func (c *Client) SendLogs(ctx context.Context, entries []api.LogEntry) error {
+	return c.post(ctx, "/api/v1/logs", entries, nil)
+}
+
+// QueryLogs retrieves historical log entries matching the given filter.
+func (c *Client) QueryLogs(ctx context.Context, filter api.LogFilter) ([]api.LogEntry, error) {
+	var resp api.ListLogsResponse
+	if err := c.get(ctx, buildLogsPath("/api/v1/logs", filter), &resp); err != nil {
+		return nil, err
+	}
+	return resp.Logs, nil
+}
+
+// buildLogsPath constructs a query-string path for log endpoints from a filter.
+func buildLogsPath(base string, filter api.LogFilter) string {
+	q := url.Values{}
+	if filter.NodeMAC != "" {
+		q.Set("mac", filter.NodeMAC)
+	}
+	if filter.Hostname != "" {
+		q.Set("hostname", filter.Hostname)
+	}
+	if filter.Level != "" {
+		q.Set("level", filter.Level)
+	}
+	if filter.Component != "" {
+		q.Set("component", filter.Component)
+	}
+	if filter.Since != nil {
+		q.Set("since", filter.Since.Format(time.RFC3339))
+	}
+	if filter.Limit > 0 {
+		q.Set("limit", strconv.Itoa(filter.Limit))
+	}
+	if len(q) == 0 {
+		return base
+	}
+	return base + "?" + q.Encode()
 }
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
