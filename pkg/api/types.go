@@ -28,16 +28,40 @@ const (
 // DiskLayout describes the partition schema expected on a target node.
 // It is part of BaseImage — never per-node.
 type DiskLayout struct {
-	Partitions   []PartitionSpec `json:"partitions"`
-	Bootloader   Bootloader      `json:"bootloader"`
+	// RAIDArrays defines software RAID arrays to create before partitioning.
+	// Arrays are created first; PartitionSpec.Device may reference an array name
+	// (e.g. "md0") to partition on top of a RAID array instead of a raw disk.
+	RAIDArrays  []RAIDSpec      `json:"raid_arrays,omitempty"`
+	Partitions  []PartitionSpec `json:"partitions"`
+	Bootloader  Bootloader      `json:"bootloader"`
 	// TargetDevice is an optional operator hint specifying the preferred kernel
 	// device name (e.g. "nvme0n1") to deploy to. When set, selectTargetDisk
 	// will prefer this device over automatic selection heuristics.
 	TargetDevice string          `json:"target_device,omitempty"`
 }
 
+// RAIDSpec describes a software RAID array to create during deployment.
+type RAIDSpec struct {
+	// Name is the md device name, e.g. "md0".
+	Name    string   `json:"name"`
+	// Level is the RAID level: "raid0", "raid1", "raid5", "raid6", "raid10".
+	Level   string   `json:"level"`
+	// Members lists the member devices by kernel name (e.g. "sda", "sdb") or
+	// by size-based selector (e.g. "smallest-2" = the two smallest disks).
+	Members []string `json:"members"`
+	// ChunkKB is the chunk size in KiB. When 0, mdadm picks the default for
+	// the RAID level (typically 512K for raid0/5/6/10, unused for raid1).
+	ChunkKB int      `json:"chunk_kb,omitempty"`
+	// Spare is the number of hot spare devices to include in the array.
+	Spare   int      `json:"spare,omitempty"`
+}
+
 // PartitionSpec describes a single partition within a DiskLayout.
 type PartitionSpec struct {
+	// Device is the target block device for this partition. If empty, the
+	// deployer uses the automatically selected target disk. If set to an md
+	// device name (e.g. "md0"), the partition is created on that RAID array.
+	Device     string   `json:"device,omitempty"`
 	Label      string   `json:"label"`
 	SizeBytes  int64    `json:"size_bytes"`  // 0 = fill remaining
 	Filesystem string   `json:"filesystem"`  // "xfs", "ext4", "vfat", "swap"

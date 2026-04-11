@@ -39,6 +39,13 @@ func (d *FilesystemDeployer) Deploy(ctx context.Context, opts DeployOpts, progre
 		return fmt.Errorf("deploy: Preflight must be called before Deploy")
 	}
 
+	// Create RAID arrays before partitioning, if any are specified.
+	if len(d.layout.RAIDArrays) > 0 {
+		if err := CreateRAIDArrays(ctx, d.layout, hardware.SystemInfo{}); err != nil {
+			return fmt.Errorf("deploy: create raid arrays: %w", err)
+		}
+	}
+
 	// Partition the disk.
 	if err := d.partitionDisk(ctx, opts.TargetDisk); err != nil {
 		return fmt.Errorf("deploy: partition disk: %w", err)
@@ -67,7 +74,21 @@ func (d *FilesystemDeployer) Deploy(ctx context.Context, opts DeployOpts, progre
 
 // Finalize applies node-specific identity to the deployed filesystem.
 func (d *FilesystemDeployer) Finalize(ctx context.Context, cfg api.NodeConfig, mountRoot string) error {
-	return applyNodeConfig(ctx, cfg, mountRoot)
+	if err := applyNodeConfig(ctx, cfg, mountRoot); err != nil {
+		return err
+	}
+
+	// If the layout includes RAID arrays, write mdadm.conf and update initramfs
+	// so the deployed system can reassemble its arrays on next boot.
+	if len(d.layout.RAIDArrays) > 0 {
+		if err := GenerateMdadmConf(ctx, mountRoot); err != nil {
+			// Non-fatal: log and continue. The node may still boot if the kernel
+			// auto-assembles the RAID arrays via superblock scanning.
+			_ = fmt.Errorf("deploy: generate mdadm.conf (non-fatal): %w", err)
+		}
+	}
+
+	return nil
 }
 
 // partitionDisk wipes and repartitions the disk according to the layout.
