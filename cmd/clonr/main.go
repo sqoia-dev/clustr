@@ -18,6 +18,7 @@ import (
 	"github.com/sqoia-dev/clonr/pkg/config"
 	"github.com/sqoia-dev/clonr/pkg/deploy"
 	"github.com/sqoia-dev/clonr/pkg/hardware"
+	"github.com/sqoia-dev/clonr/pkg/ipmi"
 )
 
 var version = "dev"
@@ -69,6 +70,20 @@ func init() {
 		newNodeConfigCmd(),
 	)
 	rootCmd.AddCommand(nodeCmd)
+
+	// ipmi subcommand group.
+	ipmiCmd := &cobra.Command{
+		Use:   "ipmi",
+		Short: "IPMI / BMC management",
+	}
+	ipmiCmd.AddCommand(
+		newIPMIStatusCmd(),
+		newIPMIPowerCmd(),
+		newIPMIConfigureCmd(),
+		newIPMIPXECmd(),
+		newIPMISensorsCmd(),
+	)
+	rootCmd.AddCommand(ipmiCmd)
 
 	// Top-level commands.
 	rootCmd.AddCommand(hardwareCmd)
@@ -530,6 +545,223 @@ pointing to the ESP partition, and sets it as the first boot target.`,
 	cmd.Flags().StringVar(&flagLabel, "label", "Linux", "Boot menu label")
 	cmd.Flags().StringVar(&flagLoader, "loader", `\EFI\rocky\grubx64.efi`, "EFI loader path relative to ESP")
 
+	return cmd
+}
+
+// ─── ipmi ────────────────────────────────────────────────────────────────────
+
+// ipmiClientFromFlags builds an ipmi.Client from the standard remote flags.
+// If host is empty, the client targets the local BMC.
+func ipmiClientFromFlags(host, user, pass string) *ipmi.Client {
+	return &ipmi.Client{
+		Host:     host,
+		Username: user,
+		Password: pass,
+	}
+}
+
+// newIPMIStatusCmd shows the local BMC network config and power state.
+func newIPMIStatusCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "status",
+		Short: "Show local BMC network config and power status",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := context.Background()
+			c := ipmiClientFromFlags("", "", "")
+
+			cfg, err := c.GetBMCConfig(ctx)
+			if err != nil {
+				return fmt.Errorf("get bmc config: %w", err)
+			}
+
+			fmt.Printf("BMC Network (channel %d):\n", cfg.Channel)
+			fmt.Printf("  IP Address : %s\n", cfg.IPAddress)
+			fmt.Printf("  Netmask    : %s\n", cfg.Netmask)
+			fmt.Printf("  Gateway    : %s\n", cfg.Gateway)
+			fmt.Printf("  IP Source  : %s\n", cfg.IPSource)
+
+			users, err := c.GetBMCUsers(ctx)
+			if err == nil && len(users) > 0 {
+				fmt.Printf("\nBMC Users:\n")
+				w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+				fmt.Fprintln(w, "  ID\tUSERNAME\tACCESS")
+				for _, u := range users {
+					fmt.Fprintf(w, "  %d\t%s\t%s\n", u.ID, u.Username, u.Access)
+				}
+				_ = w.Flush()
+			}
+			return nil
+		},
+	}
+}
+
+// newIPMIPowerCmd controls power on a remote node via its BMC.
+func newIPMIPowerCmd() *cobra.Command {
+	var flagHost, flagUser, flagPass string
+
+	cmd := &cobra.Command{
+		Use:   "power [on|off|cycle|reset]",
+		Short: "Control power on a node via IPMI",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			action := strings.ToLower(args[0])
+			ctx := context.Background()
+			c := ipmiClientFromFlags(flagHost, flagUser, flagPass)
+
+			switch action {
+			case "on":
+				if err := c.PowerOn(ctx); err != nil {
+					return err
+				}
+				fmt.Println("Power on command sent.")
+			case "off":
+				if err := c.PowerOff(ctx); err != nil {
+					return err
+				}
+				fmt.Println("Power off command sent.")
+			case "cycle":
+				if err := c.PowerCycle(ctx); err != nil {
+					return err
+				}
+				fmt.Println("Power cycle command sent.")
+			case "reset":
+				if err := c.PowerReset(ctx); err != nil {
+					return err
+				}
+				fmt.Println("Power reset command sent.")
+			case "status":
+				status, err := c.PowerStatus(ctx)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("Power: %s\n", status)
+			default:
+				return fmt.Errorf("unknown power action %q — use on, off, cycle, reset, or status", action)
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&flagHost, "host", "", "BMC IP address (required for remote)")
+	cmd.Flags().StringVar(&flagUser, "user", "", "BMC username")
+	cmd.Flags().StringVar(&flagPass, "pass", "", "BMC password")
+	return cmd
+}
+
+// newIPMIConfigureCmd configures the local BMC network interface.
+func newIPMIConfigureCmd() *cobra.Command {
+	var flagIP, flagNetmask, flagGateway string
+
+	cmd := &cobra.Command{
+		Use:   "configure",
+		Short: "Configure local BMC network (static IP)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if flagIP == "" {
+				return fmt.Errorf("--ip is required")
+			}
+			if flagNetmask == "" {
+				return fmt.Errorf("--netmask is required")
+			}
+			if flagGateway == "" {
+				return fmt.Errorf("--gateway is required")
+			}
+
+			ctx := context.Background()
+			c := ipmiClientFromFlags("", "", "")
+
+			cfg := ipmi.BMCConfig{
+				Channel:   1,
+				IPAddress: flagIP,
+				Netmask:   flagNetmask,
+				Gateway:   flagGateway,
+				IPSource:  "static",
+			}
+			if err := c.SetBMCNetwork(ctx, cfg); err != nil {
+				return fmt.Errorf("configure bmc: %w", err)
+			}
+			fmt.Printf("BMC network configured:\n")
+			fmt.Printf("  IP      : %s\n", flagIP)
+			fmt.Printf("  Netmask : %s\n", flagNetmask)
+			fmt.Printf("  Gateway : %s\n", flagGateway)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&flagIP, "ip", "", "Static IP address for the BMC (required)")
+	cmd.Flags().StringVar(&flagNetmask, "netmask", "", "Subnet mask (required)")
+	cmd.Flags().StringVar(&flagGateway, "gateway", "", "Default gateway (required)")
+	return cmd
+}
+
+// newIPMIPXECmd sets next boot to PXE and power cycles the target node.
+func newIPMIPXECmd() *cobra.Command {
+	var flagHost, flagUser, flagPass string
+
+	cmd := &cobra.Command{
+		Use:   "pxe",
+		Short: "Set next boot to PXE and power cycle the node",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if flagHost == "" {
+				return fmt.Errorf("--host is required")
+			}
+
+			ctx := context.Background()
+			c := ipmiClientFromFlags(flagHost, flagUser, flagPass)
+
+			fmt.Fprintf(os.Stderr, "Setting next boot to PXE on %s...\n", flagHost)
+			if err := c.SetBootPXE(ctx); err != nil {
+				return fmt.Errorf("set boot pxe: %w", err)
+			}
+
+			fmt.Fprintf(os.Stderr, "Power cycling...\n")
+			if err := c.PowerCycle(ctx); err != nil {
+				return fmt.Errorf("power cycle: %w", err)
+			}
+
+			fmt.Printf("Node %s will boot via PXE.\n", flagHost)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&flagHost, "host", "", "BMC IP address (required)")
+	cmd.Flags().StringVar(&flagUser, "user", "", "BMC username")
+	cmd.Flags().StringVar(&flagPass, "pass", "", "BMC password")
+	return cmd
+}
+
+// newIPMISensorsCmd displays sensor readings from a remote BMC.
+func newIPMISensorsCmd() *cobra.Command {
+	var flagHost, flagUser, flagPass string
+
+	cmd := &cobra.Command{
+		Use:   "sensors",
+		Short: "Show IPMI sensor readings",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := context.Background()
+			c := ipmiClientFromFlags(flagHost, flagUser, flagPass)
+
+			sensors, err := c.GetSensorData(ctx)
+			if err != nil {
+				return fmt.Errorf("get sensors: %w", err)
+			}
+
+			if len(sensors) == 0 {
+				fmt.Println("No sensor data available.")
+				return nil
+			}
+
+			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+			fmt.Fprintln(w, "SENSOR\tVALUE\tUNITS\tSTATUS")
+			for _, s := range sensors {
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", s.Name, s.Value, s.Units, s.Status)
+			}
+			return w.Flush()
+		},
+	}
+
+	cmd.Flags().StringVar(&flagHost, "host", "", "BMC IP address (local BMC if omitted)")
+	cmd.Flags().StringVar(&flagUser, "user", "", "BMC username")
+	cmd.Flags().StringVar(&flagPass, "pass", "", "BMC password")
 	return cmd
 }
 
