@@ -5,6 +5,7 @@ package image
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -506,30 +508,87 @@ func rsyncDir(ctx context.Context, src, dst string) error {
 }
 
 // checksumDir walks the rootfs directory, accumulates the total size, and
-// returns a sha256 hash computed over all regular file contents in path order.
+// returns a deterministic sha256 hash over the tree.
+//
+// Determinism is achieved by:
+//  1. Collecting all entries during the walk (filepath.Walk order is not canonical).
+//  2. Sorting paths lexicographically.
+//  3. For each entry in sorted order, hashing: the relative path (as bytes),
+//     the file size as a little-endian int64, and for regular files the full
+//     file content. Symlink targets are hashed as their target path string
+//     (symlinks are not followed).
+//
+// This produces the same checksum regardless of filesystem ordering, so the
+// same rootfs content always yields the same hash even after a repack.
 func checksumDir(root string) (sizeBytes int64, checksum string, err error) {
-	h := sha256.New()
-	err = filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	type entry struct {
+		relPath string
+		info    os.FileInfo
+		absPath string
+	}
+
+	var entries []entry
+
+	walkErr := filepath.Walk(root, func(path string, info os.FileInfo, werr error) error {
+		if werr != nil {
+			return werr
 		}
-		if !info.Mode().IsRegular() {
-			return nil
-		}
-		sizeBytes += info.Size()
-		f, err := os.Open(path)
+		rel, err := filepath.Rel(root, path)
 		if err != nil {
 			return err
 		}
-		defer f.Close()
-		if _, err := io.Copy(h, f); err != nil {
-			return err
+		if rel == "." {
+			return nil // skip the root itself
 		}
+		entries = append(entries, entry{relPath: rel, info: info, absPath: path})
 		return nil
 	})
-	if err != nil {
-		return 0, "", fmt.Errorf("walk rootfs: %w", err)
+	if walkErr != nil {
+		return 0, "", fmt.Errorf("walk rootfs: %w", walkErr)
 	}
+
+	// Sort lexicographically by relative path for a canonical ordering.
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].relPath < entries[j].relPath
+	})
+
+	h := sha256.New()
+	sizeBuf := make([]byte, 8)
+
+	for _, e := range entries {
+		// Hash the relative path.
+		_, _ = h.Write([]byte(e.relPath))
+
+		mode := e.info.Mode()
+
+		switch {
+		case mode.IsRegular():
+			sizeBytes += e.info.Size()
+			// Hash the file size (little-endian int64) then the file content.
+			binary.LittleEndian.PutUint64(sizeBuf, uint64(e.info.Size()))
+			_, _ = h.Write(sizeBuf)
+
+			f, err := os.Open(e.absPath)
+			if err != nil {
+				return 0, "", fmt.Errorf("open %s: %w", e.relPath, err)
+			}
+			if _, err := io.Copy(h, f); err != nil {
+				f.Close()
+				return 0, "", fmt.Errorf("read %s: %w", e.relPath, err)
+			}
+			f.Close()
+
+		case mode&os.ModeSymlink != 0:
+			// Hash the symlink target path — do not follow the link.
+			target, err := os.Readlink(e.absPath)
+			if err != nil {
+				return 0, "", fmt.Errorf("readlink %s: %w", e.relPath, err)
+			}
+			_, _ = h.Write([]byte(target))
+		}
+		// Directories and other special files contribute only their path to the hash.
+	}
+
 	return sizeBytes, hex.EncodeToString(h.Sum(nil)), nil
 }
 
