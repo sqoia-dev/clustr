@@ -18,6 +18,7 @@ import (
 type Server struct {
 	cfg    config.ServerConfig
 	db     *db.DB
+	broker *LogBroker
 	router chi.Router
 	http   *http.Server
 }
@@ -25,8 +26,9 @@ type Server struct {
 // New creates a Server wired with the given config and database.
 func New(cfg config.ServerConfig, database *db.DB) *Server {
 	s := &Server{
-		cfg: cfg,
-		db:  database,
+		cfg:    cfg,
+		db:     database,
+		broker: NewLogBroker(),
 	}
 	s.router = s.buildRouter()
 	s.http = &http.Server{
@@ -55,6 +57,7 @@ func (s *Server) buildRouter() chi.Router {
 	images := &handlers.ImagesHandler{DB: s.db, ImageDir: s.cfg.ImageDir}
 	nodes := &handlers.NodesHandler{DB: s.db}
 	factory := &handlers.FactoryHandler{DB: s.db, ImageDir: s.cfg.ImageDir}
+	logs := &handlers.LogsHandler{DB: s.db, Broker: s.broker}
 
 	r.Route("/api/v1", func(r chi.Router) {
 		// Health
@@ -81,6 +84,11 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/nodes/{id}", nodes.GetNode)
 		r.Put("/nodes/{id}", nodes.UpdateNode)
 		r.Delete("/nodes/{id}", nodes.DeleteNode)
+
+		// Logs — stream must be registered before plain /logs to avoid ambiguity.
+		r.Get("/logs/stream", logs.StreamLogs)
+		r.Get("/logs", logs.QueryLogs)
+		r.Post("/logs", logs.IngestLogs)
 	})
 
 	return r
