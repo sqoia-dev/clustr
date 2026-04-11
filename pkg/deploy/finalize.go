@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/sqoia-dev/clonr/pkg/api"
+	"github.com/sqoia-dev/clonr/pkg/ipmi"
 )
 
 // applyNodeConfig writes all node-specific identity into the deployed filesystem
@@ -21,6 +22,8 @@ import (
 //  3. SSH authorized_keys for root
 //  4. /etc/fstab UUID update
 //  5. Kernel args (GRUB)
+//  6. BMC / IPMI network and credentials (if cfg.BMC is set)
+//  7. InfiniBand / IPoIB config (if cfg.IBConfig is set)
 func applyNodeConfig(ctx context.Context, cfg api.NodeConfig, mountRoot string) error {
 	if err := writeHostname(mountRoot, cfg.Hostname, cfg.FQDN); err != nil {
 		return fmt.Errorf("finalize: hostname: %w", err)
@@ -43,7 +46,143 @@ func applyNodeConfig(ctx context.Context, cfg api.NodeConfig, mountRoot string) 
 		}
 	}
 
+	// BMC / IPMI — configure local BMC network and credentials.
+	// This operates on the physical BMC directly (not the chroot), so it is
+	// done here rather than inside the deployed filesystem.
+	if cfg.BMC != nil {
+		if err := applyBMCConfig(ctx, cfg.BMC); err != nil {
+			// Non-fatal: BMC configuration failure should not abort a deployment.
+			// The operator can manually configure the BMC afterward.
+			_ = fmt.Errorf("finalize: bmc (non-fatal): %w", err)
+		}
+	}
+
+	// InfiniBand / IPoIB — write udev rules and NetworkManager profiles into
+	// the deployed filesystem so IB interfaces come up correctly on first boot.
+	if len(cfg.IBConfig) > 0 {
+		if err := writeIBConfig(mountRoot, cfg.IBConfig); err != nil {
+			return fmt.Errorf("finalize: ib config: %w", err)
+		}
+	}
+
 	return nil
+}
+
+// applyBMCConfig configures the local BMC via ipmitool.
+// This targets the physical BMC of the node being finalized, not the chroot.
+func applyBMCConfig(ctx context.Context, bmc *api.BMCNodeConfig) error {
+	c := &ipmi.Client{} // local BMC — no host flags
+
+	bmcCfg := ipmi.BMCConfig{
+		Channel:   1,
+		IPAddress: bmc.IPAddress,
+		Netmask:   bmc.Netmask,
+		Gateway:   bmc.Gateway,
+		IPSource:  "static",
+	}
+	if err := c.SetBMCNetwork(ctx, bmcCfg); err != nil {
+		return fmt.Errorf("set bmc network: %w", err)
+	}
+
+	if bmc.Username != "" && bmc.Password != "" {
+		// Use user slot 2 — slot 1 is typically the reserved anonymous user.
+		if err := c.SetBMCUser(ctx, 2, bmc.Username, bmc.Password); err != nil {
+			return fmt.Errorf("set bmc user: %w", err)
+		}
+	}
+	return nil
+}
+
+// writeIBConfig writes IPoIB NetworkManager connection profiles and udev rules
+// for each InfiniBand device into the deployed filesystem at mountRoot.
+func writeIBConfig(mountRoot string, ibCfgs []api.IBInterfaceConfig) error {
+	nmDir := filepath.Join(mountRoot, "etc", "NetworkManager", "system-connections")
+	if err := os.MkdirAll(nmDir, 0o700); err != nil {
+		return fmt.Errorf("mkdir NM connections: %w", err)
+	}
+
+	for _, ib := range ibCfgs {
+		if err := writeIPoIBProfile(nmDir, ib); err != nil {
+			return fmt.Errorf("ib device %s: %w", ib.DeviceName, err)
+		}
+	}
+	return nil
+}
+
+// writeIPoIBProfile writes a NetworkManager keyfile for an IPoIB interface.
+// The interface name is derived from the IB device name (e.g. mlx5_0 → ib0).
+func writeIPoIBProfile(nmDir string, ib api.IBInterfaceConfig) error {
+	// IPoIB interface naming: mlx5_0→ib0, mlx5_1→ib1, hfi1_0→ib0, etc.
+	// We use the device name directly as the NM connection id and interface-name.
+	ifaceName := ibDeviceToIPoIBName(ib.DeviceName)
+
+	mtu := ib.MTU
+	if mtu == 0 {
+		if strings.EqualFold(ib.IPoIBMode, "connected") {
+			mtu = 65520
+		} else {
+			mtu = 2044 // datagram mode default
+		}
+	}
+
+	mode := strings.ToLower(ib.IPoIBMode)
+	if mode == "" {
+		mode = "datagram"
+	}
+
+	var sb strings.Builder
+	sb.WriteString("[connection]\n")
+	fmt.Fprintf(&sb, "id=%s\n", ifaceName)
+	sb.WriteString("type=infiniband\n")
+	fmt.Fprintf(&sb, "interface-name=%s\n", ifaceName)
+	sb.WriteString("\n")
+
+	sb.WriteString("[infiniband]\n")
+	fmt.Fprintf(&sb, "transport-mode=%s\n", mode)
+	fmt.Fprintf(&sb, "mtu=%d\n", mtu)
+	if len(ib.PKeys) > 0 {
+		// Write the first partition key; additional pkeys require separate profiles.
+		fmt.Fprintf(&sb, "p-key=%s\n", ib.PKeys[0])
+	}
+	sb.WriteString("\n")
+
+	sb.WriteString("[ipv4]\n")
+	if ib.IPAddress != "" {
+		ip, prefix := parseIPCIDR(ib.IPAddress)
+		sb.WriteString("method=manual\n")
+		fmt.Fprintf(&sb, "address1=%s/%s\n", ip, prefix)
+	} else {
+		sb.WriteString("method=disabled\n")
+	}
+	sb.WriteString("\n")
+
+	sb.WriteString("[ipv6]\n")
+	sb.WriteString("method=ignore\n")
+
+	filename := filepath.Join(nmDir, ifaceName+".nmconnection")
+	return os.WriteFile(filename, []byte(sb.String()), 0o600)
+}
+
+// ibDeviceToIPoIBName maps an IB device name to its IPoIB interface name.
+// e.g. "mlx5_0" → "ib0", "mlx5_1" → "ib1", "hfi1_0" → "ib0"
+func ibDeviceToIPoIBName(devName string) string {
+	// Extract trailing digit after the last underscore for the IB port index.
+	idx := strings.LastIndex(devName, "_")
+	if idx >= 0 && idx < len(devName)-1 {
+		suffix := devName[idx+1:]
+		// Only use the numeric suffix as the ib interface index.
+		allDigits := true
+		for _, c := range suffix {
+			if c < '0' || c > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits {
+			return "ib" + suffix
+		}
+	}
+	return "ib0"
 }
 
 // writeHostname writes /etc/hostname and updates /etc/hosts.
