@@ -84,6 +84,7 @@ const API = {
     },
     factory: {
         pull(body)            { return API.post('/factory/pull', body); },
+        importISO(body)       { return API.post('/factory/import-iso', body); },
     },
     health: {
         get()                 { return API.get('/health'); },

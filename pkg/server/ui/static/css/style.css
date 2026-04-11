@@ -307,6 +307,18 @@ td.dim {
     border: 1px solid rgba(160, 160, 160, 0.2);
 }
 
+.badge-deployed {
+    background: rgba(0, 230, 118, 0.15);
+    color: var(--success);
+    border: 1px solid rgba(0, 230, 118, 0.3);
+}
+
+.badge-warning {
+    background: rgba(255, 214, 0, 0.12);
+    color: var(--warning);
+    border: 1px solid rgba(255, 214, 0, 0.3);
+}
+
 /* ─── Buttons ────────────────────────────────────────────────────────────── */
 
 .btn {
@@ -757,6 +769,12 @@ td.dim {
     background: rgba(0, 230, 118, 0.1);
     border: 1px solid rgba(0, 230, 118, 0.3);
     color: var(--success);
+}
+
+.alert-info {
+    background: rgba(64, 196, 255, 0.1);
+    border: 1px solid rgba(64, 196, 255, 0.3);
+    color: var(--info);
 }
 
 /* ─── Page title row ─────────────────────────────────────────────────────── */
