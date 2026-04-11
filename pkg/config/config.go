@@ -37,6 +37,10 @@ type PXEConfig struct {
 	// TFTPDir is where TFTP-served boot files (ipxe.efi, undionly.kpxe)
 	// live (CLONR_TFTP_DIR). Default: "/var/lib/clonr/tftpboot".
 	TFTPDir string `json:"tftp_dir"`
+	// HTTPPort is the port the clonr-serverd HTTP API listens on, used by the
+	// DHCP server when building the iPXE chainload URL. Populated at runtime
+	// from ListenAddr — not a user-facing config field.
+	HTTPPort string `json:"-"`
 }
 
 // Config holds the full runtime configuration for clonr components.

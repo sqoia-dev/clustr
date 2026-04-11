@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -78,6 +79,14 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// Graceful shutdown on SIGINT / SIGTERM.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Inject the HTTP port into PXEConfig so the DHCP server can build correct
+	// iPXE chainload URLs without hardcoding port 8080.
+	if _, port, err := net.SplitHostPort(cfg.ListenAddr); err == nil {
+		cfg.PXE.HTTPPort = port
+	} else {
+		cfg.PXE.HTTPPort = "8080" // safe fallback
+	}
 
 	// Start PXE server if enabled.
 	if cfg.PXE.Enabled {

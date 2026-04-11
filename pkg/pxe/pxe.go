@@ -35,7 +35,11 @@ func New(cfg config.PXEConfig) (*Server, error) {
 		return nil, fmt.Errorf("pxe: create boot dir %s: %w", cfg.BootDir, err)
 	}
 
-	dhcp, err := newDHCPServer(cfg.Interface, net.ParseIP(serverIP), cfg.IPRange)
+	httpPort := cfg.HTTPPort
+	if httpPort == "" {
+		httpPort = "8080"
+	}
+	dhcp, err := newDHCPServer(cfg.Interface, net.ParseIP(serverIP), cfg.IPRange, httpPort)
 	if err != nil {
 		return nil, fmt.Errorf("pxe: init dhcp server: %w", err)
 	}

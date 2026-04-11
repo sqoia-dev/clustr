@@ -24,11 +24,12 @@ type leaseEntry struct {
 
 // DHCPServer is a lightweight DHCP server that only responds to PXE clients.
 type DHCPServer struct {
-	iface    string
-	serverIP net.IP
+	iface      string
+	serverIP   net.IP
 	rangeStart net.IP
 	rangeEnd   net.IP
 	leaseDur   time.Duration
+	httpPort   string // port of the clonr-serverd HTTP API (for iPXE chainload URL)
 
 	mu     sync.Mutex
 	leases map[string]leaseEntry // keyed by MAC string
@@ -38,7 +39,7 @@ type DHCPServer struct {
 }
 
 // newDHCPServer creates a DHCPServer from config. It does not start listening.
-func newDHCPServer(iface string, serverIP net.IP, ipRange string) (*DHCPServer, error) {
+func newDHCPServer(iface string, serverIP net.IP, ipRange string, httpPort string) (*DHCPServer, error) {
 	start, end, err := parseIPRange(ipRange)
 	if err != nil {
 		return nil, fmt.Errorf("pxe/dhcp: parse ip range: %w", err)
@@ -55,6 +56,7 @@ func newDHCPServer(iface string, serverIP net.IP, ipRange string) (*DHCPServer, 
 		rangeStart: start,
 		rangeEnd:   end,
 		leaseDur:   24 * time.Hour,
+		httpPort:   httpPort,
 		leases:     make(map[string]leaseEntry),
 		pool:       pool,
 	}, nil
@@ -119,9 +121,13 @@ func (d *DHCPServer) handleDHCP(conn net.PacketConn, peer net.Addr, req *dhcpv4.
 }
 
 func (d *DHCPServer) handleDiscover(conn net.PacketConn, peer net.Addr, req *dhcpv4.DHCPv4, isIPXE bool) {
-	ip := d.acquireOrAssignIP(req.ClientHWAddr.String())
+	mac := req.ClientHWAddr.String()
+	vendorClass := req.ClassIdentifier()
+	userClass := string(req.Options.Get(dhcpv4.OptionUserClassInformation))
+
+	ip := d.acquireOrAssignIP(mac)
 	if ip == nil {
-		log.Warn().Str("mac", req.ClientHWAddr.String()).Msg("DHCP pool exhausted")
+		log.Warn().Str("mac", mac).Msg("DHCP pool exhausted")
 		return
 	}
 
@@ -132,6 +138,15 @@ func (d *DHCPServer) handleDiscover(conn net.PacketConn, peer net.Addr, req *dhc
 	}
 	resp.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeOffer))
 	d.populateBootOptions(resp, req, ip, isIPXE)
+
+	bootFile := bootFilename(req, isIPXE, d.serverIP, d.httpPort)
+	log.Info().
+		Str("mac", mac).
+		Str("vendor_class", vendorClass).
+		Str("user_class", userClass).
+		Str("assigned_ip", ip.String()).
+		Str("boot_filename", bootFile).
+		Msg("DHCP DISCOVER")
 
 	if _, err := conn.WriteTo(resp.ToBytes(), peer); err != nil {
 		log.Error().Err(err).Msg("DHCP: send offer")
@@ -174,7 +189,7 @@ func (d *DHCPServer) populateBootOptions(resp *dhcpv4.DHCPv4, req *dhcpv4.DHCPv4
 	// Next-server (siaddr) always points to self.
 	resp.ServerIPAddr = d.serverIP
 
-	bootFile := bootFilename(req, isIPXE, d.serverIP)
+	bootFile := bootFilename(req, isIPXE, d.serverIP, d.httpPort)
 	if bootFile != "" {
 		resp.BootFileName = bootFile
 	}
@@ -183,10 +198,10 @@ func (d *DHCPServer) populateBootOptions(resp *dhcpv4.DHCPv4, req *dhcpv4.DHCPv4
 // bootFilename selects the appropriate boot file based on client architecture.
 // Arch type is carried in DHCP option 93 (ClientSystemArchitectureType).
 // If the client is already running iPXE, return the HTTP URL to the boot script.
-func bootFilename(req *dhcpv4.DHCPv4, isIPXE bool, serverIP net.IP) string {
+func bootFilename(req *dhcpv4.DHCPv4, isIPXE bool, serverIP net.IP, httpPort string) string {
 	if isIPXE {
 		// Already chainloaded into iPXE — give it the boot script URL.
-		return fmt.Sprintf("http://%s:8080/api/v1/boot/ipxe", serverIP)
+		return fmt.Sprintf("http://%s:%s/api/v1/boot/ipxe", serverIP, httpPort)
 	}
 
 	// Read option 93 — client system architecture.

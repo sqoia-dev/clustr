@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -61,10 +62,19 @@ func (s *Server) buildRouter() chi.Router {
 	// so that the embedded web UI at / and /ui/* is always accessible.
 
 	// Derive public server URL from listen addr for boot script generation.
-	serverURL := "http://" + s.cfg.PXE.ServerIP + s.cfg.ListenAddr
-	if s.cfg.PXE.ServerIP == "" {
+	// Use net.SplitHostPort to extract only the port from ListenAddr (which may
+	// be "0.0.0.0:8080"), then combine it with the PXE ServerIP.
+	_, port, splitErr := net.SplitHostPort(s.cfg.ListenAddr)
+	if splitErr != nil {
+		// ListenAddr had no port component — fall back to the raw value.
+		port = s.cfg.ListenAddr
+	}
+	var serverURL string
+	if s.cfg.PXE.ServerIP != "" {
+		serverURL = "http://" + s.cfg.PXE.ServerIP + ":" + port
+	} else {
 		// Fallback: use localhost when PXE is not configured.
-		serverURL = "http://localhost" + s.cfg.ListenAddr
+		serverURL = "http://localhost:" + port
 	}
 
 	// Handler instances.
