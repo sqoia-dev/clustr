@@ -77,21 +77,44 @@ type InterfaceConfig struct {
 	Bond       string   `json:"bond,omitempty"`
 }
 
+// BMCNodeConfig holds IPMI/BMC network and credential configuration applied
+// during node finalization. The password field is write-only — it is applied
+// on the node itself and is never returned by the API.
+type BMCNodeConfig struct {
+	IPAddress string `json:"ip_address"`
+	Netmask   string `json:"netmask"`
+	Gateway   string `json:"gateway"`
+	Username  string `json:"username"`
+	Password  string `json:"password"` // applied during finalize, never returned by API
+}
+
+// IBInterfaceConfig holds per-device InfiniBand / IPoIB configuration applied
+// during node finalization.
+type IBInterfaceConfig struct {
+	DeviceName string   `json:"device_name"`        // e.g. "mlx5_0"
+	PKeys      []string `json:"pkeys"`              // partition keys, e.g. ["0x8001"]
+	IPoIBMode  string   `json:"ipoib_mode"`         // "connected" or "datagram"
+	IPAddress  string   `json:"ip_address,omitempty"` // IPoIB IP in CIDR notation
+	MTU        int      `json:"mtu,omitempty"`      // typically 65520 for connected mode
+}
+
 // NodeConfig holds everything that makes a deployed image specific to one
 // physical node. Applied at deploy time — never baked into the BaseImage blob.
 type NodeConfig struct {
-	ID          string            `json:"id"`
-	Hostname    string            `json:"hostname"`
-	FQDN        string            `json:"fqdn"`
-	PrimaryMAC  string            `json:"primary_mac"`
-	Interfaces  []InterfaceConfig `json:"interfaces"`
-	SSHKeys     []string          `json:"ssh_keys"`
-	KernelArgs  string            `json:"kernel_args"`
-	Groups      []string          `json:"groups"`
-	CustomVars  map[string]string `json:"custom_vars"`
-	BaseImageID string            `json:"base_image_id"`
-	CreatedAt   time.Time         `json:"created_at"`
-	UpdatedAt   time.Time         `json:"updated_at"`
+	ID          string              `json:"id"`
+	Hostname    string              `json:"hostname"`
+	FQDN        string              `json:"fqdn"`
+	PrimaryMAC  string              `json:"primary_mac"`
+	Interfaces  []InterfaceConfig   `json:"interfaces"`
+	SSHKeys     []string            `json:"ssh_keys"`
+	KernelArgs  string              `json:"kernel_args"`
+	Groups      []string            `json:"groups"`
+	CustomVars  map[string]string   `json:"custom_vars"`
+	BaseImageID string              `json:"base_image_id"`
+	BMC         *BMCNodeConfig      `json:"bmc,omitempty"`
+	IBConfig    []IBInterfaceConfig `json:"ib_config,omitempty"`
+	CreatedAt   time.Time           `json:"created_at"`
+	UpdatedAt   time.Time           `json:"updated_at"`
 }
 
 // --- Request types ---
