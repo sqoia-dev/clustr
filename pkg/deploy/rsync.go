@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/sqoia-dev/clonr/pkg/api"
@@ -306,21 +307,67 @@ func (d *FilesystemDeployer) partitionDisk(ctx context.Context, disk string) err
 	return nil
 }
 
-// ensurePartitionNodes uses partx to explicitly add partition device nodes to /dev.
-// partx is the util-linux tool that tells the kernel about partitions found in
-// a partition table — it's more reliable than partprobe in initramfs environments
-// and explicitly creates /dev/sdaN nodes via BLKPG ioctl.
+// ensurePartitionNodes attempts multiple strategies to create partition device
+// nodes in /dev after sgdisk. In a minimal initramfs without udevd, the kernel
+// fires uevents for new partitions but nothing processes them unless mdev is
+// registered as the hotplug handler. We try three strategies in order:
+//
+//  1. partx --add  — BLKPG ioctl: tells the kernel to re-read the partition
+//     table and update /dev. Most reliable when util-linux is present.
+//  2. mdev -s      — rescans sysfs and creates nodes for all discovered devices.
+//  3. mknod        — last resort: directly create block device nodes using
+//     major/minor numbers read from /sys/class/block/<name>/dev.
 func ensurePartitionNodes(disk string, count int) {
 	log.Printf("deploy: running partx to force partition node creation on %s", disk)
-	// partx --add adds partition nodes to /dev.
 	cmd := exec.Command("partx", "--add", disk)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		log.Printf("deploy: partx --add %s: %v\noutput: %s", disk, err, string(out))
 	} else {
 		log.Printf("deploy: partx --add succeeded on %s", disk)
 	}
-	// Also try kpartx as a fallback (device-mapper based, commonly available).
-	_ = exec.Command("kpartx", "-a", disk).Run()
+
+	// Re-run mdev -s to pick up any new sysfs entries for the partitions.
+	if out, err := exec.Command("mdev", "-s").CombinedOutput(); err != nil {
+		log.Printf("deploy: mdev -s after partx: %v (output: %s)", err, string(out))
+	} else {
+		log.Printf("deploy: mdev -s ran after partx")
+	}
+
+	// Last resort: create nodes directly from sysfs major:minor data.
+	diskBase := filepath.Base(disk)
+	for num := 1; num <= count; num++ {
+		devPath := partitionDevice(disk, num)
+		if _, err := os.Stat(devPath); err == nil {
+			continue // already exists
+		}
+		// sysfs exposes the partition's major:minor at
+		// /sys/class/block/<disk><num>/dev (e.g. /sys/class/block/sda1/dev)
+		partName := fmt.Sprintf("%s%d", diskBase, num)
+		sysDevPath := fmt.Sprintf("/sys/class/block/%s/dev", partName)
+		devData, readErr := os.ReadFile(sysDevPath)
+		if readErr != nil {
+			log.Printf("deploy: mknod fallback: cannot read %s: %v", sysDevPath, readErr)
+			continue
+		}
+		// devData is "MAJOR:MINOR\n"
+		var major, minor uint32
+		if _, err := fmt.Sscanf(strings.TrimSpace(string(devData)), "%d:%d", &major, &minor); err != nil {
+			log.Printf("deploy: mknod fallback: cannot parse major:minor from %q: %v", string(devData), err)
+			continue
+		}
+		// syscall.Mknod creates a block device node (S_IFBLK = 0x6000).
+		devNum := major*256 + minor
+		if err := syscall.Mknod(devPath, syscall.S_IFBLK|0o600, int(devNum)); err != nil {
+			log.Printf("deploy: mknod %s (%d:%d): %v", devPath, major, minor, err)
+		} else {
+			log.Printf("deploy: mknod created %s (%d:%d)", devPath, major, minor)
+		}
+	}
+
+	// Log final /dev state for diagnostics.
+	if out, err := exec.Command("ls", "-la", filepath.Dir(disk)).CombinedOutput(); err == nil {
+		log.Printf("deploy: /dev after ensurePartitionNodes:\n%s", string(out))
+	}
 }
 
 // waitForPartitions waits until all expected partition device nodes appear in /dev.
@@ -535,10 +582,13 @@ func (d *FilesystemDeployer) streamExtract(ctx context.Context, body io.Reader, 
 
 	pr := &progressReader{r: reader, total: totalBytes, fn: progress, phase: "downloading+extracting"}
 
-	// Use 'tar -xaf -' which auto-detects compression (handles .tar.gz, .tar.xz, etc.)
-	// The '-a' flag requires GNU tar; busybox tar does not support it. We rely on
-	// the full GNU tar binary installed in the initramfs from the clonr-server.
-	tarCmd := exec.CommandContext(ctx, "tar", "-xaf", "-", "-C", opts.MountRoot)
+	// Use 'tar -xf -' which relies on GNU tar 1.29+ transparent decompression: when
+	// reading from stdin, GNU tar detects compression format from the stream's magic
+	// bytes (gzip=1f8b, xz=fd37, zstd=28b5) rather than the filename extension.
+	// Do NOT use '-a' (--auto-compress) — that flag uses the archive filename suffix
+	// to select the compressor, which always fails when reading from stdin ('-')
+	// because there is no filename to inspect.
+	tarCmd := exec.CommandContext(ctx, "tar", "-xf", "-", "-C", opts.MountRoot)
 	tarCmd.Stdin = pr
 
 	tarOut, err := tarCmd.CombinedOutput()
