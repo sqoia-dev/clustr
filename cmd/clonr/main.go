@@ -836,6 +836,13 @@ func runAutoDeployImage(ctx context.Context, c *client.Client, nodeCfg api.NodeC
 	if err := deployer.Deploy(ctx, opts, progressFn); err != nil {
 		fmt.Fprintln(os.Stderr)
 		deployLog.Error().Err(err).Msg("image deploy failed")
+		// Report failure to server so the node transitions to NodeStateFailed
+		// and the admin can see it needs attention.
+		reportCtx, reportCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if reportErr := c.ReportDeployFailed(reportCtx, nodeCfg.ID); reportErr != nil {
+			deployLog.Warn().Err(reportErr).Msg("deploy-failed report to server failed (non-fatal)")
+		}
+		reportCancel()
 		return fmt.Errorf("deploy: %w", err)
 	}
 	elapsed := time.Since(start).Round(time.Second)
@@ -847,43 +854,47 @@ func runAutoDeployImage(ctx context.Context, c *client.Client, nodeCfg api.NodeC
 	if err := deployer.Finalize(ctx, nodeCfg, mountRoot); err != nil {
 		deployLog.Error().Err(err).Msg("finalize failed")
 		reporter.EndPhase(err.Error())
+		// Report failure so admin can see the node is in a bad state.
+		reportCtx, reportCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if reportErr := c.ReportDeployFailed(reportCtx, nodeCfg.ID); reportErr != nil {
+			deployLog.Warn().Err(reportErr).Msg("deploy-failed report to server failed (non-fatal)")
+		}
+		reportCancel()
 		return fmt.Errorf("finalize: %w", err)
 	}
 	deployLog.Info().Str("hostname", nodeCfg.Hostname).Msg("node configuration applied")
 	reporter.EndPhase("")
 
-	// ── Auto boot-flip ──────────────────────────────────────────────────────
-	// After a successful deploy, tell the server to set the next boot device to
-	// disk via the node's configured power provider. The server handles both IPMI
-	// and Proxmox. If no provider is configured, log and let the node reboot
-	// normally via kernel reboot syscall (handled in finalize / reboot).
-	if nodeCfg.PowerProvider != nil && nodeCfg.PowerProvider.Type != "" {
-		reporter.StartPhase("flip-to-disk", 0)
-		deployLog.Info().
+	// ── Deploy complete callback ────────────────────────────────────────────
+	// Tell the server the deploy succeeded. This sets last_deploy_succeeded_at
+	// and clears reimage_pending, transitioning the node to NodeStateDeployed.
+	// On the next PXE boot (after the node reboots) the boot handler will see
+	// NodeStateDeployed and return "#!ipxe\nexit" so the BIOS boots from disk.
+	//
+	// This replaces the old FlipToDisk/SetNextBoot(disk) approach: the PXE
+	// server handles boot routing, no BMC interaction required.
+	reporter.StartPhase("deploy-complete", 0)
+	deployLog.Info().Str("hostname", nodeCfg.Hostname).
+		Msg("reporting deploy-complete to server")
+
+	completeCtx, completeCancel := context.WithTimeout(ctx, 30*time.Second)
+	completeErr := c.ReportDeployComplete(completeCtx, nodeCfg.ID)
+	completeCancel()
+
+	if completeErr != nil {
+		// Non-fatal: log but don't abort. The node image is correctly deployed
+		// on disk. The worst case is it PXE boots again on next restart and
+		// re-runs deploy --auto, which will call register, see the image is
+		// already assigned, and re-deploy (idempotent). The admin can also
+		// manually set the node state via the API.
+		deployLog.Warn().Err(completeErr).
 			Str("hostname", nodeCfg.Hostname).
-			Str("provider", nodeCfg.PowerProvider.Type).
-			Msg("flipping next boot to disk via power provider")
-
-		flipCtx, flipCancel := context.WithTimeout(ctx, 30*time.Second)
-		flipErr := c.FlipToDisk(flipCtx, nodeCfg.ID, false)
-		flipCancel()
-
-		if flipErr != nil {
-			// Non-fatal: log the error but don't abort. The OS will still boot
-			// if the disk is first in the persistent boot order; this only sets
-			// the one-time next-boot device.
-			deployLog.Warn().Err(flipErr).
-				Str("hostname", nodeCfg.Hostname).
-				Msg("flip-to-disk failed (non-fatal) — node may PXE boot again on next restart")
-			reporter.EndPhase(flipErr.Error())
-		} else {
-			deployLog.Info().Str("hostname", nodeCfg.Hostname).
-				Msg("next boot set to disk")
-			reporter.EndPhase("")
-		}
+			Msg("deploy-complete report failed (non-fatal) -- node may PXE boot again on next restart")
+		reporter.EndPhase(completeErr.Error())
 	} else {
 		deployLog.Info().Str("hostname", nodeCfg.Hostname).
-			Msg("no power provider configured — manual reboot required to boot from disk")
+			Msg("server notified: node is deployed, next PXE boot will exit to disk")
+		reporter.EndPhase("")
 	}
 	// ───────────────────────────────────────────────────────────────────────
 
