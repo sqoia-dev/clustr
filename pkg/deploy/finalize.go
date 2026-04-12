@@ -3,7 +3,6 @@ package deploy
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,26 +30,40 @@ var ifaceNameRe = regexp.MustCompile(`^[a-zA-Z0-9._:-]+$`)
 //  6. BMC / IPMI network and credentials (if cfg.BMC is set)
 //  7. InfiniBand / IPoIB config (if cfg.IBConfig is set)
 func applyNodeConfig(ctx context.Context, cfg api.NodeConfig, mountRoot string) error {
+	log := logger()
+
+	log.Info().Str("hostname", cfg.Hostname).Msg("finalize: writing /etc/hostname")
 	if err := writeHostname(mountRoot, cfg.Hostname, cfg.FQDN); err != nil {
 		return fmt.Errorf("finalize: hostname: %w", err)
 	}
+	log.Info().Str("hostname", cfg.Hostname).Msg("finalize: wrote /etc/hostname")
 
+	log.Info().Int("interfaces", len(cfg.Interfaces)).Msg("finalize: writing NetworkManager connection profiles")
 	if err := writeNetworkConfig(mountRoot, cfg.Interfaces); err != nil {
 		return fmt.Errorf("finalize: network: %w", err)
 	}
+	for _, iface := range cfg.Interfaces {
+		log.Info().Str("interface", iface.Name).Str("ip", iface.IPAddress).
+			Msgf("finalize: wrote /etc/NetworkManager/system-connections/%s.nmconnection", iface.Name)
+	}
 
 	if len(cfg.SSHKeys) > 0 {
+		log.Info().Int("keys", len(cfg.SSHKeys)).Msg("finalize: writing /root/.ssh/authorized_keys")
 		if err := writeSSHKeys(mountRoot, cfg.SSHKeys); err != nil {
 			return fmt.Errorf("finalize: ssh keys: %w", err)
 		}
+		log.Info().Int("keys", len(cfg.SSHKeys)).Msg("finalize: wrote /root/.ssh/authorized_keys")
 	}
 
 	if cfg.KernelArgs != "" {
+		log.Info().Str("args", cfg.KernelArgs).Msg("finalize: applying kernel args to /etc/default/grub")
 		if err := applyKernelArgs(ctx, mountRoot, cfg.KernelArgs); err != nil {
 			// Non-fatal: the GRUB config file edit may have succeeded even if
 			// grub2-mkconfig failed in the chroot. Log prominently so operators
 			// know to verify the bootloader configuration manually.
-			log.Printf("WARNING: finalize: kernel args: %v", err)
+			log.Warn().Err(err).Msg("WARNING: finalize: kernel args update failed (non-fatal) — manual intervention may be required")
+		} else {
+			log.Info().Str("args", cfg.KernelArgs).Msg("finalize: kernel args applied, ran grub2-mkconfig")
 		}
 	}
 
@@ -58,19 +71,24 @@ func applyNodeConfig(ctx context.Context, cfg api.NodeConfig, mountRoot string) 
 	// This operates on the physical BMC directly (not the chroot), so it is
 	// done here rather than inside the deployed filesystem.
 	if cfg.BMC != nil {
+		log.Info().Str("bmc_ip", cfg.BMC.IPAddress).Msg("finalize: configuring BMC via ipmitool")
 		if err := applyBMCConfig(ctx, cfg.BMC); err != nil {
 			// Non-fatal: BMC configuration failure should not abort a deployment.
 			// The operator can manually configure the BMC afterward.
-			log.Printf("WARNING: finalize: bmc (non-fatal): %v", err)
+			log.Warn().Err(err).Msg("WARNING: finalize: BMC configuration failed (non-fatal)")
+		} else {
+			log.Info().Str("bmc_ip", cfg.BMC.IPAddress).Msg("finalize: BMC configured")
 		}
 	}
 
 	// InfiniBand / IPoIB — write udev rules and NetworkManager profiles into
 	// the deployed filesystem so IB interfaces come up correctly on first boot.
 	if len(cfg.IBConfig) > 0 {
+		log.Info().Int("devices", len(cfg.IBConfig)).Msg("finalize: writing InfiniBand/IPoIB configuration")
 		if err := writeIBConfig(mountRoot, cfg.IBConfig); err != nil {
 			return fmt.Errorf("finalize: ib config: %w", err)
 		}
+		log.Info().Int("devices", len(cfg.IBConfig)).Msg("finalize: InfiniBand/IPoIB configuration written")
 	}
 
 	return nil
@@ -389,15 +407,17 @@ func applyKernelArgs(ctx context.Context, mountRoot, kernelArgs string) error {
 	// the requested kernel arguments without manual intervention.
 	grubCfgPath := findGrubCfg(mountRoot)
 	if grubCfgPath != "" {
+		logger().Info().Str("grub_cfg", grubCfgPath).Msg("running grub2-mkconfig in chroot")
 		chrootArgs := []string{mountRoot, "grub2-mkconfig", "-o", grubCfgPath}
-		if out, err := exec.CommandContext(ctx, "chroot", chrootArgs...).CombinedOutput(); err != nil {
+		if err := runAndLog(ctx, "grub2-mkconfig", exec.CommandContext(ctx, "chroot", chrootArgs...)); err != nil {
 			return fmt.Errorf(
 				"WARNING: grub configuration update failed — node may not boot with the requested "+
 					"kernel arguments. Manual intervention may be required. "+
-					"grub2-mkconfig: %w\noutput: %s",
-				err, string(out),
+					"grub2-mkconfig: %w",
+				err,
 			)
 		}
+		logger().Info().Str("grub_cfg", grubCfgPath).Msg("grub2-mkconfig complete")
 	}
 
 	return nil
