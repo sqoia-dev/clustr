@@ -45,6 +45,14 @@ class LogStream {
 
         this.source.onerror = () => {
             if (this._onDisconnect) this._onDisconnect();
+            // Auto-reconnect after 3 seconds on error.
+            if (this.source) {
+                this.source.close();
+                this.source = null;
+                setTimeout(() => {
+                    if (this._shouldReconnect) this.connect();
+                }, 3000);
+            }
         };
 
         this.source.onmessage = (evt) => {
@@ -53,9 +61,12 @@ class LogStream {
                 this.appendEntry(entry);
             } catch (_) {}
         };
+
+        this._shouldReconnect = true;
     }
 
     disconnect() {
+        this._shouldReconnect = false;
         if (this.source) {
             this.source.close();
             this.source = null;
@@ -109,12 +120,12 @@ class LogStream {
 
     _renderLine(entry) {
         const div = document.createElement('div');
-        div.className = 'log-line';
+        const level = (entry.level || 'info').toLowerCase();
+        div.className = `log-line log-line-${level}`;
 
         const ts = new Date(entry.timestamp);
         const tsStr = ts.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
-        const level = (entry.level || 'info').toLowerCase();
         const levelStr = level.toUpperCase().padEnd(5);
 
         div.innerHTML =

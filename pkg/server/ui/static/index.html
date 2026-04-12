@@ -6,26 +6,71 @@
     <meta name="clonr-token" content="">
     <title>clonr</title>
     <link rel="stylesheet" href="/ui/css/style.css">
-    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='4' fill='%231a1a2e'/><text x='4' y='24' font-size='22' font-family='monospace' fill='%2300d4ff'>c</text></svg>">
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%233b82f6'/><text x='5' y='23' font-size='20' font-family='monospace' font-weight='bold' fill='white'>c</text></svg>">
 </head>
 <body>
 <div id="app">
-    <header>
-        <div class="logo">clonr<span>-serverd</span></div>
-        <nav>
-            <a href="#/" id="nav-dash">Dashboard</a>
-            <a href="#/images" id="nav-images">Images</a>
-            <a href="#/nodes" id="nav-nodes">Nodes</a>
-            <a href="#/logs" id="nav-logs">Logs</a>
-        </nav>
-        <div class="header-status">
-            <span class="dot" id="health-dot"></span>
-            <span id="health-label">checking…</span>
+
+    <!-- Sidebar -->
+    <aside class="sidebar">
+        <div class="sidebar-logo">
+            <div class="sidebar-logo-mark">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+                    <rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>
+                </svg>
+            </div>
+            <div>
+                <div class="sidebar-logo-text">clonr</div>
+            </div>
         </div>
-    </header>
+
+        <nav class="sidebar-nav">
+            <a href="#/" class="nav-item" id="nav-dash">
+                <!-- dashboard icon -->
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+                    <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
+                    <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
+                </svg>
+                <span>Dashboard</span>
+            </a>
+            <a href="#/images" class="nav-item" id="nav-images">
+                <!-- layers/image icon -->
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+                    <polygon points="12 2 2 7 12 12 22 7 12 2"/>
+                    <polyline points="2 17 12 22 22 17"/>
+                    <polyline points="2 12 12 17 22 12"/>
+                </svg>
+                <span>Images</span>
+            </a>
+            <a href="#/nodes" class="nav-item" id="nav-nodes">
+                <!-- server icon -->
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+                    <rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/>
+                    <line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/>
+                </svg>
+                <span>Nodes</span>
+            </a>
+            <a href="#/logs" class="nav-item" id="nav-logs">
+                <!-- terminal icon -->
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+                    <polyline points="4 17 10 11 4 5"/>
+                    <line x1="12" y1="19" x2="20" y2="19"/>
+                </svg>
+                <span>Logs</span>
+            </a>
+        </nav>
+
+        <div class="sidebar-footer">
+            <span class="health-dot" id="health-dot"></span>
+            <span class="health-label" id="health-label">checking…</span>
+        </div>
+    </aside>
+
+    <!-- Main content -->
     <main id="main-content">
         <div class="loading"><div class="spinner"></div>Loading…</div>
     </main>
+
 </div>
 
 <script src="/ui/js/api.js"></script>
