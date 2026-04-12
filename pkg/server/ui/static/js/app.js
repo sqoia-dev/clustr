@@ -1887,6 +1887,51 @@ const Pages = {
                         </div>
                         <!-- End Power Provider section -->
 
+                        <!-- Shared Mounts section -->
+                        <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border)">
+                            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+                                <div style="font-weight:600;font-size:13px;color:var(--text-secondary)">Additional Mounts (fstab)</div>
+                                <div style="display:flex;gap:6px;align-items:center">
+                                    <select id="mount-preset-select" onchange="Pages._applyMountPreset()" style="font-size:12px;padding:4px 6px">
+                                        <option value="">Insert preset…</option>
+                                        <option value="nfs-home">NFS home directory</option>
+                                        <option value="lustre">Lustre scratch</option>
+                                        <option value="beegfs">BeeGFS data</option>
+                                        <option value="cifs">CIFS share (Windows)</option>
+                                        <option value="bind">Bind mount</option>
+                                        <option value="tmpfs">tmpfs for /tmp</option>
+                                    </select>
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="Pages._addMountRow()">+ Add Mount</button>
+                                </div>
+                            </div>
+                            <div id="mounts-table-wrap">
+                                <table id="mounts-table" style="width:100%;font-size:12px;border-collapse:collapse">
+                                    <thead>
+                                        <tr style="border-bottom:1px solid var(--border)">
+                                            <th style="text-align:left;padding:4px 6px;font-weight:500;color:var(--text-secondary)">Source</th>
+                                            <th style="text-align:left;padding:4px 6px;font-weight:500;color:var(--text-secondary)">Mount Point</th>
+                                            <th style="text-align:left;padding:4px 6px;font-weight:500;color:var(--text-secondary)">FS Type</th>
+                                            <th style="text-align:left;padding:4px 6px;font-weight:500;color:var(--text-secondary)">Options</th>
+                                            <th style="text-align:center;padding:4px 6px;font-weight:500;color:var(--text-secondary)" title="Auto-create the mount point directory">mkd</th>
+                                            <th style="text-align:left;padding:4px 6px;font-weight:500;color:var(--text-secondary)">Comment</th>
+                                            <th style="padding:4px"></th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="mounts-tbody">
+                                        ${(() => {
+                                            const mounts = (isEdit && node.extra_mounts) ? node.extra_mounts : [];
+                                            return mounts.map((m, i) => Pages._mountRowHTML(i, m)).join('');
+                                        })()}
+                                    </tbody>
+                                </table>
+                                ${(() => {
+                                    const mounts = (isEdit && node.extra_mounts) ? node.extra_mounts : [];
+                                    return mounts.length === 0 ? '<div id="mounts-empty" style="text-align:center;padding:12px;color:var(--text-dim);font-size:12px">No additional mounts configured</div>' : '';
+                                })()}
+                            </div>
+                        </div>
+                        <!-- End Shared Mounts section -->
+
                         <div id="node-form-result"></div>
                         <div class="form-actions">
                             <button type="button" class="btn btn-secondary" onclick="document.getElementById('node-modal').remove()">Cancel</button>
@@ -1898,6 +1943,156 @@ const Pages = {
 
         document.body.appendChild(overlay);
         overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+
+        // Attach live-validation listeners after DOM is ready.
+        const tbody = document.getElementById('mounts-tbody');
+        if (tbody) {
+            tbody.addEventListener('input', () => Pages._validateMountRows());
+            tbody.addEventListener('change', (e) => {
+                // When fs_type changes, suggest _netdev for network filesystems.
+                if (e.target && e.target.name === 'mount_fs_type') {
+                    Pages._onFSTypeChange(e.target);
+                }
+            });
+        }
+    },
+
+    // _mountRowHTML builds the HTML for a single mount row in the fstab editor.
+    _mountRowHTML(idx, m) {
+        m = m || {};
+        const networkFSTypes = ['nfs','nfs4','cifs','smbfs','beegfs','lustre','gpfs','9p'];
+        const fsTypes = ['nfs','nfs4','cifs','beegfs','lustre','gpfs','xfs','ext4','bind','9p','tmpfs','vfat','ext3','smbfs'];
+        const fsSelect = fsTypes.map(t =>
+            `<option value="${t}"${m.fs_type === t ? ' selected' : ''}>${t}</option>`
+        ).join('');
+        return `<tr data-mount-idx="${idx}" style="border-bottom:1px solid var(--border)">
+            <td style="padding:4px 3px">
+                <input type="text" name="mount_source" value="${escHtml(m.source||'')}"
+                    placeholder="nfs-server:/export/home" style="width:100%;min-width:120px;font-size:12px"
+                    required>
+            </td>
+            <td style="padding:4px 3px">
+                <input type="text" name="mount_point" value="${escHtml(m.mount_point||'')}"
+                    placeholder="/home/shared" style="width:100%;min-width:100px;font-size:12px"
+                    required pattern="/.+">
+            </td>
+            <td style="padding:4px 3px">
+                <select name="mount_fs_type" style="font-size:12px;padding:2px 4px">
+                    ${fsSelect}
+                </select>
+            </td>
+            <td style="padding:4px 3px">
+                <input type="text" name="mount_options" value="${escHtml(m.options||'')}"
+                    placeholder="defaults,_netdev" style="width:100%;min-width:120px;font-size:12px">
+            </td>
+            <td style="padding:4px 3px;text-align:center">
+                <input type="checkbox" name="mount_auto_mkdir" ${m.auto_mkdir !== false ? 'checked' : ''}>
+            </td>
+            <td style="padding:4px 3px">
+                <input type="text" name="mount_comment" value="${escHtml(m.comment||'')}"
+                    placeholder="optional note" style="width:100%;min-width:80px;font-size:12px">
+            </td>
+            <td style="padding:4px 3px">
+                <button type="button" class="btn btn-danger btn-sm"
+                    onclick="Pages._removeMountRow(this)" style="padding:2px 6px;font-size:11px">✕</button>
+            </td>
+        </tr>`;
+    },
+
+    // _addMountRow appends a blank mount row to the table.
+    _addMountRow(preset) {
+        const tbody = document.getElementById('mounts-tbody');
+        const empty = document.getElementById('mounts-empty');
+        if (!tbody) return;
+        if (empty) empty.remove();
+        const idx = tbody.querySelectorAll('tr').length;
+        tbody.insertAdjacentHTML('beforeend', Pages._mountRowHTML(idx, preset || {}));
+        Pages._validateMountRows();
+    },
+
+    // _removeMountRow removes the row containing the given button.
+    _removeMountRow(btn) {
+        const row = btn.closest('tr');
+        if (row) row.remove();
+        const tbody = document.getElementById('mounts-tbody');
+        if (tbody && tbody.querySelectorAll('tr').length === 0) {
+            const wrap = document.getElementById('mounts-table-wrap');
+            if (wrap && !document.getElementById('mounts-empty')) {
+                wrap.insertAdjacentHTML('beforeend',
+                    '<div id="mounts-empty" style="text-align:center;padding:12px;color:var(--text-dim);font-size:12px">No additional mounts configured</div>');
+            }
+        }
+        Pages._validateMountRows();
+    },
+
+    // _validateMountRows highlights rows with missing required fields.
+    _validateMountRows() {
+        const tbody = document.getElementById('mounts-tbody');
+        if (!tbody) return;
+        let hasErrors = false;
+        tbody.querySelectorAll('tr').forEach(row => {
+            const src = row.querySelector('[name="mount_source"]');
+            const mp  = row.querySelector('[name="mount_point"]');
+            let rowOk = true;
+            if (src && !src.value.trim()) { src.style.border = '1px solid var(--error)'; rowOk = false; }
+            else if (src) src.style.border = '';
+            if (mp && (!mp.value.trim() || mp.value[0] !== '/')) {
+                mp.style.border = '1px solid var(--error)'; rowOk = false;
+            } else if (mp) mp.style.border = '';
+            if (!rowOk) hasErrors = true;
+        });
+        const btn = document.getElementById('node-submit-btn');
+        if (btn) btn.disabled = hasErrors;
+    },
+
+    // _onFSTypeChange auto-suggests _netdev for network filesystems when the
+    // options field is empty.
+    _onFSTypeChange(select) {
+        const networkFS = ['nfs','nfs4','cifs','smbfs','beegfs','lustre','gpfs','9p'];
+        const row = select.closest('tr');
+        if (!row) return;
+        const optsInput = row.querySelector('[name="mount_options"]');
+        if (!optsInput || optsInput.value.trim()) return; // don't overwrite existing
+        if (networkFS.includes(select.value)) {
+            optsInput.value = 'defaults,_netdev';
+        }
+    },
+
+    // _applyMountPreset inserts a preset row based on the dropdown selection.
+    _applyMountPreset() {
+        const sel = document.getElementById('mount-preset-select');
+        if (!sel || !sel.value) return;
+        const presets = {
+            'nfs-home': { source: 'nfs-server:/export/home', mount_point: '/home/shared', fs_type: 'nfs4', options: 'defaults,_netdev,vers=4', auto_mkdir: true, comment: 'NFS home directory' },
+            'lustre':   { source: 'mgs@tcp:/scratch',        mount_point: '/scratch',     fs_type: 'lustre', options: 'defaults,_netdev,flock', auto_mkdir: true, comment: 'Lustre scratch' },
+            'beegfs':   { source: 'beegfs',                  mount_point: '/mnt/beegfs',  fs_type: 'beegfs', options: 'defaults,_netdev',       auto_mkdir: true, comment: 'BeeGFS data' },
+            'cifs':     { source: '//winserver/share',       mount_point: '/mnt/share',   fs_type: 'cifs',   options: 'defaults,_netdev,vers=3.0,sec=ntlmssp', auto_mkdir: true, comment: 'CIFS (Windows) share' },
+            'bind':     { source: '/data/src',               mount_point: '/data/dst',    fs_type: 'bind',   options: 'defaults,bind',           auto_mkdir: true, comment: 'Bind mount' },
+            'tmpfs':    { source: 'tmpfs',                   mount_point: '/tmp',         fs_type: 'tmpfs',  options: 'defaults,size=4G,mode=1777', auto_mkdir: false, comment: 'tmpfs /tmp' },
+        };
+        const p = presets[sel.value];
+        if (p) Pages._addMountRow(p);
+        sel.value = ''; // reset dropdown
+    },
+
+    // _collectMounts reads all mount rows from the form and returns an array
+    // of FstabEntry objects ready for the API body.
+    _collectMounts() {
+        const tbody = document.getElementById('mounts-tbody');
+        if (!tbody) return [];
+        const rows = tbody.querySelectorAll('tr');
+        const mounts = [];
+        rows.forEach(row => {
+            const source    = (row.querySelector('[name="mount_source"]')?.value || '').trim();
+            const mountPoint = (row.querySelector('[name="mount_point"]')?.value || '').trim();
+            const fsType    = row.querySelector('[name="mount_fs_type"]')?.value || 'nfs';
+            const options   = (row.querySelector('[name="mount_options"]')?.value || '').trim();
+            const autoMkdir = row.querySelector('[name="mount_auto_mkdir"]')?.checked !== false;
+            const comment   = (row.querySelector('[name="mount_comment"]')?.value || '').trim();
+            if (!source || !mountPoint) return; // skip incomplete rows
+            mounts.push({ source, mount_point: mountPoint, fs_type: fsType, options, auto_mkdir: autoMkdir, comment, dump: 0, pass: 0 });
+        });
+        return mounts;
     },
 
     // _onPowerProviderTypeChange shows/hides the Proxmox fields when the provider
@@ -1951,6 +2146,7 @@ const Pages = {
             interfaces:     [],
             custom_vars:    {},
             power_provider: powerProvider,
+            extra_mounts:   Pages._collectMounts(),
         };
 
         try {
