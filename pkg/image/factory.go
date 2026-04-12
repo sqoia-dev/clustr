@@ -278,6 +278,14 @@ func (f *Factory) ImportISO(ctx context.Context, isoPath, name, version string) 
 func (f *Factory) importISOAsync(imageID, isoPath string) {
 	ctx := context.Background()
 
+	// Clean up the source file (may be a browser-upload temp) after we are done
+	// with it regardless of success or failure.
+	defer func() {
+		if err := os.Remove(isoPath); err != nil && !os.IsNotExist(err) {
+			f.Logger.Warn().Err(err).Str("path", isoPath).Msg("factory: cleanup iso temp file")
+		}
+	}()
+
 	rootfs, size, checksum, err := f.extractISO(ctx, imageID, isoPath)
 	if err != nil {
 		f.Logger.Error().Err(err).Str("image_id", imageID).Msg("factory: import ISO failed")

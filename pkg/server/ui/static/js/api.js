@@ -85,6 +85,54 @@ const API = {
     factory: {
         pull(body)            { return API.post('/factory/pull', body); },
         importISO(body)       { return API.post('/factory/import-iso', body); },
+
+        // uploadISO — browser file upload with real progress.
+        // file     : File object from <input type="file"> or drag-and-drop.
+        // metadata : { name, version }
+        // onProgress(pct, bytesLoaded, bytesTotal, speedBps, etaSecs)
+        // Returns a Promise that resolves to the created BaseImage record.
+        uploadISO(file, metadata, onProgress) {
+            return new Promise((resolve, reject) => {
+                const fd = new FormData();
+                fd.append('file', file);
+                fd.append('name', metadata.name || '');
+                if (metadata.version) fd.append('version', metadata.version);
+
+                const xhr = new XMLHttpRequest();
+                let startTime = null;
+
+                xhr.upload.addEventListener('loadstart', () => { startTime = Date.now(); });
+                xhr.upload.addEventListener('progress', (e) => {
+                    if (!e.lengthComputable || !onProgress) return;
+                    const pct  = Math.round((e.loaded / e.total) * 100);
+                    const secs = (Date.now() - startTime) / 1000 || 0.001;
+                    const bps  = e.loaded / secs;
+                    const eta  = bps > 0 ? (e.total - e.loaded) / bps : 0;
+                    onProgress(pct, e.loaded, e.total, bps, eta);
+                });
+
+                xhr.addEventListener('load', () => {
+                    if (xhr.status >= 200 && xhr.status < 300) {
+                        try { resolve(JSON.parse(xhr.responseText)); }
+                        catch { resolve(null); }
+                    } else {
+                        let msg = `HTTP ${xhr.status}`;
+                        try {
+                            const body = JSON.parse(xhr.responseText);
+                            if (body && body.error) msg = body.error;
+                        } catch {}
+                        reject(new Error(msg));
+                    }
+                });
+                xhr.addEventListener('error', () => reject(new Error('Network error during upload')));
+                xhr.addEventListener('abort', () => reject(new Error('Upload cancelled')));
+
+                const tok = API._token();
+                xhr.open('POST', `${API.BASE}/factory/import`);
+                if (tok) xhr.setRequestHeader('Authorization', `Bearer ${tok}`);
+                xhr.send(fd);
+            });
+        },
     },
     health: {
         get()                 { return API.get('/health'); },

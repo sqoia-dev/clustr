@@ -51,16 +51,20 @@ func (h *FactoryHandler) Pull(w http.ResponseWriter, r *http.Request) {
 }
 
 // Import handles POST /api/v1/factory/import
-// Accepts a multipart upload: field "iso" = the ISO file, field "meta" = JSON
-// ImportISORequest. Saves the ISO to a temp file and calls Factory.ImportISO.
+// Accepts a multipart upload: field "file" or "iso" = the image file, fields
+// "name", "version" directly in the form, or field "meta" = JSON ImportISORequest.
+// Streams the upload to CLONR_ISO_DIR (default /var/lib/clonr/iso/) and calls
+// Factory.ImportISO. The temp file is cleaned up by the async import goroutine.
+// Supports large files (2-4 GB ISOs) — the 32 MiB memory limit causes the rest
+// to be spooled to disk by Go's multipart parser.
 func (h *FactoryHandler) Import(w http.ResponseWriter, r *http.Request) {
-	// Limit upload to 16 GiB in memory parsing (actual stream to disk).
+	// 32 MiB buffered in memory; remainder spooled to disk by the multipart parser.
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		writeValidationError(w, "failed to parse multipart form")
 		return
 	}
 
-	// Parse metadata from the "meta" field.
+	// Accept metadata either as individual form fields or as a JSON "meta" blob.
 	var meta api.ImportISORequest
 	if metaStr := r.FormValue("meta"); metaStr != "" {
 		if err := json.Unmarshal([]byte(metaStr), &meta); err != nil {
@@ -68,38 +72,64 @@ func (h *FactoryHandler) Import(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Individual fields override the meta blob when both are present.
+	if n := r.FormValue("name"); n != "" {
+		meta.Name = n
+	}
+	if v := r.FormValue("version"); v != "" {
+		meta.Version = v
+	}
 	if meta.Name == "" {
-		writeValidationError(w, "meta.name is required")
+		writeValidationError(w, "name is required")
 		return
 	}
 
-	// Stream the "iso" file field to a temp file.
-	file, _, err := r.FormFile("iso")
+	// Accept either "file" (browser upload widget) or legacy "iso" field name.
+	file, _, err := r.FormFile("file")
 	if err != nil {
-		writeValidationError(w, "iso file field is required")
+		file, _, err = r.FormFile("iso")
+	}
+	if err != nil {
+		writeValidationError(w, "file field is required (multipart field name: file or iso)")
 		return
 	}
 	defer file.Close()
 
-	tmp, err := os.CreateTemp("", "clonr-import-*.iso")
+	// Write the upload to CLONR_ISO_DIR so it lives alongside other ISOs and is
+	// on the same filesystem as the image store (avoids cross-device rename issues).
+	isoDir := os.Getenv("CLONR_ISO_DIR")
+	if isoDir == "" {
+		isoDir = defaultISODir
+	}
+	if err := os.MkdirAll(isoDir, 0o755); err != nil {
+		log.Error().Err(err).Str("iso_dir", isoDir).Msg("factory import: create iso dir")
+		writeError(w, err)
+		return
+	}
+
+	tmp, err := os.CreateTemp(isoDir, "clonr-upload-*.tmp")
 	if err != nil {
 		log.Error().Err(err).Msg("factory import: create temp file")
 		writeError(w, err)
 		return
 	}
 	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
 
-	if _, err := io.Copy(tmp, file); err != nil {
-		tmp.Close()
-		log.Error().Err(err).Msg("factory import: write temp file")
+	written, err := io.Copy(tmp, file)
+	tmp.Close()
+	if err != nil {
+		os.Remove(tmpPath)
+		log.Error().Err(err).Msg("factory import: stream upload to disk")
 		writeError(w, err)
 		return
 	}
-	tmp.Close()
+	log.Info().Str("tmp", tmpPath).Int64("bytes", written).Msg("factory import: upload received")
 
+	// ImportISO launches an async goroutine; it is responsible for removing tmpPath
+	// after it has finished mounting/extracting the file.
 	img, err := h.Factory.ImportISO(r.Context(), tmpPath, meta.Name, meta.Version)
 	if err != nil {
+		os.Remove(tmpPath)
 		log.Error().Err(err).Msg("factory import ISO")
 		writeError(w, err)
 		return

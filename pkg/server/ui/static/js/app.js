@@ -669,36 +669,90 @@ const Pages = {
         overlay.innerHTML = `
             <div class="modal">
                 <div class="modal-header">
-                    <span class="modal-title">Import ISO</span>
+                    <span class="modal-title">Upload Image File</span>
                     <button class="modal-close" onclick="document.getElementById('iso-modal').remove()">×</button>
                 </div>
                 <div class="modal-body">
-                    <p class="text-dim text-sm mb-16">Import an ISO file already present on the server host. Provide the absolute path.</p>
                     <form id="iso-form" onsubmit="Pages.submitImportISO(event)">
-                        <div class="form-grid">
-                            <div class="form-group" style="grid-column:1/-1">
-                                <label>Server-side ISO Path *</label>
-                                <input type="text" name="path" placeholder="/srv/images/rocky-9.3-x86_64.iso" required>
+                        <div class="form-group" style="margin-bottom:16px">
+                            <label>Image File</label>
+                            <div class="upload-zone" id="iso-drop-zone">
+                                <input type="file" id="iso-file-input" accept=".iso,.img,.qcow2,.tar.gz,.tgz,.raw">
+                                <div class="upload-zone-icon">&#8686;</div>
+                                <div class="upload-zone-label">
+                                    Drop an ISO, qcow2, img, or tarball here<br>
+                                    <span style="font-size:12px">or click to browse</span>
+                                </div>
+                                <div class="upload-zone-filename" id="iso-filename"></div>
                             </div>
+                        </div>
+                        <div class="form-grid">
                             <div class="form-group">
                                 <label>Name *</label>
-                                <input type="text" name="name" placeholder="rocky-9-hpc" required>
+                                <input type="text" name="name" id="iso-name" placeholder="rocky-9-hpc" required>
                             </div>
                             <div class="form-group">
                                 <label>Version</label>
-                                <input type="text" name="version" placeholder="9.3">
+                                <input type="text" name="version" id="iso-version" placeholder="9.3">
+                            </div>
+                        </div>
+                        <div class="upload-progress-wrap" id="iso-progress-wrap" style="display:none">
+                            <div class="upload-progress-bar-outer">
+                                <div class="upload-progress-bar-inner" id="iso-progress-bar"></div>
+                            </div>
+                            <div class="upload-progress-meta">
+                                <span id="iso-progress-pct">0%</span>
+                                <span id="iso-progress-speed"></span>
+                                <span id="iso-progress-eta"></span>
                             </div>
                         </div>
                         <div id="iso-result"></div>
                         <div class="form-actions">
                             <button type="button" class="btn btn-secondary" onclick="document.getElementById('iso-modal').remove()">Cancel</button>
-                            <button type="submit" class="btn btn-primary" id="iso-btn">Import ISO</button>
+                            <button type="submit" class="btn btn-primary" id="iso-btn">Upload &amp; Import</button>
                         </div>
                     </form>
                 </div>
             </div>`;
         document.body.appendChild(overlay);
         overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+
+        // Wire up file picker and drag-and-drop after the DOM is appended.
+        const zone    = document.getElementById('iso-drop-zone');
+        const input   = document.getElementById('iso-file-input');
+        const fnLabel = document.getElementById('iso-filename');
+        const nameEl  = document.getElementById('iso-name');
+        const verEl   = document.getElementById('iso-version');
+
+        const applyFile = (file) => {
+            if (!file) return;
+            fnLabel.textContent = `${file.name} (${fmtBytes(file.size)})`;
+            // Auto-populate name/version from filename when the fields are still empty.
+            if (!nameEl.value) {
+                const base = file.name.replace(/\.(iso|img|qcow2|tar\.gz|tgz|raw)$/i, '');
+                nameEl.value = base.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+            }
+            if (!verEl.value) {
+                const m = file.name.match(/(\d+\.\d+)/);
+                if (m) verEl.value = m[1];
+            }
+        };
+
+        input.addEventListener('change', () => applyFile(input.files[0]));
+
+        zone.addEventListener('dragover',  e => { e.preventDefault(); zone.classList.add('drag-over'); });
+        zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+        zone.addEventListener('drop', e => {
+            e.preventDefault();
+            zone.classList.remove('drag-over');
+            const file = e.dataTransfer.files[0];
+            if (file) {
+                const dt = new DataTransfer();
+                dt.items.add(file);
+                input.files = dt.files;
+                applyFile(file);
+            }
+        });
     },
 
     async submitPull(e) {
@@ -745,33 +799,58 @@ const Pages = {
 
     async submitImportISO(e) {
         e.preventDefault();
-        const form = e.target;
-        const btn  = document.getElementById('iso-btn');
-        const res  = document.getElementById('iso-result');
-        const data = new FormData(form);
+        const form     = e.target;
+        const btn      = document.getElementById('iso-btn');
+        const res      = document.getElementById('iso-result');
+        const input    = document.getElementById('iso-file-input');
+        const progWrap = document.getElementById('iso-progress-wrap');
+        const progBar  = document.getElementById('iso-progress-bar');
+        const progPct  = document.getElementById('iso-progress-pct');
+        const progSpd  = document.getElementById('iso-progress-speed');
+        const progEta  = document.getElementById('iso-progress-eta');
 
+        const file = input && input.files[0];
+        if (!file) {
+            res.innerHTML = alertBox('Please select a file to upload.');
+            return;
+        }
+
+        const data = new FormData(form);
         btn.disabled = true;
-        btn.textContent = 'Importing…';
+        btn.textContent = 'Uploading…';
         res.innerHTML = '';
+        if (progWrap) progWrap.style.display = 'block';
+
+        const onProgress = (pct, loaded, total, bps, eta) => {
+            if (!progBar) return;
+            progBar.style.width  = `${pct}%`;
+            progPct.textContent  = `${pct}%`;
+            progSpd.textContent  = bps > 0 ? `${fmtBytes(Math.round(bps))}/s` : '';
+            progEta.textContent  = eta > 0 ? `ETA ${Math.ceil(eta)}s` : '';
+        };
 
         try {
-            const body = {
-                path:    data.get('path'),
+            const img = await API.factory.uploadISO(file, {
                 name:    data.get('name'),
                 version: data.get('version'),
-            };
-            const img = await API.factory.importISO(body);
-            res.innerHTML = alertBox(`Import started: ${img.name} (${img.id})`, 'success');
-            form.reset();
+            }, onProgress);
+
+            if (progBar) { progBar.style.width = '100%'; progBar.classList.add('complete'); }
+            if (progPct) progPct.textContent = '100%';
+            if (progEta) progEta.textContent = 'Done';
+
+            res.innerHTML = alertBox(`Upload complete: ${img.name} (${img.id}) — processing in background`, 'success');
+            App.setAutoRefresh(() => Pages.images(), 5000);
             setTimeout(() => {
                 const modal = document.getElementById('iso-modal');
                 if (modal) modal.remove();
                 Pages.images();
-            }, 1500);
+            }, 2000);
         } catch (ex) {
-            res.innerHTML = alertBox(`Import failed: ${ex.message}`);
+            if (progBar) progBar.classList.add('error');
+            res.innerHTML = alertBox(`Upload failed: ${ex.message}`);
             btn.disabled = false;
-            btn.textContent = 'Import ISO';
+            btn.textContent = 'Upload & Import';
         }
     },
 
