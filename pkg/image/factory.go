@@ -155,6 +155,8 @@ func (f *Factory) pullAndExtract(ctx context.Context, imageID, url string) (root
 		err = f.extractRaw(ctx, imageID, tmpFile.Name(), rootfsPath)
 	case ext == ".tar.gz" || ext == ".tgz" || ext == ".tar":
 		err = extractTar(tmpFile.Name(), rootfsPath)
+	case ext == ".tar.zst" || ext == ".tzst":
+		err = extractTarZst(ctx, tmpFile.Name(), rootfsPath)
 	default:
 		// Try treating unknown extensions as raw block images.
 		err = f.extractRaw(ctx, imageID, tmpFile.Name(), rootfsPath)
@@ -765,6 +767,67 @@ func extractTar(srcPath, dstPath string) error {
 	return nil
 }
 
+// extractTarZst extracts a .tar.zst archive by piping zstdcat into tar.
+// Falls back to "zstd -dc | tar -xf -" if zstdcat is not found.
+func extractTarZst(ctx context.Context, srcPath, dstPath string) error {
+	// Try zstdcat first (part of zstd package).
+	if path, err := exec.LookPath("zstdcat"); err == nil {
+		zstd := exec.CommandContext(ctx, path, srcPath)
+		tarCmd := exec.CommandContext(ctx, "tar", "-xf", "-", "-C", dstPath)
+		r, w := io.Pipe()
+		zstd.Stdout = w
+		tarCmd.Stdin = r
+		var zstdErr, tarErr error
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			defer w.Close()
+			if out, err := zstd.CombinedOutput(); err != nil {
+				zstdErr = fmt.Errorf("zstdcat: %w\noutput: %s", err, string(out))
+			}
+		}()
+		if out, err := tarCmd.CombinedOutput(); err != nil {
+			tarErr = fmt.Errorf("tar (from zstdcat): %w\noutput: %s", err, string(out))
+		}
+		<-done
+		if zstdErr != nil {
+			return zstdErr
+		}
+		return tarErr
+	}
+
+	// Fallback: use "zstd -dc" piped into tar.
+	f, err := os.Open(srcPath)
+	if err != nil {
+		return fmt.Errorf("open zst: %w", err)
+	}
+	defer f.Close()
+
+	zstdCmd := exec.CommandContext(ctx, "zstd", "-dc")
+	zstdCmd.Stdin = f
+	tarCmd := exec.CommandContext(ctx, "tar", "-xf", "-", "-C", dstPath)
+	pr, pw := io.Pipe()
+	zstdCmd.Stdout = pw
+	tarCmd.Stdin = pr
+
+	if err := zstdCmd.Start(); err != nil {
+		return fmt.Errorf("zstd start: %w", err)
+	}
+	if err := tarCmd.Start(); err != nil {
+		zstdCmd.Process.Kill()
+		return fmt.Errorf("tar start: %w", err)
+	}
+
+	zstdRunErr := zstdCmd.Wait()
+	pw.Close()
+	tarRunErr := tarCmd.Wait()
+
+	if zstdRunErr != nil {
+		return fmt.Errorf("zstd decompress: %w", zstdRunErr)
+	}
+	return tarRunErr
+}
+
 // rsyncDir rsyncs src into dst, preserving all attributes.
 // --copy-unsafe-links causes symlinks that point outside the source tree to be
 // copied as regular files rather than preserved as symlinks, preventing
@@ -875,6 +938,9 @@ func urlExt(rawURL string) string {
 	}
 	if strings.HasSuffix(strings.ToLower(base), ".tar.bz2") {
 		return ".tar.bz2"
+	}
+	if strings.HasSuffix(strings.ToLower(base), ".tar.zst") {
+		return ".tar.zst"
 	}
 	return filepath.Ext(base)
 }

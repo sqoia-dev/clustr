@@ -3,9 +3,11 @@ module github.com/sqoia-dev/clonr
 go 1.25.0
 
 require (
+	github.com/creack/pty v1.1.24 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/go-chi/chi/v5 v5.2.5 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/insomniacslk/dhcp v0.0.0-20260407060928-11b94ed970f2 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect

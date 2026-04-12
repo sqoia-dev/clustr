@@ -366,12 +366,19 @@ ${transitive}"
     # tar: busybox tar cannot reliably handle .tar.gz with large files or extended
     # headers. GNU tar at /usr/bin/tar overrides the busybox symlink at /bin/tar.
     # gzip: similarly, GNU gzip handles multi-stream and large files correctly.
+    # pigz: parallel gzip — uses all CPU cores for decompression of .tar.gz images.
+    #       clonr's streamExtract() prefers pigz over gzip when available.
+    # zstd: zstandard — 3-5x faster decompression than gzip at similar ratio.
+    #       clonr stores new captures as .tar.zst and detects the magic bytes at
+    #       deploy time. zstd binary must be in PATH for .tar.zst extraction.
     # rsync: used for incremental deploys; not in busybox.
     # udevadm: 'udevadm settle' flushes kernel uevents after partprobe so that
     # /dev/sda1 etc. exist before we try to mkfs them. Lives in /usr/bin on Rocky 9.
     DEPLOY_TOOLS_BIN=(
-        tar             # GNU tar (image extraction — .tar.gz / .tar.xz)
-        gzip            # GNU gzip (decompression)
+        tar             # GNU tar (image extraction — .tar.gz / .tar.zst)
+        gzip            # GNU gzip (decompression fallback)
+        pigz            # parallel gzip — multi-core decompression of .tar.gz images
+        zstd            # zstandard — fast decompression of .tar.zst images
         rsync           # incremental deploy sync
         udevadm         # device settle after partition table changes
     )
@@ -450,6 +457,11 @@ else
     mkdir -p "$WORKDIR/lib/modules/$KVER/kernel/drivers/net"
     mkdir -p "$WORKDIR/lib/modules/$KVER/kernel/drivers/scsi"
     mkdir -p "$WORKDIR/lib/modules/$KVER/kernel/drivers/block"
+    mkdir -p "$WORKDIR/lib/modules/$KVER/kernel/fs/xfs"
+    mkdir -p "$WORKDIR/lib/modules/$KVER/kernel/fs/ext4"
+    mkdir -p "$WORKDIR/lib/modules/$KVER/kernel/fs/jbd2"
+    mkdir -p "$WORKDIR/lib/modules/$KVER/kernel/lib"
+    mkdir -p "$WORKDIR/lib/modules/$KVER/kernel/arch/x86/crypto"
 
     # List of module paths relative to /lib/modules/$KVER/kernel/
     # Network: failover → net_failover → virtio_net
@@ -460,7 +472,12 @@ else
     #                  the block node, so /sys/class/block/ stays empty.
     # Storage (virtio block device, e.g. Proxmox virtio0):
     #   virtio_blk   — direct virtio block driver, creates /dev/vdX
-    # All have no module dependencies on the Rocky 9 kernel.
+    # Filesystems and their deps:
+    #   crc32c-intel — hardware CRC32C acceleration (required by xfs, libcrc32c)
+    #   libcrc32c    — software CRC32C library (required by xfs)
+    #   xfs          — XFS filesystem (required for mount after mkfs.xfs)
+    #   jbd2         — journaling block device (required by ext4)
+    #   ext4         — ext4 filesystem
     MODULES=(
         "net/core/failover.ko.xz"
         "drivers/net/net_failover.ko.xz"
@@ -468,6 +485,11 @@ else
         "drivers/scsi/virtio_scsi.ko.xz"
         "drivers/scsi/sd_mod.ko.xz"
         "drivers/block/virtio_blk.ko.xz"
+        "arch/x86/crypto/crc32c-intel.ko.xz"
+        "lib/libcrc32c.ko.xz"
+        "fs/xfs/xfs.ko.xz"
+        "fs/jbd2/jbd2.ko.xz"
+        "fs/ext4/ext4.ko.xz"
     )
 
     for mod_rel in "${MODULES[@]}"; do
@@ -501,6 +523,11 @@ kernel/drivers/net/virtio_net.ko: kernel/drivers/net/net_failover.ko kernel/net/
 kernel/drivers/scsi/virtio_scsi.ko:
 kernel/drivers/scsi/sd_mod.ko:
 kernel/drivers/block/virtio_blk.ko:
+kernel/arch/x86/crypto/crc32c-intel.ko:
+kernel/lib/libcrc32c.ko: kernel/arch/x86/crypto/crc32c-intel.ko
+kernel/fs/xfs/xfs.ko: kernel/lib/libcrc32c.ko
+kernel/fs/jbd2/jbd2.ko:
+kernel/fs/ext4/ext4.ko: kernel/fs/jbd2/jbd2.ko
 MODDEP
 
     cat > "$MODDEP_DIR/modules.alias" << MODALIAS
@@ -607,6 +634,17 @@ mount -t devpts devpts /dev/pts 2>/dev/null
 log "============================================"
 log " clonr initramfs init started"
 log "============================================"
+
+# ── Step 1b: register mdev as the kernel hotplug handler ─────────────────────
+# This makes the kernel exec /bin/mdev for every uevent (new disk, new partition,
+# etc.). Without this, partition nodes (/dev/sda1, /dev/sda2) are never created
+# after sgdisk because there is no udevd in the initramfs to process the uevents.
+# With this set, the moment sgdisk writes a new partition table and the kernel
+# fires the partition-add uevents, mdev is invoked and creates /dev/sda1 etc.
+echo /bin/mdev > /proc/sys/kernel/hotplug 2>/dev/null || true
+log "hotplug handler: \$(cat /proc/sys/kernel/hotplug 2>/dev/null || echo unavailable)"
+# Run mdev -s once now to create device nodes for all currently visible hardware.
+/bin/mdev -s 2>/dev/null || true
 log "cmdline: \$(cat /proc/cmdline)"
 log "kernel : \$(uname -r)"
 
@@ -644,7 +682,12 @@ for mod in \
     "\$MODBASE/kernel/drivers/net/virtio_net.ko" \
     "\$MODBASE/kernel/drivers/scsi/virtio_scsi.ko" \
     "\$MODBASE/kernel/drivers/scsi/sd_mod.ko" \
-    "\$MODBASE/kernel/drivers/block/virtio_blk.ko"; do
+    "\$MODBASE/kernel/drivers/block/virtio_blk.ko" \
+    "\$MODBASE/kernel/arch/x86/crypto/crc32c-intel.ko" \
+    "\$MODBASE/kernel/lib/libcrc32c.ko" \
+    "\$MODBASE/kernel/fs/xfs/xfs.ko" \
+    "\$MODBASE/kernel/fs/jbd2/jbd2.ko" \
+    "\$MODBASE/kernel/fs/ext4/ext4.ko"; do
     name=\$(basename "\$mod")
     if [ -f "\$mod" ]; then
         err=\$(insmod "\$mod" 2>&1)
@@ -680,7 +723,14 @@ log "/dev contents: \$(ls /dev/ 2>/dev/null | tr '\n' ' ' | head -c 200)"
 log "lsblk test (simple): \$(/usr/bin/lsblk --json --bytes --output NAME,SIZE,TYPE 2>&1 | head -c 500 || echo LSBLK_FAILED)"
 log "lsblk test (full cols): \$(/usr/bin/lsblk --json --bytes --output NAME,SIZE,TYPE,MODEL,SERIAL,FSTYPE,MOUNTPOINT,TRAN,ROTA,PHY-SEC,LOG-SEC,PTTYPE,PTUUID,PARTUUID,PARTTYPE,PARTLABEL 2>&1 | head -c 800 || echo LSBLK_FULL_FAILED)"
 
-log "loaded: \$(cat /proc/modules 2>/dev/null | grep -E 'virtio|failover' | cut -d' ' -f1 | tr '\n' ' ')"
+# Run mdev -s to scan sysfs and create device nodes for all discovered hardware.
+# This is critical in initramfs environments — devtmpfs creates /dev/sda but
+# partition nodes (/dev/sda1 etc.) may not appear until mdev scans /sys/class/block/.
+# We run mdev twice: once now (for base disk nodes), and again after partprobe
+# (handled by the clonr deploy code itself).
+/bin/mdev -s 2>/dev/null || true
+log "mdev -s ran — dev nodes after mdev: \$(ls /dev/sd* /dev/vd* /dev/nvme* 2>/dev/null | tr '\n' ' ' || echo none)"
+log "loaded: \$(cat /proc/modules 2>/dev/null | grep -E 'virtio|failover|xfs|ext4' | cut -d' ' -f1 | tr '\n' ' ')"
 log "ifaces: \$(ls /sys/class/net/ 2>/dev/null | tr '\n' ' ')"
 # Also dump all interfaces for diagnostics
 ls -la /sys/class/net/ 2>/dev/null | tee -a "\$LOG"
