@@ -849,6 +849,41 @@ func runAutoDeployImage(ctx context.Context, c *client.Client, nodeCfg api.NodeC
 	deployLog.Info().Str("hostname", nodeCfg.Hostname).Msg("node configuration applied")
 	reporter.EndPhase("")
 
+	// ── Auto boot-flip ──────────────────────────────────────────────────────
+	// After a successful deploy, tell the server to set the next boot device to
+	// disk via the node's configured power provider. The server handles both IPMI
+	// and Proxmox. If no provider is configured, log and let the node reboot
+	// normally via kernel reboot syscall (handled in finalize / reboot).
+	if nodeCfg.PowerProvider != nil && nodeCfg.PowerProvider.Type != "" {
+		reporter.StartPhase("flip-to-disk", 0)
+		deployLog.Info().
+			Str("hostname", nodeCfg.Hostname).
+			Str("provider", nodeCfg.PowerProvider.Type).
+			Msg("flipping next boot to disk via power provider")
+
+		flipCtx, flipCancel := context.WithTimeout(ctx, 30*time.Second)
+		flipErr := c.FlipToDisk(flipCtx, nodeCfg.ID, false)
+		flipCancel()
+
+		if flipErr != nil {
+			// Non-fatal: log the error but don't abort. The OS will still boot
+			// if the disk is first in the persistent boot order; this only sets
+			// the one-time next-boot device.
+			deployLog.Warn().Err(flipErr).
+				Str("hostname", nodeCfg.Hostname).
+				Msg("flip-to-disk failed (non-fatal) — node may PXE boot again on next restart")
+			reporter.EndPhase(flipErr.Error())
+		} else {
+			deployLog.Info().Str("hostname", nodeCfg.Hostname).
+				Msg("next boot set to disk")
+			reporter.EndPhase("")
+		}
+	} else {
+		deployLog.Info().Str("hostname", nodeCfg.Hostname).
+			Msg("no power provider configured — manual reboot required to boot from disk")
+	}
+	// ───────────────────────────────────────────────────────────────────────
+
 	deployLog.Info().Str("hostname", nodeCfg.Hostname).Str("duration",
 		time.Since(start).Round(time.Second).String()).Msg("auto-deployment complete — rebooting")
 

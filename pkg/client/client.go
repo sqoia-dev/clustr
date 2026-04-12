@@ -188,6 +188,18 @@ func (c *Client) RegisterNode(ctx context.Context, req api.RegisterRequest) (*ap
 	return &resp, nil
 }
 
+// FlipToDisk calls POST /api/v1/nodes/:id/power/flip-to-disk.
+// The server instructs the node's configured power provider to set the next boot
+// device to disk. When cycle is true, the server also power-cycles the node so
+// it reboots immediately into the deployed OS.
+func (c *Client) FlipToDisk(ctx context.Context, nodeID string, cycle bool) error {
+	path := "/api/v1/nodes/" + nodeID + "/power/flip-to-disk"
+	if cycle {
+		path += "?cycle=true"
+	}
+	return c.post(ctx, path, nil, nil)
+}
+
 // Health checks the server's health endpoint.
 func (c *Client) Health(ctx context.Context) (*api.HealthResponse, error) {
 	var h api.HealthResponse
