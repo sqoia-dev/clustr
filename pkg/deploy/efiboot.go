@@ -32,7 +32,7 @@ func FixEFIBoot(ctx context.Context, disk string, espPartNum int, label, loader 
 	}
 
 	// Remove stale entries with the same label to avoid duplicates.
-	if err := removeStalentries(ctx, label); err != nil {
+	if err := removeStaleEntries(ctx, label); err != nil {
 		// Non-fatal — proceed even if cleanup fails.
 		_ = err
 	}
@@ -63,8 +63,8 @@ func FixEFIBoot(ctx context.Context, disk string, espPartNum int, label, loader 
 	return setBootEntry(ctx, newNum)
 }
 
-// removeStalentries deletes existing efibootmgr entries matching label.
-func removeStalentries(ctx context.Context, label string) error {
+// removeStaleEntries deletes existing efibootmgr entries matching label.
+func removeStaleEntries(ctx context.Context, label string) error {
 	entries, err := listBootEntries(ctx)
 	if err != nil {
 		return err
