@@ -107,6 +107,8 @@ func (s *Server) buildRouter() chi.Router {
 	health := &handlers.HealthHandler{Version: "dev"}
 	images := &handlers.ImagesHandler{DB: s.db, ImageDir: s.cfg.ImageDir, Progress: s.progress}
 	nodes := &handlers.NodesHandler{DB: s.db}
+	nodeGroups := &handlers.NodeGroupsHandler{DB: s.db}
+	layoutH := &handlers.LayoutHandler{DB: s.db}
 	imgFactory := &image.Factory{
 		Store:    s.db,
 		ImageDir: s.cfg.ImageDir,
@@ -197,6 +199,22 @@ func (s *Server) buildRouter() chi.Router {
 			// node should boot from disk or run another deploy on next PXE boot.
 			r.Post("/nodes/{id}/deploy-complete", nodes.DeployComplete)
 			r.Post("/nodes/{id}/deploy-failed", nodes.DeployFailed)
+
+			// Disk layout hierarchy — node-level overrides, group assignment,
+			// hardware-aware recommendations, and validation.
+			r.Get("/nodes/{id}/layout-recommendation", layoutH.GetLayoutRecommendation)
+			r.Get("/nodes/{id}/effective-layout", layoutH.GetEffectiveLayout)
+			r.Put("/nodes/{id}/layout-override", layoutH.SetNodeLayoutOverride)
+			r.Post("/nodes/{id}/layout/validate", layoutH.ValidateLayout)
+			r.Put("/nodes/{id}/group", layoutH.AssignNodeGroup)
+			r.Get("/nodes/{id}/effective-mounts", layoutH.GetEffectiveMounts)
+
+			// Node groups — named sets of nodes sharing a disk layout override.
+			r.Get("/node-groups", nodeGroups.ListNodeGroups)
+			r.Post("/node-groups", nodeGroups.CreateNodeGroup)
+			r.Get("/node-groups/{id}", nodeGroups.GetNodeGroup)
+			r.Put("/node-groups/{id}", nodeGroups.UpdateNodeGroup)
+			r.Delete("/node-groups/{id}", nodeGroups.DeleteNodeGroup)
 
 			// IPMI / power management — subpaths of /nodes/{id} must be
 			// registered in the same chi group so the auth middleware applies.

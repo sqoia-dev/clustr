@@ -744,3 +744,85 @@ func fstabMountOpts(fstype, mountpoint string) string {
 		return "defaults"
 	}
 }
+
+// applyExtraMounts appends custom fstab entries from NodeConfig.ExtraMounts and
+// optionally creates the mount point directories inside the deployed filesystem.
+// It must be called after applyBootConfig so the base fstab already exists.
+//
+// Invalid entries are skipped with a warning rather than aborting the deployment,
+// because a bad shared-storage entry should not prevent the node from booting.
+func applyExtraMounts(ctx context.Context, mountRoot string, mounts []api.FstabEntry) error {
+	if len(mounts) == 0 {
+		return nil
+	}
+
+	log := logger()
+
+	fstabPath := filepath.Join(mountRoot, "etc", "fstab")
+	f, err := os.OpenFile(fstabPath, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("applyExtraMounts: open fstab: %w", err)
+	}
+	defer f.Close()
+
+	fmt.Fprintf(f, "\n# Additional mounts from clonr NodeConfig.ExtraMounts\n")
+
+	written := 0
+	for _, m := range mounts {
+		if err := api.ValidateFstabEntry(m); err != nil {
+			log.Warn().Err(err).Str("mount_point", m.MountPoint).
+				Msg("finalize: skipping invalid extra fstab entry")
+			continue
+		}
+
+		// Auto-create the mount point directory inside the deployed filesystem.
+		if m.AutoMkdir {
+			targetDir := filepath.Join(mountRoot, m.MountPoint)
+
+			// Path traversal guard: the resolved absolute path must remain inside mountRoot.
+			absTarget, err := filepath.Abs(targetDir)
+			if err != nil || !strings.HasPrefix(absTarget, mountRoot+string(filepath.Separator)) {
+				log.Warn().Str("mount_point", m.MountPoint).
+					Msg("finalize: mount point escapes deployed filesystem root — skipping mkdir")
+			} else if err := os.MkdirAll(absTarget, 0755); err != nil {
+				// Non-fatal: the mount will fail at boot, but we still write the entry
+				// so the operator can investigate rather than silently losing the config.
+				log.Warn().Err(err).Str("path", absTarget).
+					Msg("finalize: failed to create extra mount point (non-fatal)")
+			} else {
+				log.Info().Str("path", m.MountPoint).
+					Msg("finalize: created mount point for extra mount")
+			}
+		}
+
+		// Resolve mount options: default to "defaults" when empty, then auto-inject
+		// _netdev for network filesystems that omit it (needed so systemd waits for
+		// the network before attempting the mount).
+		opts := m.Options
+		if opts == "" {
+			opts = "defaults"
+		}
+		if api.IsNetworkFS(m.FSType) && !strings.Contains(opts, "_netdev") {
+			opts += ",_netdev"
+			log.Info().Str("fs_type", m.FSType).Str("mount_point", m.MountPoint).
+				Msg("finalize: auto-added _netdev to extra mount options for network filesystem")
+		}
+
+		if m.Comment != "" {
+			fmt.Fprintf(f, "# %s\n", m.Comment)
+		}
+		// fstab format: source  mountpoint  fstype  options  dump  pass
+		fmt.Fprintf(f, "%s\t%s\t%s\t%s\t%d\t%d\n",
+			m.Source, m.MountPoint, m.FSType, opts, m.Dump, m.Pass)
+
+		log.Info().
+			Str("source", m.Source).
+			Str("mount_point", m.MountPoint).
+			Str("fs_type", m.FSType).
+			Msg("finalize: wrote extra fstab entry")
+		written++
+	}
+
+	log.Info().Int("count", written).Msg("finalize: extra fstab entries written")
+	return nil
+}

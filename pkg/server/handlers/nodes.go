@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"regexp"
@@ -169,21 +170,44 @@ func (h *NodesHandler) UpdateNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate extra mount entries before touching the database.
+	for i, m := range req.ExtraMounts {
+		if err := api.ValidateFstabEntry(m); err != nil {
+			writeValidationError(w, fmt.Sprintf("extra_mounts[%d]: %s", i, err.Error()))
+			return
+		}
+	}
+
+	// Resolve the layout override: use whatever was in the request, but honour
+	// ClearLayoutOverride to explicitly remove a previously set override.
+	layoutOverride := req.DiskLayoutOverride
+	if req.ClearLayoutOverride {
+		layoutOverride = nil
+	}
+	// Preserve the existing group assignment unless explicitly changed in the request.
+	groupID := existing.GroupID
+	if req.GroupID != "" || req.GroupID == "" && existing.GroupID != "" {
+		groupID = req.GroupID
+	}
+
 	cfg := api.NodeConfig{
-		ID:            id,
-		Hostname:      req.Hostname,
-		HostnameAuto:  false, // admin explicitly set the hostname → mark as non-auto
-		FQDN:          req.FQDN,
-		PrimaryMAC:    req.PrimaryMAC,
-		Interfaces:    req.Interfaces,
-		SSHKeys:       req.SSHKeys,
-		KernelArgs:    req.KernelArgs,
-		Groups:        req.Groups,
-		CustomVars:    req.CustomVars,
-		BaseImageID:   req.BaseImageID,
-		PowerProvider: req.PowerProvider,
-		CreatedAt:     existing.CreatedAt,
-		UpdatedAt:     time.Now().UTC(),
+		ID:                 id,
+		Hostname:           req.Hostname,
+		HostnameAuto:       false, // admin explicitly set the hostname → mark as non-auto
+		FQDN:               req.FQDN,
+		PrimaryMAC:         req.PrimaryMAC,
+		Interfaces:         req.Interfaces,
+		SSHKeys:            req.SSHKeys,
+		KernelArgs:         req.KernelArgs,
+		Groups:             req.Groups,
+		CustomVars:         req.CustomVars,
+		BaseImageID:        req.BaseImageID,
+		PowerProvider:      req.PowerProvider,
+		GroupID:            groupID,
+		DiskLayoutOverride: layoutOverride,
+		ExtraMounts:        req.ExtraMounts,
+		CreatedAt:          existing.CreatedAt,
+		UpdatedAt:          time.Now().UTC(),
 	}
 	if cfg.Interfaces == nil {
 		cfg.Interfaces = []api.InterfaceConfig{}
@@ -225,6 +249,9 @@ func (h *NodesHandler) GetNodeByMAC(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	// Pre-merge group extra mounts so the deploy client receives the full
+	// effective mount list in ExtraMounts without needing a separate group lookup.
+	cfg = mergeGroupExtraMounts(r.Context(), h.DB, cfg)
 	writeJSON(w, http.StatusOK, sanitizeNodeConfig(cfg))
 }
 
@@ -318,6 +345,9 @@ func (h *NodesHandler) RegisterNode(w http.ResponseWriter, r *http.Request) {
 		Bool("reimage_pending", nodeCfg.ReimagePending).
 		Bool("dry_run", dryRun).
 		Str("action", action).Msg("node registered")
+
+	// Pre-merge group extra mounts so the deploy client's ExtraMounts is complete.
+	nodeCfg = mergeGroupExtraMounts(r.Context(), h.DB, nodeCfg)
 
 	writeJSON(w, http.StatusOK, api.RegisterResponse{
 		NodeConfig: &nodeCfg,

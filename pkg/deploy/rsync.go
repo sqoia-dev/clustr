@@ -341,6 +341,15 @@ func (d *FilesystemDeployer) Finalize(ctx context.Context, cfg api.NodeConfig, m
 		return fmt.Errorf("deploy: finalize: boot config: %w", err)
 	}
 
+	// Append shared-storage fstab entries (NFS, Lustre, BeeGFS, CIFS, etc.)
+	// and auto-create mount point directories in the deployed filesystem.
+	// Called after applyBootConfig so the base fstab already exists.
+	if err := applyExtraMounts(ctx, mountRoot, cfg.ExtraMounts); err != nil {
+		// Non-fatal: a bad shared-storage config must not prevent the node from
+		// booting. The operator can correct and redeploy.
+		logger().Warn().Err(err).Msg("WARNING: finalize: extra mounts failed (non-fatal)")
+	}
+
 	// If the layout includes RAID arrays, write mdadm.conf and update initramfs
 	// so the deployed system can reassemble its arrays on next boot.
 	if len(d.layout.RAIDArrays) > 0 {
