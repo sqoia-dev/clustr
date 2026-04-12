@@ -428,6 +428,120 @@ Reads from local BMC when no `--host` is provided.
 
 ---
 
+### `clonr ipmi test-boot-flip-direct`
+
+Validates the boot-device override configuration directly against a real BMC **without power cycling the node**. Run this when setting up a new BMC or debugging IPMI compatibility issues before registering the node on the server.
+
+For nodes already registered on the server, use `clonr ipmi test-boot-flip --node <id>` instead (it uses the server-stored credentials and provider config).
+
+```
+clonr ipmi test-boot-flip-direct \
+  --host <bmc-ip> --user <user> --pass <pass> \
+  --device disk --persistent --efi
+```
+
+Steps performed:
+1. Detect BMC vendor (`ipmitool mc info`) and print applicable quirks
+2. Send the boot override (`SetBootDevWithOpts`)
+3. Read back `chassis bootparam get 5` and compare to expected values
+4. Print the raw 5-byte parameter data
+
+The node is **not** power cycled. Any mismatch between set and read-back values is printed as a warning, not an error.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--host` | required | BMC IP address |
+| `--user` | | BMC username |
+| `--pass` | | BMC password |
+| `--device` | `disk` | Boot device: `disk`, `pxe`, `bios`, `cd` |
+| `--persistent` | `true` | Persist override across all future power cycles |
+| `--efi` | `false` | Request UEFI boot mode |
+
+---
+
+## IPMI Bootdev Compatibility
+
+clonr uses a two-path strategy for setting the chassis boot device override on real bare-metal hardware:
+
+1. **Friendly path** — `ipmitool chassis bootdev <dev> options=persistent[,efiboot]`
+2. **Raw fallback** — `ipmitool raw 0x00 0x08 0x05 <flags> <device> 0x00 0x00 0x00`
+
+The raw path is used automatically when the friendly command fails (non-zero exit). For BMC vendors where the friendly command is known to be silently broken (Supermicro X9/X10), the raw path is used immediately without attempting the friendly command first.
+
+### Tested vendors
+
+| Vendor | BMC | Notes |
+|---|---|---|
+| Dell | iDRAC7+ | Standard IPMI works; persistent mode forced (one-time override unreliable on pre-iDRAC7) |
+| Dell | iDRAC5/6 (R6xx) | May silently ignore friendly command; raw fallback applied automatically |
+| HPE | iLO4, iLO5 | Friendly path works but requires a 3-second pause before power cycle (applied automatically) |
+| Supermicro | X10, X11, X12 | Standard IPMI works |
+| Supermicro | X9 | One-time override broken in firmware; raw command + persistent forced automatically |
+| Lenovo | XCC (ThinkSystem) | Standard IPMI works; `bootparam get 5` read-back is stale after write (verify skipped) |
+| Lenovo | IMM2 (System x) | Same as XCC |
+| Generic | Any IPMI 2.0 | Standard friendly path with persistent option |
+
+### Known issues and workarounds
+
+**Symptom:** Node ignores boot override and boots from previous default.
+**Cause:** BMC consumed the one-time override bit during a previous reboot, or silently ignored the command.
+**Fix:** Use `CLONR_IPMI_USE_RAW=true` to force the raw command path, which bypasses the BMC's high-level command parser.
+
+**Symptom:** `clonr ipmi test-boot-flip-direct` shows device mismatch in the read-back, but the node actually boots correctly.
+**Cause:** Some BMCs (especially Lenovo XCC/IMM2) return stale bootparam data in the same IPMI session as the write. The boot behaviour at POST time is correct.
+**Fix:** This is expected; test-boot-flip-direct will note that verify is skipped for Lenovo. If the node boots correctly, ignore the read-back discrepancy.
+
+**Symptom:** HPE node ignores boot override intermittently.
+**Cause:** Power cycle was issued within 3 seconds of the boot-flip command. The iLO firmware races the flush to non-volatile storage.
+**Fix:** When using clonr's `PowerCycleAfterBoot`, the 3-second delay is applied automatically. If scripting ipmitool directly, add `sleep 3` between the bootdev set and power cycle.
+
+### Environment variable overrides
+
+These environment variables override auto-detection when the heuristics fail:
+
+| Variable | Effect |
+|---|---|
+| `CLONR_IPMI_USE_RAW=true` | Force raw `ipmitool raw 0x00 0x08 ...` command for all BMCs, skipping the friendly path entirely |
+| `CLONR_IPMI_EFI=true` | Force UEFI boot mode even when not detected or not requested via flags |
+
+### Raw IPMI command reference
+
+The raw command maps to IPMI spec section 28.12 (Set System Boot Options, parameter 5):
+
+```
+# Disk, persistent, UEFI (default for production deploy)
+ipmitool raw 0x00 0x08 0x05 0xE0 0x08 0x00 0x00 0x00
+
+# PXE, persistent, UEFI
+ipmitool raw 0x00 0x08 0x05 0xE0 0x04 0x00 0x00 0x00
+
+# Disk, persistent, BIOS/legacy
+ipmitool raw 0x00 0x08 0x05 0xC0 0x08 0x00 0x00 0x00
+
+# PXE, persistent, BIOS/legacy
+ipmitool raw 0x00 0x08 0x05 0xC0 0x04 0x00 0x00 0x00
+```
+
+Flag byte bit layout (3rd parameter byte):
+
+| Bit | Mask | Meaning |
+|---|---|---|
+| 7 | `0x80` | Valid — must be 1 for BMC to honour the setting |
+| 6 | `0x40` | Persistent — survive all future power cycles |
+| 5 | `0x20` | EFI — request UEFI firmware path |
+| 4-0 | — | Reserved, must be 0 |
+
+Device byte values (4th parameter byte):
+
+| Value | Device |
+|---|---|
+| `0x04` | PXE / Network boot |
+| `0x08` | Hard disk (default) |
+| `0x14` | CD/DVD |
+| `0x18` | BIOS setup utility |
+
+---
+
 ## Image Factory
 
 The image factory handles the full image lifecycle: pulling from URLs, importing from ISOs, interactive chroot customization, and capturing images from running nodes.
