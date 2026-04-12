@@ -1,6 +1,8 @@
 // Package reimage orchestrates node reimaging: it assigns a new base image,
-// sets next boot to PXE, power-cycles the node via the power provider registry,
-// and tracks the request lifecycle in the database.
+// sets reimage_pending = true (so the PXE server routes the next boot to deploy),
+// power-cycles the node via the power provider registry, and tracks the request
+// lifecycle in the database. Boot routing is handled by the PXE server, not the
+// power provider — no SetNextBoot(PXE) calls are made.
 package reimage
 
 import (
@@ -32,14 +34,19 @@ func New(database *db.DB, registry *power.Registry, logger zerolog.Logger) *Orch
 	}
 }
 
-// Trigger executes an immediate reimage for the request identified by reqID:
-//  1. Loads the reimage request and node config.
-//  2. Validates a power provider is configured.
-//  3. Updates node.base_image_id to the requested image.
-//  4. Sets node.reimage_pending = true.
-//  5. Calls provider.SetNextBoot(PXE).
-//  6. Calls provider.PowerCycle().
-//  7. Updates the reimage request status to "triggered".
+// Trigger executes an immediate reimage for the request identified by reqID.
+//
+// Boot routing is handled entirely by the PXE server: when the node PXE boots
+// and hits /api/v1/boot/ipxe, the handler checks reimage_pending and returns
+// the full clonr initramfs script. No SetNextBoot(PXE) call is needed.
+//
+// Steps:
+//  1. Load the reimage request and node config.
+//  2. Validate a power provider is configured.
+//  3. Assign node.base_image_id to the requested image.
+//  4. Set node.reimage_pending = true (PXE handler reads this on next boot).
+//  5. Call provider.PowerCycle() to trigger the reboot (skipped for dry_run).
+//  6. Update the reimage request status to "triggered".
 //
 // If any step fails after the DB writes have started, the request status is
 // set to "failed" with the error message before returning.
@@ -77,33 +84,31 @@ func (o *Orchestrator) Trigger(ctx context.Context, reqID string) error {
 		return fmt.Errorf("reimage trigger: set reimage_pending on node %s: %w", node.ID, err)
 	}
 
+	// No SetNextBoot(PXE) call needed. The PXE server is the source of truth:
+	// when the node PXE boots and hits /api/v1/boot/ipxe?mac=<mac>, the handler
+	// reads reimage_pending=true and returns the full clonr deploy script.
+	// PXE must be first in the BIOS boot order (set once during rack/stack).
 	o.Logger.Info().
 		Str("req_id", reqID).
 		Str("node_id", node.ID).
 		Str("node_hostname", node.Hostname).
 		Str("image_id", req.ImageID).
 		Bool("dry_run", req.DryRun).
-		Msg("setting next boot to PXE")
-
-	if err := provider.SetNextBoot(ctx, power.BootPXE); err != nil {
-		errMsg := fmt.Sprintf("SetNextBoot(PXE) failed: %v", err)
-		_ = o.DB.UpdateReimageRequestStatus(ctx, reqID, api.ReimageStatusFailed, errMsg)
-		return fmt.Errorf("reimage trigger: %s (node %s)", errMsg, node.ID)
-	}
+		Msg("reimage_pending set — PXE server will route next boot to deploy")
 
 	if req.DryRun {
-		// Dry run: PXE boot is set but we skip the power cycle. The node will
-		// PXE boot on next natural reboot instead of an immediate cycle.
+		// Dry run: reimage_pending is set but skip the power cycle. The node
+		// will deploy on next natural reboot (PXE first in boot order).
 		o.Logger.Info().
 			Str("req_id", reqID).
 			Str("node_id", node.ID).
-			Msg("dry_run=true — skipping power cycle; node will PXE on next reboot")
+			Msg("dry_run=true — skipping power cycle; node will deploy on next PXE boot")
 	} else {
 		o.Logger.Info().
 			Str("req_id", reqID).
 			Str("node_id", node.ID).
 			Str("node_hostname", node.Hostname).
-			Msg("power cycling node for reimage")
+			Msg("power cycling node to trigger reimage")
 
 		if err := provider.PowerCycle(ctx); err != nil {
 			errMsg := fmt.Sprintf("PowerCycle failed: %v", err)
