@@ -364,11 +364,14 @@ var identifyCmd = &cobra.Command{
 
 func newDeployCmd() *cobra.Command {
 	var (
-		flagImage     string
-		flagDisk      string
-		flagMountRoot string
-		flagFixEFI    bool
-		flagAuto      bool
+		flagImage      string
+		flagDisk       string
+		flagMountRoot  string
+		flagFixEFI     bool
+		flagAuto       bool
+		flagNoRollback bool
+		flagSkipVerify bool
+		flagTimeout    string
 	)
 
 	cmd := &cobra.Command{
@@ -396,7 +399,20 @@ PXE-booted nodes running from initramfs.`,
 				return fmt.Errorf("--image is required")
 			}
 
-			ctx := context.Background()
+			// Resolve deployment timeout (env var overrides flag default).
+			timeoutStr := flagTimeout
+			if envTimeout := os.Getenv("CLONR_DEPLOY_TIMEOUT"); envTimeout != "" {
+				timeoutStr = envTimeout
+			}
+			deployTimeout, err := time.ParseDuration(timeoutStr)
+			if err != nil {
+				return fmt.Errorf("invalid deployment timeout %q: %w", timeoutStr, err)
+			}
+
+			baseCtx := context.Background()
+			ctx, cancelTimeout := context.WithTimeout(baseCtx, deployTimeout)
+			defer cancelTimeout()
+
 			c := clientFromFlags()
 
 			// ── Remote logging setup ─────────────────────────────────────────
@@ -493,15 +509,26 @@ PXE-booted nodes running from initramfs.`,
 			fmt.Fprintln(os.Stderr, "[5/6] Deploying image...")
 			deployLog.Info().Str("component", "deploy").Msg("starting image write")
 			opts := deploy.DeployOpts{
-				ImageURL:   blobURL,
-				AuthToken:  cfg.AuthToken,
-				TargetDisk: flagDisk,
-				Format:     string(img.Format),
-				MountRoot:  mountRoot,
+				ImageURL:         blobURL,
+				AuthToken:        cfg.AuthToken,
+				TargetDisk:       flagDisk,
+				Format:           string(img.Format),
+				MountRoot:        mountRoot,
+				NoRollback:       flagNoRollback,
+				SkipVerify:       flagSkipVerify,
+				ExpectedChecksum: img.Checksum,
 			}
 
 			start := time.Now()
+			var lastPhase string
 			progressFn := func(written, total int64, phase string) {
+				if phase != lastPhase {
+					if lastPhase != "" {
+						fmt.Fprintln(os.Stderr) // newline after previous phase
+					}
+					lastPhase = phase
+					deployLog.Info().Str("component", "deploy").Str("phase", phase).Msg("deployment phase started")
+				}
 				if total > 0 {
 					pct := float64(written) / float64(total) * 100
 					fmt.Fprintf(os.Stderr, "\r    %s: %.1f%% (%s / %s)",
@@ -513,6 +540,13 @@ PXE-booted nodes running from initramfs.`,
 
 			if err := deployer.Deploy(ctx, opts, progressFn); err != nil {
 				fmt.Fprintln(os.Stderr) // newline after progress
+				if ctx.Err() != nil {
+					deployLog.Error().Str("component", "deploy").
+						Dur("timeout", deployTimeout).
+						Msg("deployment timed out — rollback attempted")
+					return fmt.Errorf("deploy: timed out after %s (limit set by --timeout / CLONR_DEPLOY_TIMEOUT): %w",
+						deployTimeout, err)
+				}
 				deployLog.Error().Str("component", "deploy").Err(err).Msg("image write failed")
 				return fmt.Errorf("deploy: %w", err)
 			}
@@ -563,6 +597,12 @@ PXE-booted nodes running from initramfs.`,
 	cmd.Flags().BoolVar(&flagFixEFI, "fix-efi", false, "Repair EFI boot entries after deployment")
 	cmd.Flags().BoolVar(&flagAuto, "auto", false,
 		"Auto mode: register with server, wait for image assignment, then deploy (for PXE-booted nodes)")
+	cmd.Flags().BoolVar(&flagNoRollback, "no-rollback", false,
+		"Skip partition table backup/restore on failure (use when intentionally wiping a disk)")
+	cmd.Flags().BoolVar(&flagSkipVerify, "skip-verify", false,
+		"Skip image checksum verification (deploy even if the sha256 does not match)")
+	cmd.Flags().StringVar(&flagTimeout, "timeout", "30m",
+		"Maximum time allowed for the entire deployment (env: CLONR_DEPLOY_TIMEOUT, e.g. 30m, 1h)")
 
 	return cmd
 }
