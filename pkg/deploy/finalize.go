@@ -482,6 +482,20 @@ func installKernelInChroot(ctx context.Context, mountRoot, targetDisk string) er
 		_ = os.WriteFile(resolvDst, data, 0o644)
 	}
 
+	// Ensure /tmp exists and is writable inside the chroot.
+	// dnf requires /tmp for its download cache and RPM scriptlets.
+	// Images captured without /tmp (or with sticky-bit /tmp permissions stripped)
+	// will cause dnf to fail with "mkstemp: No such file or directory".
+	tmpDir := filepath.Join(mountRoot, "tmp")
+	if err := os.MkdirAll(tmpDir, 0o1777); err != nil {
+		log.Warn().Err(err).Str("path", tmpDir).Msg("finalize/boot: could not create /tmp in chroot (non-fatal)")
+	}
+	// Ensure /boot/grub2 directory exists so grub2-mkconfig can write grub.cfg.
+	grub2Dir := filepath.Join(mountRoot, "boot", "grub2")
+	if err := os.MkdirAll(grub2Dir, 0o755); err != nil {
+		log.Warn().Err(err).Str("path", grub2Dir).Msg("finalize/boot: could not create /boot/grub2 in chroot (non-fatal)")
+	}
+
 	// Install kernel and grub2-pc inside the deployed chroot.
 	// We always use "chroot <mountRoot> dnf" because the initramfs (deployment host)
 	// does not have dnf — it must be invoked from within the deployed image, which
@@ -613,7 +627,10 @@ func applyBootConfig(ctx context.Context, mountRoot, targetDisk string, layout a
 	// deployed from it. Truncating (not removing) the file causes systemd to
 	// generate a new ID on first boot and write it back.
 	machineIDPath := filepath.Join(mountRoot, "etc", "machine-id")
-	if err := os.WriteFile(machineIDPath, []byte{}, 0o444); err != nil {
+	// Mode 0644: must be writable so systemd-machine-id-setup can write the new ID
+	// on first boot. The previous 0444 (read-only) prevented systemd from updating
+	// the file, leaving the machine-id empty and causing sshd-keygen to fail.
+	if err := os.WriteFile(machineIDPath, []byte{}, 0o644); err != nil {
 		log.Warn().Err(err).Str("path", machineIDPath).
 			Msg("finalize/boot: could not truncate machine-id (non-fatal)")
 	} else {
