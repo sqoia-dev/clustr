@@ -796,7 +796,7 @@ const Pages = {
         overlay.className = 'modal-overlay';
         overlay.id = 'pull-modal';
         overlay.innerHTML = `
-            <div class="modal">
+            <div class="modal" style="max-width:600px">
                 <div class="modal-header">
                     <span class="modal-title">Pull Image</span>
                     <button class="modal-close" onclick="document.getElementById('pull-modal').remove()">×</button>
@@ -806,15 +806,24 @@ const Pages = {
                         <div class="form-grid">
                             <div class="form-group" style="grid-column:1/-1">
                                 <label>Image URL *</label>
-                                <input type="url" name="url" placeholder="https://example.com/image.tar.gz" required>
+                                <input type="url" name="url" id="pull-url"
+                                    placeholder="https://example.com/image.tar.gz  or  https://…/Rocky-10.1-x86_64-dvd1.iso"
+                                    required>
+                                <div id="pull-iso-hint" style="display:none;margin-top:6px;padding:8px 10px;
+                                    background:var(--bg-tertiary,#1e2a3a);border-radius:6px;font-size:12px;
+                                    color:var(--text-secondary)">
+                                    Installer ISO detected — clonr will run the installer in a temporary
+                                    QEMU VM and capture the result as a base image (5-30 min).
+                                    KVM acceleration is used when available.
+                                </div>
                             </div>
                             <div class="form-group">
                                 <label>Name *</label>
-                                <input type="text" name="name" placeholder="rocky-9-hpc" required>
+                                <input type="text" name="name" placeholder="rocky-10-base" required>
                             </div>
                             <div class="form-group">
                                 <label>Version</label>
-                                <input type="text" name="version" placeholder="9.3">
+                                <input type="text" name="version" placeholder="10.1">
                             </div>
                             <div class="form-group">
                                 <label>OS</label>
@@ -824,12 +833,32 @@ const Pages = {
                                 <label>Arch</label>
                                 <input type="text" name="arch" placeholder="x86_64">
                             </div>
-                            <div class="form-group">
+                            <!-- Standard (non-ISO) fields -->
+                            <div class="form-group" id="pull-format-group">
                                 <label>Format</label>
                                 <select name="format">
                                     <option value="filesystem">filesystem (tar)</option>
                                     <option value="block">block (raw/partclone)</option>
                                 </select>
+                            </div>
+                            <!-- ISO-installer fields (shown only for .iso URLs) -->
+                            <div class="form-group" id="pull-disk-group" style="display:none">
+                                <label>Disk Size (GB)</label>
+                                <input type="number" name="disk_size_gb" value="20" min="10" max="500">
+                            </div>
+                            <div class="form-group" id="pull-mem-group" style="display:none">
+                                <label>VM Memory (MB)</label>
+                                <input type="number" name="memory_mb" value="2048" min="512" max="32768">
+                            </div>
+                            <div class="form-group" id="pull-cpu-group" style="display:none">
+                                <label>VM CPUs</label>
+                                <input type="number" name="cpus" value="2" min="1" max="16">
+                            </div>
+                            <div class="form-group" style="grid-column:1/-1" id="pull-ks-group" style="display:none">
+                                <label>Custom Kickstart / Autoinstall</label>
+                                <textarea name="custom_kickstart" rows="3"
+                                    placeholder="Paste a custom kickstart or autoinstall config here (optional — leave blank to use the auto-generated template)"
+                                    style="width:100%;font-family:monospace;font-size:12px;resize:vertical"></textarea>
                             </div>
                             <div class="form-group" style="grid-column:1/-1">
                                 <label>Notes</label>
@@ -837,7 +866,7 @@ const Pages = {
                             </div>
                         </div>
                         <div id="pull-progress" style="display:none;margin-top:12px">
-                            <div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px">Submitting pull request…</div>
+                            <div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px" id="pull-progress-label">Submitting…</div>
                             <div class="progress-bar-wrap" style="width:100%">
                                 <div class="progress-bar-fill" style="width:60%;animation:indeterminate 1.5s ease infinite"></div>
                             </div>
@@ -852,7 +881,66 @@ const Pages = {
             </div>`;
         document.body.appendChild(overlay);
         overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
-        overlay.querySelector('input[name="url"]').focus();
+
+        // Detect ISO URL and toggle ISO-specific fields.
+        const urlInput = document.getElementById('pull-url');
+        const isoHint  = document.getElementById('pull-iso-hint');
+        const fmtGroup  = document.getElementById('pull-format-group');
+        const diskGroup = document.getElementById('pull-disk-group');
+        const memGroup  = document.getElementById('pull-mem-group');
+        const cpuGroup  = document.getElementById('pull-cpu-group');
+        const ksGroup   = document.getElementById('pull-ks-group');
+        const pullBtn   = document.getElementById('pull-btn');
+
+        const applyISOMode = (isISO) => {
+            isoHint.style.display  = isISO ? 'block' : 'none';
+            fmtGroup.style.display  = isISO ? 'none'  : '';
+            diskGroup.style.display = isISO ? ''      : 'none';
+            memGroup.style.display  = isISO ? ''      : 'none';
+            cpuGroup.style.display  = isISO ? ''      : 'none';
+            if (ksGroup) ksGroup.style.display = isISO ? '' : 'none';
+            pullBtn.textContent = isISO ? 'Build from ISO' : 'Pull Image';
+        };
+
+        urlInput.addEventListener('input', () => {
+            const val = urlInput.value.trim().toLowerCase().split('?')[0];
+            applyISOMode(val.endsWith('.iso'));
+            // Auto-fill name/os from filename when URL looks like an ISO.
+            if (val.endsWith('.iso')) {
+                Pages._autoFillFromISOUrl(urlInput.value);
+            }
+        });
+
+        urlInput.focus();
+    },
+
+    // _autoFillFromISOUrl populates Name/Version/OS inputs from an ISO filename.
+    _autoFillFromISOUrl(isoURL) {
+        const form    = document.getElementById('pull-form');
+        if (!form) return;
+        const nameEl  = form.elements['name'];
+        const verEl   = form.elements['version'];
+        const osEl    = form.elements['os'];
+        if (!nameEl || !verEl || !osEl) return;
+
+        const base = isoURL.split('/').pop().split('?')[0].replace(/\.iso$/i, '');
+        if (!nameEl.value) {
+            nameEl.value = base.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+        }
+        if (!verEl.value) {
+            const m = base.match(/(\d+\.\d+)/);
+            if (m) verEl.value = m[1];
+        }
+        if (!osEl.value) {
+            const lower = base.toLowerCase();
+            if (lower.includes('rocky'))     osEl.value = 'rocky';
+            else if (lower.includes('alma')) osEl.value = 'almalinux';
+            else if (lower.includes('centos')) osEl.value = 'centos';
+            else if (lower.includes('ubuntu')) osEl.value = 'ubuntu';
+            else if (lower.includes('debian')) osEl.value = 'debian';
+            else if (lower.includes('opensuse') || lower.includes('suse')) osEl.value = 'suse';
+            else if (lower.includes('alpine')) osEl.value = 'alpine';
+        }
     },
 
     showImportISOModal() {
@@ -950,31 +1038,56 @@ const Pages = {
 
     async submitPull(e) {
         e.preventDefault();
-        const form = e.target;
-        const btn  = document.getElementById('pull-btn');
-        const res  = document.getElementById('pull-result');
-        const prog = document.getElementById('pull-progress');
-        const data = new FormData(form);
+        const form  = e.target;
+        const btn   = document.getElementById('pull-btn');
+        const res   = document.getElementById('pull-result');
+        const prog  = document.getElementById('pull-progress');
+        const label = document.getElementById('pull-progress-label');
+        const data  = new FormData(form);
+        const url   = (data.get('url') || '').trim();
+        const isISO = url.toLowerCase().split('?')[0].endsWith('.iso');
 
         btn.disabled = true;
         btn.textContent = 'Submitting…';
         if (prog) prog.style.display = 'block';
+        if (label) label.textContent = isISO
+            ? 'Starting ISO build (this can take 5-30 min — check the image status for progress)…'
+            : 'Submitting pull request…';
         res.innerHTML = '';
 
         try {
-            const body = {
-                url:     data.get('url'),
-                name:    data.get('name'),
-                version: data.get('version'),
-                os:      data.get('os'),
-                arch:    data.get('arch'),
-                format:  data.get('format'),
-                notes:   data.get('notes'),
-                tags:    [],
-            };
-            const img = await API.factory.pull(body);
+            let img;
+            if (isISO) {
+                const body = {
+                    url:              url,
+                    name:             data.get('name'),
+                    version:          data.get('version') || undefined,
+                    os:               data.get('os')      || undefined,
+                    arch:             data.get('arch')    || undefined,
+                    disk_size_gb:     parseInt(data.get('disk_size_gb'), 10) || 0,
+                    memory_mb:        parseInt(data.get('memory_mb'),    10) || 0,
+                    cpus:             parseInt(data.get('cpus'),         10) || 0,
+                    custom_kickstart: data.get('custom_kickstart') || undefined,
+                    notes:            data.get('notes')  || undefined,
+                    tags:             [],
+                };
+                img = await API.factory.buildFromISO(body);
+            } else {
+                const body = {
+                    url:     url,
+                    name:    data.get('name'),
+                    version: data.get('version'),
+                    os:      data.get('os'),
+                    arch:    data.get('arch'),
+                    format:  data.get('format'),
+                    notes:   data.get('notes'),
+                    tags:    [],
+                };
+                img = await API.factory.pull(body);
+            }
             if (prog) prog.style.display = 'none';
-            res.innerHTML = alertBox(`Pull started: ${img.name} (${img.id}) — status: ${img.status}`, 'success');
+            const verb = isISO ? 'ISO build started' : 'Pull started';
+            res.innerHTML = alertBox(`${verb}: ${escHtml(img.name)} (${img.id}) — status: ${img.status}`, 'success');
             form.reset();
             App.setAutoRefresh(() => Pages.images(), 5000);
             setTimeout(() => {
@@ -984,9 +1097,9 @@ const Pages = {
             }, 1500);
         } catch (ex) {
             if (prog) prog.style.display = 'none';
-            res.innerHTML = alertBox(`Pull failed: ${ex.message}`);
+            res.innerHTML = alertBox(`${isISO ? 'ISO build' : 'Pull'} failed: ${ex.message}`);
             btn.disabled = false;
-            btn.textContent = 'Pull Image';
+            btn.textContent = isISO ? 'Build from ISO' : 'Pull Image';
         }
     },
 

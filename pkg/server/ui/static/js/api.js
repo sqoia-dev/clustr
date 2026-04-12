@@ -129,6 +129,10 @@ const API = {
         pull(body)            { return API.post('/factory/pull', body); },
         importISO(body)       { return API.post('/factory/import-iso', body); },
         capture(body)         { return API.post('/factory/capture', body); },
+        // buildFromISO submits an installer ISO URL for automated VM-based install.
+        // The server downloads the ISO, runs it in QEMU, captures the rootfs,
+        // and returns a building BaseImage record. Poll GET /images/:id for status.
+        buildFromISO(body)    { return API.post('/factory/build-from-iso', body); },
 
         // uploadISO — browser file upload with real progress.
         // file     : File object from <input type="file"> or drag-and-drop.
@@ -177,6 +181,9 @@ const API = {
                 xhr.send(fd);
             });
         },
+    },
+    imageRoles: {
+        list()              { return API.get('/image-roles'); },
     },
     nodeGroups: {
         list()              { return API.get('/node-groups'); },
