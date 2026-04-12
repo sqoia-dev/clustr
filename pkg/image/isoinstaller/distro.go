@@ -208,37 +208,62 @@ func containsAny(s string, subs ...string) bool {
 	return false
 }
 
+// qemuCandidates lists the known binary paths for qemu-system-x86_64 across
+// distributions. RHEL/Rocky/Alma ship it at /usr/libexec/qemu-kvm; Debian/Ubuntu
+// at /usr/bin/qemu-system-x86_64.
+var qemuCandidates = []string{
+	"qemu-system-x86_64",    // Debian/Ubuntu/Arch (in $PATH)
+	"/usr/bin/qemu-system-x86_64",
+	"/usr/libexec/qemu-kvm", // RHEL/Rocky/AlmaLinux/CentOS
+	"/usr/bin/qemu-kvm",
+}
+
+// FindQEMU returns the path to the qemu-system-x86_64 (or qemu-kvm) binary.
+// Searches $PATH first, then well-known distribution-specific locations.
+// Returns ("", false) when QEMU is not available.
+func FindQEMU() (string, bool) {
+	for _, candidate := range qemuCandidates {
+		if path, err := exec.LookPath(candidate); err == nil {
+			return path, true
+		}
+		// LookPath only resolves names in $PATH; for absolute paths we stat directly.
+		if strings.HasPrefix(candidate, "/") {
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate, true
+			}
+		}
+	}
+	return "", false
+}
+
 // CheckDependencies returns a list of missing host binaries required to run
 // the ISO installer. Callers should surface these as actionable errors before
 // attempting a build rather than failing deep in the goroutine.
 func CheckDependencies() []string {
-	required := []string{
-		"qemu-system-x86_64",
-		"qemu-img",
-	}
-	// Either genisoimage or xorriso must be present (for building the kickstart ISO).
-	optional := [][]string{
-		{"genisoimage", "xorriso"},
+	var missing []string
+
+	// qemu: check via FindQEMU which handles RHEL vs Debian binary paths.
+	if _, ok := FindQEMU(); !ok {
+		missing = append(missing, "qemu-system-x86_64 (or /usr/libexec/qemu-kvm on RHEL/Rocky)")
 	}
 
-	var missing []string
-	for _, bin := range required {
-		if _, err := exec.LookPath(bin); err != nil {
-			missing = append(missing, bin)
+	// qemu-img is always in $PATH even on RHEL.
+	if _, err := exec.LookPath("qemu-img"); err != nil {
+		missing = append(missing, "qemu-img")
+	}
+
+	// Either genisoimage or xorriso must be present (for building the seed ISO).
+	geiso := false
+	for _, bin := range []string{"genisoimage", "xorriso"} {
+		if _, err := exec.LookPath(bin); err == nil {
+			geiso = true
+			break
 		}
 	}
-	for _, group := range optional {
-		found := false
-		for _, bin := range group {
-			if _, err := exec.LookPath(bin); err == nil {
-				found = true
-				break
-			}
-		}
-		if !found {
-			missing = append(missing, strings.Join(group, " or "))
-		}
+	if !geiso {
+		missing = append(missing, "genisoimage or xorriso")
 	}
+
 	return missing
 }
 

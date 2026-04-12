@@ -160,7 +160,12 @@ func Build(ctx context.Context, opts BuildOptions) (*BuildResult, error) {
 	installCtx, installCancel := context.WithTimeout(ctx, opts.Timeout)
 	defer installCancel()
 
-	qemu := exec.CommandContext(installCtx, "qemu-system-x86_64", qemuArgs...)
+	qemuBin, ok := FindQEMU()
+	if !ok {
+		return nil, fmt.Errorf("isoinstaller: qemu not found — install qemu-kvm (RHEL/Rocky) or qemu-system-x86_64 (Debian/Ubuntu)")
+	}
+
+	qemu := exec.CommandContext(installCtx, qemuBin, qemuArgs...)
 
 	// Capture stdout/stderr for debug logging (serial output goes to the log file).
 	qemuStderr := &strings.Builder{}
