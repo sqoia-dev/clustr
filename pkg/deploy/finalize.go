@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/sqoia-dev/clonr/pkg/api"
+	"github.com/sqoia-dev/clonr/pkg/chroot"
 	"github.com/sqoia-dev/clonr/pkg/ipmi"
 )
 
@@ -438,4 +439,229 @@ func findGrubCfg(mountRoot string) string {
 		}
 	}
 	return ""
+}
+
+// applyBootConfig performs the post-install steps required to produce a bootable
+// deployed filesystem. It must be called after grub2-install has written the
+// bootloader to the MBR/bios-boot partition and after the full tar extraction is
+// complete. The steps are:
+//
+//  1. Regenerate /boot/grub2/grub.cfg via grub2-mkconfig inside a chroot with
+//     /proc, /sys, and /dev bind-mounted (required by grub2-mkconfig).
+//  2. Regenerate the initramfs via dracut --no-hostonly so the resulting image
+//     contains drivers for all hardware, not just the capture source's hardware
+//     (critical for virtio_blk/virtio_net on VMs).
+//  3. Rewrite /etc/fstab with the UUIDs of the newly partitioned disks, replacing
+//     the stale UUIDs from the capture source.
+//  4. Truncate /etc/machine-id so systemd generates a new unique ID on first boot.
+//  5. Remove /etc/ssh/ssh_host_* so sshd regenerates host keys on first boot,
+//     preventing all deployed nodes from sharing identical host keys.
+//
+// partDevs must be in the same order as layout.Partitions (index i → device i+1).
+func applyBootConfig(ctx context.Context, mountRoot, targetDisk string, layout api.DiskLayout, partDevs []string) error {
+	log := logger()
+
+	// ── 1. grub2-mkconfig ────────────────────────────────────────────────────
+	// grub2-mkconfig probes /proc and /sys for bootable kernels — it must run
+	// inside a chroot with the standard virtual filesystems mounted.
+	grubCfgPath := findGrubCfg(mountRoot)
+	if grubCfgPath == "" {
+		// /boot was either not yet populated or is not mounted. This is a hard
+		// prerequisite: if the image was captured without /boot (--exclude=/boot),
+		// grub2-mkconfig will silently produce an empty config. Bail early with a
+		// clear error so the operator knows to re-capture with /boot included.
+		log.Error().Str("mountRoot", mountRoot).
+			Msg("finalize/boot: grub.cfg not found under mountRoot — /boot may be empty or not mounted; re-capture image without --exclude=/boot")
+		return fmt.Errorf("finalize/boot: grub.cfg not found under %s — /boot must be present in the image; re-capture without --exclude=/boot", mountRoot)
+	}
+
+	log.Info().Str("grub_cfg", grubCfgPath).Msg("finalize/boot: regenerating GRUB config via grub2-mkconfig")
+	cs, err := chroot.NewSession(mountRoot)
+	if err != nil {
+		return fmt.Errorf("finalize/boot: chroot session: %w", err)
+	}
+	if err := cs.Enter(); err != nil {
+		return fmt.Errorf("finalize/boot: chroot enter: %w", err)
+	}
+	defer func() {
+		if cerr := cs.Close(); cerr != nil {
+			log.Warn().Err(cerr).Msg("finalize/boot: chroot close error (non-fatal)")
+		}
+	}()
+
+	// grub2-mkconfig writes the grub.cfg to the path passed via -o (inside the
+	// chroot, so the path is relative to the chroot root).
+	mkcfgCmd := exec.CommandContext(ctx, "chroot", mountRoot, "grub2-mkconfig", "-o", grubCfgPath)
+	if err := runAndLog(ctx, "grub2-mkconfig", mkcfgCmd); err != nil {
+		// Fatal: without a valid grub.cfg the node cannot boot.
+		return fmt.Errorf("finalize/boot: grub2-mkconfig failed: %w", err)
+	}
+	log.Info().Str("grub_cfg", grubCfgPath).Msg("finalize/boot: grub2-mkconfig complete")
+
+	// ── 2. dracut --regenerate-all ───────────────────────────────────────────
+	// --no-hostonly is critical: the capture source may be bare metal with a
+	// specific set of drivers. We need a generic initramfs that includes virtio_blk,
+	// virtio_net, and xfs so the image boots on any target (VM or physical).
+	// --force overwrites any existing initramfs images without prompting.
+	log.Info().Msg("finalize/boot: regenerating initramfs via dracut --no-hostonly --regenerate-all")
+	dracutCmd := exec.CommandContext(ctx, "chroot", mountRoot,
+		"dracut", "--force", "--no-hostonly", "--regenerate-all")
+	if err := runAndLog(ctx, "dracut", dracutCmd); err != nil {
+		// Non-fatal: the node may still boot if the capture source's initramfs
+		// happens to contain the required drivers. Log loudly so the operator
+		// knows to investigate if the node kernel-panics on boot.
+		log.Warn().Err(err).
+			Msg("WARNING finalize/boot: dracut --regenerate-all failed — initramfs may lack hardware drivers for target; node may not boot on different hardware")
+	} else {
+		log.Info().Msg("finalize/boot: dracut complete")
+	}
+
+	// ── 3. /etc/fstab UUID update ────────────────────────────────────────────
+	// The image carries the capture source's UUIDs. After partitioning a new disk
+	// the target has fresh UUIDs. Build fstab from blkid output on the actual
+	// target partition devices.
+	log.Info().Msg("finalize/boot: regenerating /etc/fstab with target disk UUIDs")
+	if err := writeFstab(ctx, mountRoot, layout, partDevs); err != nil {
+		// Fatal: a missing or incorrect fstab means the root filesystem won't
+		// mount and the OS will drop to emergency mode on every boot.
+		return fmt.Errorf("finalize/boot: fstab regen: %w", err)
+	}
+	log.Info().Msg("finalize/boot: /etc/fstab written")
+
+	// ── 4. machine-id scrub ──────────────────────────────────────────────────
+	// systemd uses /etc/machine-id as a stable unique identifier for the host.
+	// A non-empty machine-id baked into the image would be shared by every node
+	// deployed from it. Truncating (not removing) the file causes systemd to
+	// generate a new ID on first boot and write it back.
+	machineIDPath := filepath.Join(mountRoot, "etc", "machine-id")
+	if err := os.WriteFile(machineIDPath, []byte{}, 0o444); err != nil {
+		log.Warn().Err(err).Str("path", machineIDPath).
+			Msg("finalize/boot: could not truncate machine-id (non-fatal)")
+	} else {
+		log.Info().Msg("finalize/boot: machine-id truncated — new ID will be generated on first boot")
+	}
+
+	// ── 5. SSH host key scrub ────────────────────────────────────────────────
+	// Host keys baked into the image would be identical on every deployed node,
+	// making MITM attacks trivial. Remove them so sshd regenerates unique keys
+	// on first boot via the ssh-keygen firstboot unit.
+	hostKeys, _ := filepath.Glob(filepath.Join(mountRoot, "etc", "ssh", "ssh_host_*"))
+	for _, k := range hostKeys {
+		if err := os.Remove(k); err != nil {
+			log.Warn().Err(err).Str("key", k).
+				Msg("finalize/boot: could not remove SSH host key (non-fatal)")
+		}
+	}
+	if len(hostKeys) > 0 {
+		log.Info().Int("count", len(hostKeys)).
+			Msg("finalize/boot: SSH host keys removed — sshd will regenerate on first boot")
+	}
+
+	return nil
+}
+
+// getUUID returns the filesystem UUID of a block device using blkid.
+// Returns an error if blkid is unavailable or the device has no UUID (e.g.
+// unformatted or a bios_grub partition).
+func getUUID(ctx context.Context, device string) (string, error) {
+	out, err := exec.CommandContext(ctx, "blkid", "-s", "UUID", "-o", "value", device).Output()
+	if err != nil {
+		return "", fmt.Errorf("blkid %s: %w", device, err)
+	}
+	uuid := strings.TrimSpace(string(out))
+	if uuid == "" {
+		return "", fmt.Errorf("blkid %s: no UUID (partition may be unformatted)", device)
+	}
+	return uuid, nil
+}
+
+// writeFstab generates /etc/fstab for the deployed filesystem from the actual
+// UUIDs of the target partitions. It replaces whatever fstab the image carried
+// from the capture source, which has the source system's UUIDs.
+//
+// Only partitions with a non-empty MountPoint and a formattable filesystem are
+// written. biosboot/bios_grub partitions are silently skipped.
+func writeFstab(ctx context.Context, mountRoot string, layout api.DiskLayout, partDevs []string) error {
+	log := logger()
+
+	var sb strings.Builder
+	sb.WriteString("# /etc/fstab — generated by clonr during deployment\n")
+	sb.WriteString("# <device>  <mountpoint>  <fstype>  <options>  <dump>  <pass>\n\n")
+
+	for i, p := range layout.Partitions {
+		if p.MountPoint == "" {
+			continue // biosboot, unpartitioned, or no mount needed
+		}
+		switch p.Filesystem {
+		case "", "biosboot", "bios_grub":
+			continue // no filesystem, nothing to mount
+		}
+
+		if i >= len(partDevs) {
+			log.Warn().Int("partition", i+1).Msg("writeFstab: partDevs slice shorter than layout — skipping")
+			continue
+		}
+		dev := partDevs[i]
+
+		uuid, err := getUUID(ctx, dev)
+		if err != nil {
+			// If we can't get a UUID the fstab entry would be useless and the
+			// node would fail to boot. Return an error so Finalize aborts cleanly
+			// rather than deploying a machine that will boot-loop.
+			return fmt.Errorf("partition %d (%s): %w", i+1, dev, err)
+		}
+
+		// Standard mount options per filesystem and mountpoint.
+		opts := fstabMountOpts(p.Filesystem, p.MountPoint)
+
+		// dump/pass: root gets pass=1, /boot gets pass=2, everything else 0.
+		dump := 0
+		pass := 0
+		switch p.MountPoint {
+		case "/":
+			dump, pass = 1, 1
+		case "/boot":
+			dump, pass = 1, 2
+		}
+
+		if p.Filesystem == "swap" {
+			fmt.Fprintf(&sb, "UUID=%-36s  %-12s  %-6s  %-20s  %d  %d\n",
+				uuid, "swap", "swap", "defaults", 0, 0)
+		} else {
+			fmt.Fprintf(&sb, "UUID=%-36s  %-12s  %-6s  %-20s  %d  %d\n",
+				uuid, p.MountPoint, p.Filesystem, opts, dump, pass)
+		}
+
+		log.Info().Str("uuid", uuid).Str("mountpoint", p.MountPoint).
+			Str("device", dev).Msg("finalize/boot: fstab entry written")
+	}
+
+	fstabPath := filepath.Join(mountRoot, "etc", "fstab")
+	if err := os.WriteFile(fstabPath, []byte(sb.String()), 0o644); err != nil {
+		return fmt.Errorf("write fstab: %w", err)
+	}
+	return nil
+}
+
+// fstabMountOpts returns appropriate mount options for a given filesystem type
+// and mountpoint. These are conservative production defaults for Rocky Linux 9.
+func fstabMountOpts(fstype, mountpoint string) string {
+	switch fstype {
+	case "xfs":
+		if mountpoint == "/" {
+			return "defaults,noatime"
+		}
+		return "defaults"
+	case "ext4":
+		if mountpoint == "/" {
+			return "defaults,noatime"
+		}
+		return "defaults"
+	case "vfat", "fat32":
+		return "defaults,uid=0,gid=0,umask=077,shortname=winnt"
+	case "swap":
+		return "defaults"
+	default:
+		return "defaults"
+	}
 }

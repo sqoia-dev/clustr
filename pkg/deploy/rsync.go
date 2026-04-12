@@ -326,25 +326,18 @@ func (d *FilesystemDeployer) Finalize(ctx context.Context, cfg api.NodeConfig, m
 				Msg("WARNING: finalize: grub2-install failed (non-fatal) — node may not boot; run grub2-install manually")
 		} else {
 			log.Info().Str("disk", d.targetDisk).Msg("finalize: GRUB bootloader installed")
-
-			// After installing the bootloader, regenerate grub.cfg inside the
-			// deployed root. The tar image's grub.cfg has UUIDs from the source
-			// system; after mkfs the partition UUIDs are new and GRUB will fail
-			// to find the root unless grub.cfg is regenerated with the live UUIDs.
-			grubCfgPath := findGrubCfg(mountRoot)
-			if grubCfgPath != "" {
-				log.Info().Str("grub_cfg", grubCfgPath).Msg("finalize: regenerating grub.cfg via chroot grub2-mkconfig")
-				chrootArgs := []string{mountRoot, "grub2-mkconfig", "-o", grubCfgPath}
-				if err := runAndLog(ctx, "grub2-mkconfig", exec.CommandContext(ctx, "chroot", chrootArgs...)); err != nil {
-					log.Warn().Err(err).Str("grub_cfg", grubCfgPath).
-						Msg("WARNING: finalize: grub2-mkconfig failed (non-fatal) — node may boot with stale UUIDs in grub.cfg; run grub2-mkconfig manually")
-				} else {
-					log.Info().Str("grub_cfg", grubCfgPath).Msg("finalize: grub.cfg regenerated with live partition UUIDs")
-				}
-			} else {
-				log.Warn().Str("mountRoot", mountRoot).Msg("finalize: grub.cfg not found — skipping grub2-mkconfig (node may not boot)")
-			}
 		}
+	}
+
+	// Apply boot-critical post-install steps: grub2-mkconfig, dracut, fstab
+	// UUID regen, machine-id truncation, and SSH host key removal.
+	// These steps are unconditional — they must run on every filesystem
+	// deployment regardless of whether grub2-install succeeded above.
+	// grub2-install writes the bootloader binary; applyBootConfig makes it
+	// functional by regenerating the config with the target's actual kernel,
+	// initramfs, and partition UUIDs.
+	if err := applyBootConfig(ctx, mountRoot, d.targetDisk, d.layout, partDevs); err != nil {
+		return fmt.Errorf("deploy: finalize: boot config: %w", err)
 	}
 
 	// If the layout includes RAID arrays, write mdadm.conf and update initramfs
@@ -668,27 +661,33 @@ func isMounted(dev, target string) bool {
 	return false
 }
 
-// xfsSyncMountRoot freezes then immediately thaws every XFS filesystem mounted
-// under mountRoot. freeze(xfs_freeze -f) forces the XFS log to fully commit all
-// in-memory journal entries to disk and quiesces I/O; thaw(xfs_freeze -u) resumes
-// normal operation. After this cycle the filesystem has no pending dirty log
-// entries and is safe to unmount without EBUSY from lingering log I/O.
+// fsSyncMountRoot freezes then immediately thaws every XFS filesystem mounted
+// under mountRoot using fsfreeze(8) (util-linux). freeze(-f) forces the XFS log
+// to fully commit all in-memory journal entries to disk and quiesces I/O;
+// thaw(-u) resumes normal operation. After this cycle the filesystem has no
+// pending dirty log entries and is safe to unmount without EBUSY.
 //
 // XFS uses an asynchronous delayed-logging model: sync(2) flushes the page cache
 // but does NOT wait for the XFS circular log buffer to commit. On a large tar
-// extraction that writes thousands of inodes, the log can remain active for several
-// seconds after sync returns, causing umount to fail with EBUSY. xfs_freeze is the
-// only reliable way to drain it without a fixed-duration sleep.
+// extraction that writes thousands of inodes, the log can remain active for
+// several seconds after sync returns, causing umount to fail with EBUSY.
+// fsfreeze is the only reliable way to drain it without a fixed-duration sleep.
+//
+// Note: we use fsfreeze(8) from util-linux, NOT xfs_freeze(8) from xfsprogs.
+// On Rocky/RHEL 9, xfs_freeze is a shell script wrapper that calls xfs_io —
+// it cannot execute in the initramfs environment where /usr/bin/sh does not
+// exist and xfs_io is not available. fsfreeze is a standalone binary that
+// requires only libc.
 //
 // Mounts are processed deepest-first so nested mounts (e.g. /boot nested inside /)
 // are frozen before their parent.
-func xfsSyncMountRoot(mountRoot string) {
+func fsSyncMountRoot(mountRoot string) {
 	log := logger()
 
 	// Read /proc/mounts and find all XFS mounts under mountRoot (or exactly mountRoot).
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
-		log.Warn().Err(err).Msg("xfsSyncMountRoot: cannot read /proc/mounts — skipping xfs_freeze")
+		log.Warn().Err(err).Msg("fsSyncMountRoot: cannot read /proc/mounts — skipping fsfreeze")
 		return
 	}
 
@@ -727,18 +726,18 @@ func xfsSyncMountRoot(mountRoot string) {
 	}
 
 	for _, mp := range xfsMounts {
-		if out, err := exec.Command("xfs_freeze", "-f", mp).CombinedOutput(); err != nil {
+		if out, err := exec.Command("fsfreeze", "-f", mp).CombinedOutput(); err != nil {
 			log.Warn().Str("mountpoint", mp).Err(err).Str("output", string(out)).
-				Msg("xfs_freeze -f failed — XFS log may not be fully committed")
+				Msg("fsfreeze -f failed — XFS log may not be fully committed")
 			continue
 		}
-		log.Info().Str("mountpoint", mp).Msg("xfs_freeze: log committed and filesystem frozen")
+		log.Info().Str("mountpoint", mp).Msg("fsfreeze: XFS log committed and filesystem frozen")
 		// Immediately thaw — we only needed the freeze to drain the log.
-		if out, err := exec.Command("xfs_freeze", "-u", mp).CombinedOutput(); err != nil {
+		if out, err := exec.Command("fsfreeze", "-u", mp).CombinedOutput(); err != nil {
 			log.Warn().Str("mountpoint", mp).Err(err).Str("output", string(out)).
-				Msg("xfs_freeze -u failed — filesystem may remain frozen; unmount will proceed")
+				Msg("fsfreeze -u failed — filesystem may remain frozen; unmount will proceed")
 		} else {
-			log.Info().Str("mountpoint", mp).Msg("xfs_freeze: filesystem thawed")
+			log.Info().Str("mountpoint", mp).Msg("fsfreeze: filesystem thawed")
 		}
 	}
 }
@@ -761,11 +760,11 @@ func logMountBusyDiagnostics(mountRoot string) {
 
 // unmountAll unmounts everything under mountRoot.
 // Before unmounting, it freezes-then-thaws every XFS filesystem under mountRoot
-// via xfs_freeze to force the XFS log to fully commit — this is the reliable fix
+// via fsfreeze(8) to force the XFS log to fully commit — this is the reliable fix
 // for EBUSY after large tar extractions on XFS. sync(2) alone is insufficient
 // because it flushes the page cache but does not drain XFS's internal log buffer.
 //
-// After the XFS freeze/thaw, clean unmount should succeed immediately. We keep
+// After the fsfreeze/thaw cycle, clean unmount should succeed immediately. We keep
 // three retries as a safety margin for non-XFS cases. Only falls back to lazy
 // detach if all retries fail. Lazy detach (umount -l) is intentionally a last
 // resort because it leaves the block device marked "in use" by the kernel, which
@@ -775,9 +774,9 @@ func (d *FilesystemDeployer) unmountAll(mountRoot string) {
 
 	// Force XFS log commit before unmounting. This drains the async journal
 	// that keeps the filesystem busy after large writes.
-	xfsSyncMountRoot(mountRoot)
+	fsSyncMountRoot(mountRoot)
 
-	// After xfs_freeze the filesystem should unmount cleanly on the first try.
+	// After fsfreeze the filesystem should unmount cleanly on the first try.
 	// Keep three retries for safety (non-XFS filesystems, ext4 writeback, etc).
 	const maxUmountRetries = 3
 	for attempt := 1; attempt <= maxUmountRetries; attempt++ {
@@ -792,9 +791,9 @@ func (d *FilesystemDeployer) unmountAll(mountRoot string) {
 		if attempt < maxUmountRetries {
 			log.Debug().Str("mountRoot", mountRoot).Err(err).Int("attempt", attempt).
 				Msg("umount -R not ready yet — retrying in 1s")
-			// Re-run xfs_freeze in case a retry is needed — there may be a second
+			// Re-run fsfreeze in case a retry is needed — there may be a second
 			// partition (e.g. /boot) that was not yet drained on the first pass.
-			xfsSyncMountRoot(mountRoot)
+			fsSyncMountRoot(mountRoot)
 			time.Sleep(time.Second)
 		} else {
 			log.Warn().Str("mountRoot", mountRoot).Err(err).
