@@ -385,14 +385,22 @@ ${transitive}"
     # Strategy: we use grub2-install in a chroot (chroot /mnt grub2-install /dev/sdX)
     # so ideally these come from the deployed image. However we also copy them into
     # the initramfs so grub2-install can fall back if the chroot path is missing.
+    #
+    # scp -r <host>:<dir> <local_parent>  — copies the dir INTO local_parent,
+    # creating local_parent/<basename(dir)>/. We scp to the PARENT of the target
+    # so the directory structure is preserved correctly.
     echo "      fetching grub2 module data from ${CLONR_SERVER_HOST}..."
     for grub_dir in /usr/lib/grub /usr/share/grub; do
-        local_dest="$WORKDIR${grub_dir}"
-        mkdir -p "$local_dest"
-        sshpass -p "$CLONR_SERVER_PASS" scp -o StrictHostKeyChecking=no -r \
-            "${CLONR_SERVER_USER}@${CLONR_SERVER_HOST}:${grub_dir}/." \
-            "${local_dest}/" 2>/dev/null || \
+        # Parent dir inside initramfs (e.g. $WORKDIR/usr/lib for /usr/lib/grub)
+        local_parent="$WORKDIR$(dirname "$grub_dir")"
+        mkdir -p "$local_parent"
+        if sshpass -p "$CLONR_SERVER_PASS" scp -o StrictHostKeyChecking=no -r \
+            "${CLONR_SERVER_USER}@${CLONR_SERVER_HOST}:${grub_dir}" \
+            "${local_parent}/" 2>/dev/null; then
+            echo "      fetched ${grub_dir} ($(du -sh "${local_parent}/$(basename "$grub_dir")" 2>/dev/null | cut -f1))"
+        else
             echo "      WARNING: could not fetch ${grub_dir}" >&2
+        fi
     done
 
     echo "  [+] Deployment tools installed"
