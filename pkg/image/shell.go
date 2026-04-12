@@ -62,8 +62,8 @@ func (m *ShellManager) OpenSession(ctx context.Context, imageID string) (*ShellS
 	if err != nil {
 		return nil, fmt.Errorf("shell: get image: %w", err)
 	}
-	if img.Status != api.ImageStatusReady && img.Status != api.ImageStatusBuilding {
-		return nil, fmt.Errorf("shell: image %s has status %q — must be ready or building", imageID, img.Status)
+	if img.Status != api.ImageStatusReady {
+		return nil, fmt.Errorf("shell: image %s has status %q — must be ready to open a shell session", imageID, img.Status)
 	}
 
 	rootDir := filepath.Join(m.ImageDir, imageID, "rootfs")

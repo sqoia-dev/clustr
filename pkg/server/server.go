@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
@@ -193,7 +194,8 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
-		shutdownCtx := context.Background()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutdownCancel()
 		if err := s.http.Shutdown(shutdownCtx); err != nil {
 			log.Error().Err(err).Msg("graceful shutdown error")
 		}

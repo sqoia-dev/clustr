@@ -7,11 +7,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/sqoia-dev/clonr/pkg/api"
 	"github.com/sqoia-dev/clonr/pkg/ipmi"
 )
+
+// ifaceNameRe validates that a network interface name contains only safe
+// characters before it is used to construct a filename.
+var ifaceNameRe = regexp.MustCompile(`^[a-zA-Z0-9._:-]+$`)
 
 // applyNodeConfig writes all node-specific identity into the deployed filesystem
 // rooted at mountRoot. This function is called by both FilesystemDeployer and
@@ -118,6 +123,11 @@ func writeIPoIBProfile(nmDir string, ib api.IBInterfaceConfig) error {
 	// IPoIB interface naming: mlx5_0→ib0, mlx5_1→ib1, hfi1_0→ib0, etc.
 	// We use the device name directly as the NM connection id and interface-name.
 	ifaceName := ibDeviceToIPoIBName(ib.DeviceName)
+
+	// Validate the derived interface name before using it as a filename component.
+	if !ifaceNameRe.MatchString(ifaceName) {
+		return fmt.Errorf("derived IB interface name %q contains invalid characters", ifaceName)
+	}
 
 	mtu := ib.MTU
 	if mtu == 0 {
@@ -257,6 +267,11 @@ func writeNMKeyfile(nmDir string, iface api.InterfaceConfig) error {
 	name := iface.Name
 	if name == "" {
 		name = iface.MACAddress
+	}
+
+	// Validate the interface name before using it as a filename component.
+	if !ifaceNameRe.MatchString(name) {
+		return fmt.Errorf("interface name %q contains invalid characters (must match ^[a-zA-Z0-9._:-]+$)", name)
 	}
 
 	// Parse IP and prefix from CIDR.
