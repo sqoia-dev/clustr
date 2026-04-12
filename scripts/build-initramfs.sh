@@ -241,10 +241,11 @@ chmod 755 "$WORKDIR/usr/share/udhcpc/default.script"
 
 # init script — runs as PID 1 in the initramfs.
 # Always drops to a busybox shell on exit so the node stays debuggable.
+# NOTE: do NOT redirect to /dev/console at startup — the kernel already sets
+# up PID 1's stdio to /dev/console based on the 'console=' kernel param.
+# An explicit exec >/dev/console can hang if the device node isn't ready.
 cat > "$WORKDIR/init" << INIT_EOF
 #!/bin/sh
-# Redirect stdout/stderr to /dev/console so we get output on the serial/VGA console.
-exec >/dev/console 2>/dev/console </dev/console
 
 # Mount virtual filesystems.
 mount -t proc  proc    /proc           2>/dev/null
@@ -274,16 +275,23 @@ echo "MAC    : \${CLONR_MAC:-auto-detect}"
 echo "Kernel : \$(uname -r 2>/dev/null)"
 echo ""
 
-# Load kernel modules for virtio NIC.
-# Modules were embedded at build time from the clonr-server matching kernel.
-# Modules live at /lib/modules/\$(uname -r)/ — busybox modprobe finds them there.
-# Load order: failover → net_failover → virtio_net
+# Load kernel modules for virtio NIC using insmod with explicit paths.
+# modprobe in minimal busybox environments may not parse modules.dep correctly.
+# We use insmod directly in dependency order: failover -> net_failover -> virtio_net.
 KVER=\$(uname -r)
+MODBASE="/lib/modules/\$KVER"
 echo "Loading NIC modules for \$KVER..."
-modprobe failover      2>/dev/null && echo "  [ok] failover"      || echo "  [!] failover (may be builtin or missing)"
-modprobe net_failover  2>/dev/null && echo "  [ok] net_failover"  || echo "  [!] net_failover (may be missing)"
-modprobe virtio_net    2>/dev/null && echo "  [ok] virtio_net"    || echo "  [!] virtio_net (may be missing)"
+
+insmod "\$MODBASE/kernel/net/core/failover.ko.xz"   2>/dev/null \
+    && echo "  [ok] failover"     || echo "  [!] failover (already loaded or missing)"
+insmod "\$MODBASE/kernel/drivers/net/net_failover.ko.xz" 2>/dev/null \
+    && echo "  [ok] net_failover" || echo "  [!] net_failover (already loaded or missing)"
+insmod "\$MODBASE/kernel/drivers/net/virtio_net.ko.xz"   2>/dev/null \
+    && echo "  [ok] virtio_net"   || echo "  [!] virtio_net (already loaded or missing)"
 echo ""
+
+# Give the kernel a moment to enumerate the new NIC.
+sleep 1
 
 # Bring up loopback first.
 ip link set lo up 2>/dev/null
