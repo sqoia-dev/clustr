@@ -773,6 +773,25 @@ func runAutoDeployImage(ctx context.Context, c *client.Client, nodeCfg api.NodeC
 		return fmt.Errorf("hardware discovery for preflight: %w", err)
 	}
 
+	// Resolve the effective disk layout using the three-level hierarchy:
+	//   1. Node-level override (highest)
+	//   2. Group-level override
+	//   3. Image default (lowest)
+	var group *api.NodeGroup
+	if nodeCfg.GroupID != "" {
+		g, gErr := c.GetNodeGroup(ctx, nodeCfg.GroupID)
+		if gErr != nil {
+			deployLog.Warn().Err(gErr).Str("group_id", nodeCfg.GroupID).
+				Msg("could not fetch node group — falling back to image layout")
+		} else {
+			group = g
+		}
+	}
+	effectiveLayout := nodeCfg.EffectiveLayout(img, group)
+	layoutSource := nodeCfg.EffectiveLayoutSource(img, group)
+	deployLog.Info().Str("layout_source", layoutSource).
+		Msg("disk layout resolved")
+
 	mountRoot, err := os.MkdirTemp("", "clonr-auto-deploy-*")
 	if err != nil {
 		return fmt.Errorf("create temp mount root: %w", err)
@@ -789,7 +808,7 @@ func runAutoDeployImage(ctx context.Context, c *client.Client, nodeCfg api.NodeC
 
 	deployLog.Info().Msg("running preflight checks")
 	reporter.StartPhase("preflight", 0)
-	if err := deployer.Preflight(ctx, img.DiskLayout, *hw); err != nil {
+	if err := deployer.Preflight(ctx, effectiveLayout, *hw); err != nil {
 		reporter.EndPhase(err.Error())
 		return fmt.Errorf("preflight: %w", err)
 	}

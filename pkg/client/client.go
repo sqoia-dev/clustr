@@ -262,6 +262,24 @@ func (c *Client) SendLogs(ctx context.Context, entries []api.LogEntry) error {
 	return c.post(ctx, "/api/v1/logs", entries, nil)
 }
 
+// GetNodeGroup retrieves a NodeGroup by ID.
+func (c *Client) GetNodeGroup(ctx context.Context, id string) (*api.NodeGroup, error) {
+	var g api.NodeGroup
+	if err := c.get(ctx, "/api/v1/node-groups/"+id, &g); err != nil {
+		return nil, err
+	}
+	return &g, nil
+}
+
+// GetEffectiveLayout returns the resolved DiskLayout for a node (node/group/image hierarchy).
+func (c *Client) GetEffectiveLayout(ctx context.Context, nodeID string) (*api.EffectiveLayoutResponse, error) {
+	var resp api.EffectiveLayoutResponse
+	if err := c.get(ctx, "/api/v1/nodes/"+nodeID+"/effective-layout", &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // QueryLogs retrieves historical log entries matching the given filter.
 func (c *Client) QueryLogs(ctx context.Context, filter api.LogFilter) ([]api.LogEntry, error) {
 	var resp api.ListLogsResponse
