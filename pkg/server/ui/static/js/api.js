@@ -78,6 +78,16 @@ const API = {
         create(body)          { return API.post('/nodes', body); },
         update(id, body)      { return API.put(`/nodes/${id}`, body); },
         del(id)               { return API.del(`/nodes/${id}`); },
+        power: {
+            status(id)        { return API.get(`/nodes/${id}/power`); },
+            on(id)            { return API.post(`/nodes/${id}/power/on`); },
+            off(id)           { return API.post(`/nodes/${id}/power/off`); },
+            cycle(id)         { return API.post(`/nodes/${id}/power/cycle`); },
+            reset(id)         { return API.post(`/nodes/${id}/power/reset`); },
+            pxeBoot(id)       { return API.post(`/nodes/${id}/power/pxe`); },
+            diskBoot(id)      { return API.post(`/nodes/${id}/power/disk`); },
+        },
+        sensors(id)           { return API.get(`/nodes/${id}/sensors`); },
     },
     logs: {
         query(params = {})    { return API.get('/logs', params); },

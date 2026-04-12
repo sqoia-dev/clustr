@@ -1308,7 +1308,7 @@ const Pages = {
                 <div class="tab-bar">
                     <div class="tab active" onclick="Pages._switchTab(this, 'tab-overview')">Overview</div>
                     <div class="tab" onclick="Pages._switchTab(this, 'tab-hardware')">Hardware</div>
-                    ${node.bmc ? `<div class="tab" onclick="Pages._switchTab(this, 'tab-bmc')">BMC / IPMI</div>` : ''}
+                    <div class="tab" onclick="Pages._switchTab(this, 'tab-bmc');Pages._onBMCTabOpen('${node.id}', ${!!node.bmc})">Power / IPMI</div>
                     <div class="tab" onclick="Pages._switchTab(this, 'tab-config')">Configuration</div>
                     <div class="tab" onclick="Pages._switchTab(this, 'tab-logs')">Logs</div>
                 </div>
@@ -1360,19 +1360,72 @@ const Pages = {
                     ${hw ? this._hardwareProfile(hw) : `<div class="card"><div class="card-body">${emptyState('No hardware profile', 'Hardware is discovered when a node registers via PXE boot.')}</div></div>`}
                 </div>
 
-                <!-- BMC tab -->
-                ${node.bmc ? `<div id="tab-bmc" class="tab-panel">
-                    ${cardWrap('BMC / IPMI Configuration', `
-                        <div class="card-body">
-                            <div class="kv-grid mb-16">
-                                <div class="kv-item"><div class="kv-key">IP Address</div><div class="kv-value">${escHtml(node.bmc.ip_address || '—')}</div></div>
-                                <div class="kv-item"><div class="kv-key">Netmask</div><div class="kv-value">${escHtml(node.bmc.netmask || '—')}</div></div>
-                                <div class="kv-item"><div class="kv-key">Gateway</div><div class="kv-value">${escHtml(node.bmc.gateway || '—')}</div></div>
-                                <div class="kv-item"><div class="kv-key">Username</div><div class="kv-value">${escHtml(node.bmc.username || '—')}</div></div>
+                <!-- Power / IPMI tab — always rendered; content depends on BMC config -->
+                <div id="tab-bmc" class="tab-panel">
+                    ${node.bmc && node.bmc.ip_address ? `
+                    ${cardWrap('Power Status',
+                        `<div class="card-body">
+                            <div id="power-status-panel" style="display:flex;align-items:center;gap:16px;margin-bottom:16px">
+                                <div id="power-indicator" style="width:18px;height:18px;border-radius:50%;background:var(--border);flex-shrink:0"></div>
+                                <div>
+                                    <div id="power-label" style="font-weight:600;font-size:15px">Checking…</div>
+                                    <div id="power-last-checked" class="text-dim text-sm"></div>
+                                </div>
+                                <button class="btn btn-secondary btn-sm" style="margin-left:auto" onclick="Pages._refreshPowerStatus('${node.id}')">Refresh</button>
                             </div>
-                            ${this._ipmiControls(node)}
-                        </div>`)}
-                </div>` : ''}
+                            <div id="power-error-msg" style="display:none" class="alert alert-error"></div>
+                        </div>`,
+                        ''
+                    )}
+
+                    ${cardWrap('Power Controls',
+                        `<div class="card-body">
+                            <div class="flex gap-8" style="flex-wrap:wrap;margin-bottom:8px">
+                                <button id="btn-power-on"    class="btn btn-secondary btn-sm" onclick="Pages._doPowerAction('${node.id}', 'on')">Power On</button>
+                                <button id="btn-power-off"   class="btn btn-danger btn-sm"    onclick="Pages._confirmPowerAction('${node.id}', 'off',   'Power Off', 'This will immediately cut power to the node.')">Power Off</button>
+                                <button id="btn-power-cycle" class="btn btn-danger btn-sm"    onclick="Pages._confirmPowerAction('${node.id}', 'cycle', 'Power Cycle', 'This will hard-cycle the node (power off then on).')">Power Cycle</button>
+                                <button id="btn-power-reset" class="btn btn-danger btn-sm"    onclick="Pages._confirmPowerAction('${node.id}', 'reset', 'Reset', 'This will issue a hard reset. The node will reboot immediately.')">Reset</button>
+                            </div>
+                            <div class="flex gap-8" style="flex-wrap:wrap">
+                                <button class="btn btn-secondary btn-sm" onclick="Pages._confirmPowerAction('${node.id}', 'pxe',  'Boot to PXE', 'Sets next boot to PXE and power-cycles the node.')">
+                                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" style="width:13px;height:13px"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></svg>
+                                    PXE Boot
+                                </button>
+                                <button class="btn btn-secondary btn-sm" onclick="Pages._doPowerAction('${node.id}', 'disk')">
+                                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" style="width:13px;height:13px"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+                                    Boot to Disk
+                                </button>
+                            </div>
+                            <div id="power-action-feedback" style="display:none;margin-top:10px" class="alert alert-info"></div>
+                        </div>`,
+                        ''
+                    )}
+
+                    ${cardWrap('BMC Information',
+                        `<div class="card-body">
+                            <div class="kv-grid">
+                                <div class="kv-item"><div class="kv-key">IP Address</div><div class="kv-value text-mono">${escHtml(node.bmc.ip_address || '—')}</div></div>
+                                <div class="kv-item"><div class="kv-key">Netmask</div><div class="kv-value text-mono">${escHtml(node.bmc.netmask || '—')}</div></div>
+                                <div class="kv-item"><div class="kv-key">Gateway</div><div class="kv-value text-mono">${escHtml(node.bmc.gateway || '—')}</div></div>
+                                <div class="kv-item"><div class="kv-key">Username</div><div class="kv-value text-mono">${escHtml(node.bmc.username || '—')}</div></div>
+                            </div>
+                            <div style="margin-top:12px">
+                                <button class="btn btn-secondary btn-sm" onclick='Pages.showNodeModal(${JSON.stringify(JSON.stringify(node))}, ${JSON.stringify(JSON.stringify([]))})'>Edit BMC Config</button>
+                            </div>
+                        </div>`,
+                        ''
+                    )}
+
+                    ${cardWrap('Sensor Readings',
+                        `<div id="sensor-table-wrap"><div class="loading"><div class="spinner"></div>Loading sensors…</div></div>`,
+                        `<button class="btn btn-secondary btn-sm" onclick="Pages._refreshSensors('${node.id}')">Refresh</button>`
+                    )}`
+                    : `<div class="card"><div class="card-body">${emptyState(
+                        'BMC not configured',
+                        'Add BMC credentials to this node to enable remote power management.',
+                        `<button class="btn btn-primary btn-sm" onclick='Pages.showNodeModal(${JSON.stringify(JSON.stringify(node))}, ${JSON.stringify(JSON.stringify([]))})'>Configure BMC</button>`
+                    )}</div></div>`}
+                </div>
 
                 <!-- Configuration tab -->
                 <div id="tab-config" class="tab-panel">
@@ -1420,6 +1473,12 @@ const Pages = {
                     }
                 });
             });
+
+            // Kick off initial power status fetch if BMC is configured.
+            // This runs immediately so status is ready when the user opens the tab.
+            if (node.bmc && node.bmc.ip_address) {
+                Pages._refreshPowerStatus(node.id);
+            }
 
         } catch (e) {
             App.render(alertBox(`Failed to load node: ${e.message}`));
@@ -1484,49 +1543,133 @@ const Pages = {
         }
     },
 
-    _ipmiControls(node) {
-        if (!node.bmc || !node.bmc.ip_address) return '';
-        const bmcIP = node.bmc.ip_address;
-        const user  = node.bmc.username || 'admin';
+    // ── Power management ──────────────────────────────────────────────────────
 
-        const commands = [
-            { label: 'Power On',    cmd: `ipmitool -H ${bmcIP} -U ${user} -P <password> power on` },
-            { label: 'Power Off',   cmd: `ipmitool -H ${bmcIP} -U ${user} -P <password> power off` },
-            { label: 'Power Cycle', cmd: `ipmitool -H ${bmcIP} -U ${user} -P <password> power cycle` },
-            { label: 'Reset',       cmd: `ipmitool -H ${bmcIP} -U ${user} -P <password> power reset` },
-            { label: 'PXE Boot',    cmd: `ipmitool -H ${bmcIP} -U ${user} -P <password> chassis bootdev pxe && ipmitool -H ${bmcIP} -U ${user} -P <password> power cycle` },
-            { label: 'Sensors',     cmd: `ipmitool -H ${bmcIP} -U ${user} -P <password> sdr list` },
-        ];
-
-        return `
-            <div>
-                <p class="text-dim text-sm mb-12">Click a command to copy. Run from a host with BMC network access.</p>
-                <div class="flex gap-6" style="flex-wrap:wrap;margin-bottom:12px">
-                    ${commands.map(c => `
-                        <button class="btn btn-secondary btn-sm" onclick="Pages._copyAndShowCmd('${escHtml(c.cmd)}', this)">
-                            ${escHtml(c.label)}
-                        </button>`).join('')}
-                </div>
-                <div id="ipmi-cmd-display" style="display:none">
-                    <pre class="json-block" id="ipmi-cmd-text" style="user-select:all;margin-top:8px"></pre>
-                </div>
-            </div>`;
+    // _onBMCTabOpen is called when the user clicks the Power / IPMI tab.
+    // Starts a 20-second auto-refresh for power status and a 30-second refresh
+    // for sensors. Clears both when the user navigates away (Router stop/start).
+    _onBMCTabOpen(nodeId, hasBMC) {
+        if (!hasBMC) return;
+        // Clear any existing IPMI timers.
+        if (Pages._powerTimer)  { clearInterval(Pages._powerTimer);  Pages._powerTimer  = null; }
+        if (Pages._sensorTimer) { clearInterval(Pages._sensorTimer); Pages._sensorTimer = null; }
+        // Load sensors immediately, then every 30s.
+        Pages._refreshSensors(nodeId);
+        Pages._sensorTimer = setInterval(() => Pages._refreshSensors(nodeId), 30000);
+        // Power status is already being fetched; start auto-refresh every 20s.
+        Pages._powerTimer = setInterval(() => Pages._refreshPowerStatus(nodeId), 20000);
     },
 
-    _copyAndShowCmd(cmd, btn) {
-        const display = document.getElementById('ipmi-cmd-display');
-        const text    = document.getElementById('ipmi-cmd-text');
-        if (display && text) {
-            text.textContent = cmd;
-            display.style.display = 'block';
+    // _refreshPowerStatus fetches the current power status from the server and
+    // updates the status indicator, label, and button disabled states.
+    async _refreshPowerStatus(nodeId) {
+        const indicator = document.getElementById('power-indicator');
+        const label     = document.getElementById('power-label');
+        const lastEl    = document.getElementById('power-last-checked');
+        const errEl     = document.getElementById('power-error-msg');
+        if (!indicator) return; // tab not visible
+
+        try {
+            const data = await API.nodes.power.status(nodeId);
+            const status = data.status || 'unknown';
+
+            // Colour-code the status indicator.
+            const colours = { on: 'var(--success)', off: 'var(--text-dim)', unknown: '#f59e0b', error: 'var(--error)' };
+            const labels  = { on: 'Power On', off: 'Power Off', unknown: 'Unknown', error: 'BMC Unreachable' };
+            indicator.style.background = colours[status] || colours.unknown;
+            if (label) label.textContent = labels[status] || status;
+            if (lastEl && data.last_checked) {
+                lastEl.textContent = 'Last checked ' + fmtRelative(data.last_checked);
+            }
+            if (errEl) {
+                if (data.error) {
+                    errEl.textContent = data.error;
+                    errEl.style.display = '';
+                } else {
+                    errEl.style.display = 'none';
+                }
+            }
+            // Disable buttons that don't make sense for the current state.
+            const btnOn    = document.getElementById('btn-power-on');
+            const btnOff   = document.getElementById('btn-power-off');
+            const btnCycle = document.getElementById('btn-power-cycle');
+            const btnReset = document.getElementById('btn-power-reset');
+            if (btnOn)    btnOn.disabled    = (status === 'on');
+            if (btnOff)   btnOff.disabled   = (status === 'off');
+            if (btnCycle) btnCycle.disabled = (status === 'off');
+            if (btnReset) btnReset.disabled = (status === 'off');
+        } catch (e) {
+            if (label) label.textContent = 'Error';
+            if (errEl) { errEl.textContent = e.message; errEl.style.display = ''; }
         }
-        if (navigator.clipboard) {
-            navigator.clipboard.writeText(cmd).then(() => {
-                const orig = btn.textContent;
-                btn.style.background = 'var(--success-bg)';
-                btn.style.color = 'var(--success-text)';
-                setTimeout(() => { btn.style.background = ''; btn.style.color = ''; }, 1000);
-            }).catch(() => {});
+    },
+
+    // _doPowerAction executes a power action without a confirmation dialog.
+    // Used for non-destructive actions (power on, boot-to-disk).
+    async _doPowerAction(nodeId, action) {
+        const feedback = document.getElementById('power-action-feedback');
+        if (feedback) { feedback.textContent = `Sending ${action}…`; feedback.style.display = ''; feedback.className = 'alert alert-info'; }
+        try {
+            const fn = {
+                on: ()   => API.nodes.power.on(nodeId),
+                disk: () => API.nodes.power.diskBoot(nodeId),
+            }[action];
+            if (!fn) return;
+            await fn();
+            if (feedback) { feedback.textContent = `${action} command sent.`; feedback.className = 'alert alert-info'; }
+            // Refresh status after a short delay to let BMC process the command.
+            setTimeout(() => Pages._refreshPowerStatus(nodeId), 2000);
+        } catch (e) {
+            if (feedback) { feedback.textContent = `Error: ${e.message}`; feedback.className = 'alert alert-error'; }
+        }
+    },
+
+    // _confirmPowerAction shows a modal dialog before executing a destructive action.
+    _confirmPowerAction(nodeId, action, title, description) {
+        if (!confirm(`${title}\n\n${description}\n\nAre you sure?`)) return;
+        const actionFns = {
+            off:   () => API.nodes.power.off(nodeId),
+            cycle: () => API.nodes.power.cycle(nodeId),
+            reset: () => API.nodes.power.reset(nodeId),
+            pxe:   () => API.nodes.power.pxeBoot(nodeId),
+        };
+        const fn = actionFns[action];
+        if (!fn) return;
+        const feedback = document.getElementById('power-action-feedback');
+        if (feedback) { feedback.textContent = `Sending ${action} command…`; feedback.style.display = ''; feedback.className = 'alert alert-info'; }
+        fn().then(() => {
+            if (feedback) { feedback.textContent = `${title} command sent.`; }
+            setTimeout(() => Pages._refreshPowerStatus(nodeId), 2000);
+        }).catch(e => {
+            if (feedback) { feedback.textContent = `Error: ${e.message}`; feedback.className = 'alert alert-error'; }
+        });
+    },
+
+    // _refreshSensors fetches sensor readings and renders them in the sensor table.
+    async _refreshSensors(nodeId) {
+        const wrap = document.getElementById('sensor-table-wrap');
+        if (!wrap) return;
+        try {
+            const data = await API.nodes.sensors(nodeId);
+            const sensors = data.sensors || [];
+            if (!sensors.length) {
+                wrap.innerHTML = `<div style="padding:12px;color:var(--text-dim);font-size:13px">No sensor readings returned by BMC.</div>`;
+                return;
+            }
+            const statusColour = { ok: 'var(--success)', warning: '#f59e0b', critical: 'var(--error)' };
+            wrap.innerHTML = `<div class="table-wrap"><table>
+                <thead><tr><th>Sensor</th><th>Value</th><th>Units</th><th>Status</th></tr></thead>
+                <tbody>
+                ${sensors.map(s => `<tr>
+                    <td>${escHtml(s.name)}</td>
+                    <td class="mono">${escHtml(s.value || '—')}</td>
+                    <td class="text-dim">${escHtml(s.units || '—')}</td>
+                    <td><span style="color:${statusColour[s.status] || 'inherit'};font-weight:500">${escHtml(s.status)}</span></td>
+                </tr>`).join('')}
+                </tbody>
+            </table></div>`;
+        } catch (e) {
+            wrap.innerHTML = `<div style="padding:12px;color:var(--error);font-size:12px">Sensor read failed: ${escHtml(e.message)}</div>`;
         }
     },
 
