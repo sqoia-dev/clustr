@@ -10,6 +10,8 @@
 #   - clonr binary must be statically compiled (CGO_ENABLED=0)
 #   - busybox-static package OR internet access to download busybox
 #   - cpio, gzip
+#   - sshpass + access to clonr-server (192.168.1.151) for kernel modules
+#     (virtio_net, net_failover, failover required for virtio NIC in initramfs)
 #
 # Example:
 #   CGO_ENABLED=0 go build -o bin/clonr ./cmd/clonr
@@ -19,6 +21,12 @@ set -euo pipefail
 
 CLONR_BIN="${1:?Usage: build-initramfs.sh <clonr-binary> [output]}"
 OUTPUT="${2:-initramfs-clonr.img}"
+
+# clonr-server SSH credentials — used to pull kernel modules.
+# The initramfs kernel version must match the modules being loaded.
+CLONR_SERVER_HOST="${CLONR_SERVER_HOST:-192.168.1.151}"
+CLONR_SERVER_USER="${CLONR_SERVER_USER:-clonr}"
+CLONR_SERVER_PASS="${CLONR_SERVER_PASS:-clonr}"
 
 # Verify the binary exists and is executable.
 if [[ ! -f "$CLONR_BIN" ]]; then
@@ -95,6 +103,89 @@ done
 
 echo "  [+] Installed busybox and symlinks"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Kernel modules for virtio NIC support.
+#
+# The Rocky 9 kernel served by clonr-server has virtio_pci built-in but
+# virtio_net (+ its deps net_failover, failover) as loadable modules.
+# Without these, the NIC won't appear in the initramfs and DHCP won't work.
+#
+# We pull the modules from the clonr-server (same kernel version as the PXE
+# kernel) and embed them. The init script calls modprobe before udhcpc.
+# ──────────────────────────────────────────────────────────────────────────────
+echo "  [+] Fetching kernel modules from clonr-server ${CLONR_SERVER_HOST}..."
+
+# Discover the kernel version from the server.
+KVER=$(sshpass -p "$CLONR_SERVER_PASS" ssh -o StrictHostKeyChecking=no \
+    "${CLONR_SERVER_USER}@${CLONR_SERVER_HOST}" "uname -r" 2>/dev/null)
+
+if [[ -z "$KVER" ]]; then
+    echo "WARNING: cannot reach clonr-server — skipping kernel modules." >&2
+    echo "         virtio_net will not be loaded; DHCP may fail on virtio NICs." >&2
+    KVER="unknown"
+else
+    echo "      kernel version: $KVER"
+
+    # Modules needed for virtio NIC: failover → net_failover → virtio_net
+    MODULES=(
+        "net/core/failover.ko.xz"
+        "net/net_failover.ko.xz"
+        "net/virtio_net.ko.xz"
+    )
+
+    MODDIR="$WORKDIR/lib/modules/$KVER/kernel/drivers"
+    mkdir -p "$MODDIR/net"
+    mkdir -p "$WORKDIR/lib/modules/$KVER/kernel/net/core"
+
+    for mod in "${MODULES[@]}"; do
+        REMOTE_PATH="/lib/modules/$KVER/kernel/drivers/$mod"
+        # Adjust path for net/core modules which live outside drivers/
+        if [[ "$mod" == net/core/* ]]; then
+            REMOTE_PATH="/lib/modules/$KVER/kernel/${mod}"
+            LOCAL_DIR="$WORKDIR/lib/modules/$KVER/kernel/$(dirname "$mod")"
+        else
+            REMOTE_PATH="/lib/modules/$KVER/kernel/drivers/${mod}"
+            LOCAL_DIR="$WORKDIR/lib/modules/$KVER/kernel/drivers/$(dirname "$mod")"
+        fi
+        mkdir -p "$LOCAL_DIR"
+        LOCAL_FILE="$LOCAL_DIR/$(basename "$mod")"
+
+        if sshpass -p "$CLONR_SERVER_PASS" scp -o StrictHostKeyChecking=no \
+            "${CLONR_SERVER_USER}@${CLONR_SERVER_HOST}:${REMOTE_PATH}" \
+            "$LOCAL_FILE" 2>/dev/null; then
+            echo "      fetched: $(basename "$mod")"
+        else
+            echo "WARNING: failed to fetch ${REMOTE_PATH}" >&2
+        fi
+    done
+
+    # Generate a minimal modules.dep so modprobe can resolve the chain.
+    # Format: module_path: [dep_path ...]
+    # virtio_net depends on net_failover; net_failover depends on failover.
+    MODDEP_DIR="$WORKDIR/lib/modules/$KVER"
+    MODDEP_FILE="$MODDEP_DIR/modules.dep"
+
+    VIRTIO_NET_PATH="kernel/drivers/net/virtio_net.ko.xz"
+    FAILOVER_PATH="kernel/net/core/failover.ko.xz"
+    NET_FAILOVER_PATH="kernel/drivers/net/net_failover.ko.xz"
+
+    cat > "$MODDEP_FILE" << MODDEP
+kernel/net/core/failover.ko.xz:
+kernel/drivers/net/net_failover.ko.xz: kernel/net/core/failover.ko.xz
+kernel/drivers/net/virtio_net.ko.xz: kernel/drivers/net/net_failover.ko.xz kernel/net/core/failover.ko.xz
+MODDEP
+
+    # modules.alias for virtio NIC alias lookup (optional but keeps modprobe quiet).
+    cat > "$MODDEP_DIR/modules.alias" << MODALIAS
+alias virtio:d00000001v* virtio_net
+MODALIAS
+
+    # modules.dep.bin is not needed when modprobe has the text modules.dep.
+    echo "      generated modules.dep for $KVER"
+fi
+
+echo "  [+] Kernel modules ready"
+
 # /etc/resolv.conf placeholder (udhcpc will overwrite this).
 cat > "$WORKDIR/etc/resolv.conf" << 'EOF'
 nameserver 8.8.8.8
@@ -150,7 +241,7 @@ chmod 755 "$WORKDIR/usr/share/udhcpc/default.script"
 
 # init script — runs as PID 1 in the initramfs.
 # Always drops to a busybox shell on exit so the node stays debuggable.
-cat > "$WORKDIR/init" << 'INIT_EOF'
+cat > "$WORKDIR/init" << INIT_EOF
 #!/bin/sh
 # Redirect stdout/stderr to /dev/console so we get output on the serial/VGA console.
 exec >/dev/console 2>/dev/console </dev/console
@@ -171,15 +262,27 @@ echo "============================================"
 # Parse kernel command line.
 CLONR_SERVER=""
 CLONR_MAC=""
-for arg in $(cat /proc/cmdline); do
-    case $arg in
-        clonr.server=*) CLONR_SERVER="${arg#clonr.server=}" ;;
-        clonr.mac=*)    CLONR_MAC="${arg#clonr.mac=}" ;;
+for arg in \$(cat /proc/cmdline); do
+    case \$arg in
+        clonr.server=*) CLONR_SERVER="\${arg#clonr.server=}" ;;
+        clonr.mac=*)    CLONR_MAC="\${arg#clonr.mac=}" ;;
     esac
 done
 
-echo "Server : ${CLONR_SERVER:-not set}"
-echo "MAC    : ${CLONR_MAC:-auto-detect}"
+echo "Server : \${CLONR_SERVER:-not set}"
+echo "MAC    : \${CLONR_MAC:-auto-detect}"
+echo "Kernel : \$(uname -r 2>/dev/null)"
+echo ""
+
+# Load kernel modules for virtio NIC.
+# Modules were embedded at build time from the clonr-server matching kernel.
+# Modules live at /lib/modules/\$(uname -r)/ — busybox modprobe finds them there.
+# Load order: failover → net_failover → virtio_net
+KVER=\$(uname -r)
+echo "Loading NIC modules for \$KVER..."
+modprobe failover      2>/dev/null && echo "  [ok] failover"      || echo "  [!] failover (may be builtin or missing)"
+modprobe net_failover  2>/dev/null && echo "  [ok] net_failover"  || echo "  [!] net_failover (may be missing)"
+modprobe virtio_net    2>/dev/null && echo "  [ok] virtio_net"    || echo "  [!] virtio_net (may be missing)"
 echo ""
 
 # Bring up loopback first.
@@ -189,20 +292,20 @@ ip addr add 127.0.0.1/8 dev lo 2>/dev/null || true
 # Bring up networking — try DHCP on all non-loopback interfaces.
 IFACE_UP=""
 for iface_path in /sys/class/net/*/; do
-    iface=$(basename "$iface_path")
-    [ "$iface" = "lo" ] && continue
-    echo "Bringing up $iface..."
-    ip link set "$iface" up 2>/dev/null
-    if udhcpc -i "$iface" -n -q -t 15 -T 3 -s /usr/share/udhcpc/default.script; then
-        IFACE_UP="$iface"
-        echo "DHCP on $iface: OK"
+    iface=\$(basename "\$iface_path")
+    [ "\$iface" = "lo" ] && continue
+    echo "Bringing up \$iface..."
+    ip link set "\$iface" up 2>/dev/null
+    if udhcpc -i "\$iface" -n -q -t 15 -T 3 -s /usr/share/udhcpc/default.script; then
+        IFACE_UP="\$iface"
+        echo "DHCP on \$iface: OK"
         break
     else
-        echo "DHCP on $iface: failed"
+        echo "DHCP on \$iface: failed"
     fi
 done
 
-if [ -z "$IFACE_UP" ]; then
+if [ -z "\$IFACE_UP" ]; then
     echo "WARNING: DHCP failed on all interfaces"
 fi
 
@@ -215,20 +318,20 @@ echo ""
 # Build the clonr arguments.
 # CLONR_SERVER env var is read by clonr's LoadClientConfig(), but also pass
 # --server explicitly as belt-and-suspenders.
-export CLONR_SERVER="${CLONR_SERVER:-http://10.99.0.1:8080}"
-SERVER_ARG="--server ${CLONR_SERVER}"
+export CLONR_SERVER="\${CLONR_SERVER:-http://10.99.0.1:8080}"
+SERVER_ARG="--server \${CLONR_SERVER}"
 
-echo "Running: /usr/bin/clonr deploy --auto ${SERVER_ARG}"
+echo "Running: /usr/bin/clonr deploy --auto \${SERVER_ARG}"
 echo ""
 
-/usr/bin/clonr deploy --auto ${SERVER_ARG}
-CLONR_EXIT=$?
+/usr/bin/clonr deploy --auto \${SERVER_ARG}
+CLONR_EXIT=\$?
 
 echo ""
-if [ $CLONR_EXIT -eq 0 ]; then
+if [ \$CLONR_EXIT -eq 0 ]; then
     echo "clonr deploy --auto completed successfully (exit 0)"
 else
-    echo "clonr deploy --auto exited with code $CLONR_EXIT"
+    echo "clonr deploy --auto exited with code \$CLONR_EXIT"
 fi
 
 echo ""
