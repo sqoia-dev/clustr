@@ -422,6 +422,12 @@ PXE-booted nodes running from initramfs.`,
 			remoteWriter := client.NewRemoteLogWriter(c, "unknown", "", client.WithComponent("deploy"))
 			defer remoteWriter.Close()
 
+			// ── Structured progress reporter ─────────────────────────────────
+			// Created early with a placeholder MAC; updated after hardware discovery.
+			// Best-effort: failures to POST progress don't abort the deployment.
+			progressReporter := client.NewProgressReporter(c, "unknown", "")
+			defer func() { progressReporter.Complete() }()
+
 			// Tee all zerolog output: local console + remote server.
 			multi := zerolog.MultiLevelWriter(zerolog.ConsoleWriter{Out: os.Stderr}, remoteWriter)
 			deployLog := zerolog.New(multi).With().Timestamp().Logger()
@@ -446,6 +452,7 @@ PXE-booted nodes running from initramfs.`,
 
 			// Now that we have the MAC, update the remote writer identity.
 			remoteWriter.SetNodeMAC(primaryMAC)
+			progressReporter.SetNode(primaryMAC, "")
 			deployLog.Info().Str("component", "deploy").Str("mac", primaryMAC).Msg("fetching node config")
 
 			nodeCfg, err := c.GetNodeConfigByMAC(ctx, primaryMAC)
@@ -454,6 +461,7 @@ PXE-booted nodes running from initramfs.`,
 				return fmt.Errorf("get node config (MAC %s): %w", primaryMAC, err)
 			}
 			remoteWriter.SetHostname(nodeCfg.Hostname)
+			progressReporter.SetNode(primaryMAC, nodeCfg.Hostname)
 			fmt.Fprintf(os.Stderr, "    Node: %s (%s)\n", nodeCfg.Hostname, nodeCfg.ID)
 			deployLog.Info().Str("component", "deploy").Str("hostname", nodeCfg.Hostname).Msg("node config loaded")
 
@@ -494,6 +502,7 @@ PXE-booted nodes running from initramfs.`,
 			// Step 4: Preflight.
 			fmt.Fprintln(os.Stderr, "[4/6] Running preflight checks...")
 			deployLog.Info().Str("component", "deploy").Msg("running preflight checks")
+			progressReporter.StartPhase("preflight", 0)
 			var deployer deploy.Deployer
 			switch img.Format {
 			case api.ImageFormatBlock:
@@ -504,9 +513,11 @@ PXE-booted nodes running from initramfs.`,
 
 			if err := deployer.Preflight(ctx, img.DiskLayout, *hw); err != nil {
 				deployLog.Error().Str("component", "deploy").Err(err).Msg("preflight failed")
+				progressReporter.EndPhase(err.Error())
 				return fmt.Errorf("preflight: %w", err)
 			}
 			deployLog.Info().Str("component", "deploy").Msg("preflight passed")
+			progressReporter.EndPhase("")
 
 			// Step 5: Deploy.
 			fmt.Fprintln(os.Stderr, "[5/6] Deploying image...")
@@ -520,6 +531,7 @@ PXE-booted nodes running from initramfs.`,
 				NoRollback:       flagNoRollback,
 				SkipVerify:       flagSkipVerify,
 				ExpectedChecksum: img.Checksum,
+				Reporter:         progressReporter,
 			}
 
 			start := time.Now()
@@ -560,12 +572,15 @@ PXE-booted nodes running from initramfs.`,
 			// Step 6: Finalize.
 			fmt.Fprintln(os.Stderr, "[6/6] Applying node configuration...")
 			deployLog.Info().Str("component", "chroot").Msg("applying node configuration")
+			progressReporter.StartPhase("finalizing", 0)
 			if err := deployer.Finalize(ctx, *nodeCfg, mountRoot); err != nil {
 				deployLog.Error().Str("component", "chroot").Err(err).Msg("finalize failed")
+				progressReporter.EndPhase(err.Error())
 				return fmt.Errorf("finalize: %w", err)
 			}
 			fmt.Fprintln(os.Stderr, "    Hostname, network, and SSH keys applied.")
 			deployLog.Info().Str("component", "chroot").Msg("node configuration applied")
+			progressReporter.EndPhase("")
 
 			// Step 7: EFI boot repair (optional).
 			if flagFixEFI {
@@ -733,6 +748,10 @@ func runAutoDeployImage(ctx context.Context, c *client.Client, nodeCfg api.NodeC
 		cfg.ServerURL = flagServer
 	}
 
+	// Create progress reporter — best-effort, failures don't abort deployment.
+	reporter := client.NewProgressReporter(c, nodeCfg.PrimaryMAC, nodeCfg.Hostname)
+	defer reporter.Complete()
+
 	// Fetch image details.
 	img, err := c.GetImage(ctx, nodeCfg.BaseImageID)
 	if err != nil {
@@ -766,19 +785,24 @@ func runAutoDeployImage(ctx context.Context, c *client.Client, nodeCfg api.NodeC
 	}
 
 	deployLog.Info().Msg("running preflight checks")
+	reporter.StartPhase("preflight", 0)
 	if err := deployer.Preflight(ctx, img.DiskLayout, *hw); err != nil {
+		reporter.EndPhase(err.Error())
 		return fmt.Errorf("preflight: %w", err)
 	}
+	reporter.EndPhase("")
 
 	blobURL := cfg.ServerURL + "/api/v1/images/" + img.ID + "/blob"
 	deployLog.Info().Str("url", blobURL).Msg("starting image write")
 
 	opts := deploy.DeployOpts{
-		ImageURL:   blobURL,
-		AuthToken:  cfg.AuthToken,
-		TargetDisk: "", // auto-detect
-		Format:     string(img.Format),
-		MountRoot:  mountRoot,
+		ImageURL:         blobURL,
+		AuthToken:        cfg.AuthToken,
+		TargetDisk:       "", // auto-detect
+		Format:           string(img.Format),
+		MountRoot:        mountRoot,
+		ExpectedChecksum: img.Checksum,
+		Reporter:         reporter,
 	}
 
 	var lastLoggedPct int64
@@ -816,11 +840,14 @@ func runAutoDeployImage(ctx context.Context, c *client.Client, nodeCfg api.NodeC
 	deployLog.Info().Str("duration", elapsed.String()).Msg("image write complete")
 
 	deployLog.Info().Str("hostname", nodeCfg.Hostname).Msg("applying node configuration (hostname, network, SSH keys)")
+	reporter.StartPhase("finalizing", 0)
 	if err := deployer.Finalize(ctx, nodeCfg, mountRoot); err != nil {
 		deployLog.Error().Err(err).Msg("finalize failed")
+		reporter.EndPhase(err.Error())
 		return fmt.Errorf("finalize: %w", err)
 	}
 	deployLog.Info().Str("hostname", nodeCfg.Hostname).Msg("node configuration applied")
+	reporter.EndPhase("")
 
 	deployLog.Info().Str("hostname", nodeCfg.Hostname).Str("duration",
 		time.Since(start).Round(time.Second).String()).Msg("auto-deployment complete — rebooting")

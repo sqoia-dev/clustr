@@ -140,6 +140,20 @@ type DeployOpts struct {
 	// ExpectedChecksum is the sha256 hex string to verify the downloaded blob against.
 	// When empty and SkipVerify is false, verification is skipped with a warning.
 	ExpectedChecksum string
+	// Reporter is the optional structured progress reporter used to send
+	// real-time byte-level progress updates to the server.
+	// When nil, progress is reported only via ProgressFunc and logging.
+	Reporter ProgressReporter
+}
+
+// ProgressReporter is the interface used by deploy engines to emit structured
+// progress events. Implemented by client.ProgressReporter; may be nil-safe.
+type ProgressReporter interface {
+	StartPhase(phase string, total int64)
+	Update(bytesDone int64)
+	EndPhase(errMsg string)
+	Complete()
+	Fail(err error)
 }
 
 // Deployer is the interface implemented by all deployment backends.

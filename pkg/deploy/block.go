@@ -95,6 +95,9 @@ func (d *BlockDeployer) Deploy(ctx context.Context, opts DeployOpts, progress Pr
 	if progress != nil {
 		progress(0, 0, "downloading")
 	}
+	if opts.Reporter != nil {
+		opts.Reporter.StartPhase("downloading", 0) // total updated once content-length is known
+	}
 
 	var writeErr error
 	for attempt := 1; attempt <= maxDownloadAttempts; attempt++ {
@@ -126,7 +129,13 @@ func (d *BlockDeployer) Deploy(ctx context.Context, opts DeployOpts, progress Pr
 
 	if writeErr != nil {
 		doRollback("block write failed after all retries")
+		if opts.Reporter != nil {
+			opts.Reporter.EndPhase(writeErr.Error())
+		}
 		return fmt.Errorf("deploy/block: image write failed after %d attempts: %w", maxDownloadAttempts, writeErr)
+	}
+	if opts.Reporter != nil {
+		opts.Reporter.EndPhase("")
 	}
 
 	// Deployment succeeded — remove the rollback backup.
@@ -172,7 +181,7 @@ func (d *BlockDeployer) attemptBlockWrite(ctx context.Context, disk string, opts
 	if opts.SkipVerify && opts.ExpectedChecksum != "" {
 		logger().Warn().Msg("checksum verification skipped (--skip-verify set)")
 	}
-	return d.streamBlockWrite(ctx, resp.Body, totalBytes, disk, progress)
+	return d.streamBlockWrite(ctx, resp.Body, totalBytes, disk, opts, progress)
 }
 
 // downloadVerifyAndWrite downloads the block image to a temp file, verifies
@@ -188,7 +197,11 @@ func (d *BlockDeployer) downloadVerifyAndWrite(ctx context.Context, body io.Read
 	// Download and hash simultaneously.
 	hasher := sha256.New()
 	tee := io.TeeReader(body, hasher)
-	pr := &progressReader{r: tee, total: totalBytes, fn: progress, phase: "downloading"}
+	// Update downloading phase total now that we know the content-length.
+	if opts.Reporter != nil {
+		opts.Reporter.StartPhase("downloading", totalBytes)
+	}
+	pr := &progressReader{r: tee, total: totalBytes, fn: progress, phase: "downloading", reporter: opts.Reporter}
 
 	if _, err := io.Copy(tmpFile, pr); err != nil {
 		return fmt.Errorf("network error downloading image blob: %w", err)
@@ -220,7 +233,10 @@ func (d *BlockDeployer) downloadVerifyAndWrite(ctx context.Context, body io.Read
 	defer f.Close()
 
 	buf := make([]byte, 4*1024*1024)
-	pr2 := &progressReader{r: tmpFile, total: totalBytes, fn: progress, phase: "writing"}
+	if opts.Reporter != nil {
+		opts.Reporter.StartPhase("extracting", totalBytes)
+	}
+	pr2 := &progressReader{r: tmpFile, total: totalBytes, fn: progress, phase: "writing", reporter: opts.Reporter}
 	if _, err := io.CopyBuffer(f, pr2, buf); err != nil {
 		return fmt.Errorf("write to %s: %w", disk, err)
 	}
@@ -229,14 +245,18 @@ func (d *BlockDeployer) downloadVerifyAndWrite(ctx context.Context, body io.Read
 }
 
 // streamBlockWrite streams the download directly to disk without checksum verification.
-func (d *BlockDeployer) streamBlockWrite(ctx context.Context, body io.Reader, totalBytes int64, disk string, progress ProgressFunc) error {
+func (d *BlockDeployer) streamBlockWrite(ctx context.Context, body io.Reader, totalBytes int64, disk string, opts DeployOpts, progress ProgressFunc) error {
 	f, err := os.OpenFile(disk, os.O_WRONLY|os.O_SYNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("open disk %s: %w", disk, err)
 	}
 	defer f.Close()
 
-	pr := &progressReader{r: body, total: totalBytes, fn: progress, phase: "writing"}
+	// Update downloading phase total now that we know the content-length.
+	if opts.Reporter != nil {
+		opts.Reporter.StartPhase("downloading", totalBytes)
+	}
+	pr := &progressReader{r: body, total: totalBytes, fn: progress, phase: "writing", reporter: opts.Reporter}
 	buf := make([]byte, 4*1024*1024)
 	if _, err := io.CopyBuffer(f, pr, buf); err != nil {
 		return fmt.Errorf("write to %s: %w", disk, err)
