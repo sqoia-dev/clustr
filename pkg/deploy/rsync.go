@@ -155,12 +155,18 @@ func (d *FilesystemDeployer) Deploy(ctx context.Context, opts DeployOpts, progre
 	if progress != nil {
 		progress(0, 0, "partitioning")
 	}
+	if opts.Reporter != nil {
+		opts.Reporter.StartPhase("partitioning", int64(len(d.layout.Partitions)))
+	}
 
 	// Create RAID arrays before partitioning, if any are specified.
 	if len(d.layout.RAIDArrays) > 0 {
 		logger().Info().Int("count", len(d.layout.RAIDArrays)).Msg("creating RAID arrays")
 		if err := CreateRAIDArrays(ctx, d.layout, hardware.SystemInfo{}); err != nil {
 			doRollback("RAID array creation failed")
+			if opts.Reporter != nil {
+				opts.Reporter.EndPhase(err.Error())
+			}
 			return fmt.Errorf("deploy: create raid arrays: %w", err)
 		}
 	}
@@ -169,14 +175,23 @@ func (d *FilesystemDeployer) Deploy(ctx context.Context, opts DeployOpts, progre
 	if err := d.partitionDisk(ctx, disk); err != nil {
 		logger().Error().Str("disk", disk).Err(err).Msg("partitioning failed")
 		doRollback("partitioning failed")
+		if opts.Reporter != nil {
+			opts.Reporter.EndPhase(err.Error())
+		}
 		return err // partitionDisk already produces an actionable error
 	}
 	logger().Info().Str("disk", disk).Msg("partitioning complete")
+	if opts.Reporter != nil {
+		opts.Reporter.EndPhase("")
+	}
 
 	// Emit progress: formatting phase.
 	logger().Info().Str("disk", disk).Msg("formatting partitions")
 	if progress != nil {
 		progress(0, 0, "formatting")
+	}
+	if opts.Reporter != nil {
+		opts.Reporter.StartPhase("formatting", int64(len(d.layout.Partitions)))
 	}
 
 	// Create filesystems.
@@ -184,9 +199,15 @@ func (d *FilesystemDeployer) Deploy(ctx context.Context, opts DeployOpts, progre
 	if err != nil {
 		logger().Error().Str("disk", disk).Err(err).Msg("filesystem creation failed")
 		doRollback("filesystem creation failed")
+		if opts.Reporter != nil {
+			opts.Reporter.EndPhase(err.Error())
+		}
 		return fmt.Errorf("deploy: create filesystems: %w", err)
 	}
 	logger().Info().Str("devices", strings.Join(partDevs, ", ")).Msg("filesystems created")
+	if opts.Reporter != nil {
+		opts.Reporter.EndPhase("")
+	}
 
 	// Mount partitions.
 	logger().Info().Str("mount_root", opts.MountRoot).Msg("mounting partitions")
@@ -217,6 +238,11 @@ func (d *FilesystemDeployer) Deploy(ctx context.Context, opts DeployOpts, progre
 		logger().Info().Msg("image blob connection ready — extracting (unknown size)")
 	}
 
+	// Signal downloading phase with byte total for real-time UI progress.
+	if opts.Reporter != nil {
+		opts.Reporter.StartPhase("downloading", blob.totalBytes)
+	}
+
 	needsVerify := !opts.SkipVerify && opts.ExpectedChecksum != ""
 	if opts.SkipVerify && opts.ExpectedChecksum != "" {
 		logger().Warn().Msg("checksum verification skipped for image download (--skip-verify set)")
@@ -225,9 +251,15 @@ func (d *FilesystemDeployer) Deploy(ctx context.Context, opts DeployOpts, progre
 	if err := d.streamExtract(ctx, blob.resp.Body, blob.totalBytes, opts, needsVerify, progress); err != nil {
 		logger().Error().Err(err).Msg("image download/extract failed")
 		doRollback("image download/extract failed")
+		if opts.Reporter != nil {
+			opts.Reporter.EndPhase(err.Error())
+		}
 		return fmt.Errorf("deploy: extract: %w", err)
 	}
 	logger().Info().Msg("extraction complete")
+	if opts.Reporter != nil {
+		opts.Reporter.EndPhase("")
+	}
 
 	// Deployment succeeded — remove the rollback backup.
 	if rollbackPath != "" {
@@ -656,7 +688,7 @@ func (d *FilesystemDeployer) streamExtract(ctx context.Context, body io.Reader, 
 		reader = io.TeeReader(body, hasher)
 	}
 
-	pr := &progressReader{r: reader, total: totalBytes, fn: progress, phase: "downloading+extracting"}
+	pr := &progressReader{r: reader, total: totalBytes, fn: progress, phase: "downloading+extracting", reporter: opts.Reporter}
 
 	// Peek at the first 4 bytes to detect compression format.
 	peeked := bufio.NewReaderSize(pr, 512)
@@ -725,11 +757,48 @@ func (d *FilesystemDeployer) streamExtract(ctx context.Context, body io.Reader, 
 	// tar -xvf - streams each extracted filename to stdout, which runAndLog pipes
 	// through the logger at Info level. This gives per-file visibility during
 	// extraction without any extra logic.
-	tarCmd := exec.CommandContext(ctx, "tar", "-xvf", "-", "-C", opts.MountRoot)
+	//
+	// Flags used:
+	//   --numeric-owner        preserve UID/GID as numbers (no user DB needed in initramfs)
+	//   --xattrs               restore extended attributes from the archive
+	//   --xattrs-include='*'   include all xattr namespaces (selinux, security.*, etc)
+	//   --selinux              restore SELinux contexts
+	//   --acls                 restore POSIX ACLs
+	//   --ignore-failed-read   don't abort on read failures in weird files
+	//   --warning=no-xattr-write --warning=no-unknown-keyword
+	//                          demote xattr-write and unknown-pax-keyword warnings to info
+	//                          (these cause exit code 2 on some files without being real failures)
+	//   --warning=no-timestamp don't fail on files with timestamps in the future
+	tarCmd := exec.CommandContext(ctx, "tar",
+		"--numeric-owner",
+		"--xattrs",
+		"--xattrs-include=*",
+		"--selinux",
+		"--acls",
+		"--ignore-failed-read",
+		"--warning=no-xattr-write",
+		"--warning=no-unknown-keyword",
+		"--warning=no-timestamp",
+		"-xvf", "-",
+		"-C", opts.MountRoot,
+	)
 	tarCmd.Stdin = tarSrc
 
 	if err := runAndLog(ctx, "tar", tarCmd); err != nil {
-		return fmt.Errorf("tar extract failed: %w", err)
+		// tar exit code 2 on extraction often means a handful of files failed but
+		// most of the archive was written successfully. Log the error but don't
+		// fail the deployment if the critical system files are present.
+		// Check if /etc and /usr were extracted — if so, the failure was in something
+		// non-critical and we can continue.
+		if _, etcErr := os.Stat(filepath.Join(opts.MountRoot, "etc", "os-release")); etcErr == nil {
+			if _, usrErr := os.Stat(filepath.Join(opts.MountRoot, "usr", "bin")); usrErr == nil {
+				log.Warn().Err(err).Msg("tar extract reported errors but /etc and /usr are present — continuing")
+			} else {
+				return fmt.Errorf("tar extract failed: %w", err)
+			}
+		} else {
+			return fmt.Errorf("tar extract failed: %w", err)
+		}
 	}
 
 	log.Info().Str("read", humanReadableBytes(pr.written)).Msg("stream-extract complete")
@@ -753,12 +822,15 @@ func (d *FilesystemDeployer) streamExtract(ctx context.Context, body io.Reader, 
 }
 
 // progressReader wraps an io.Reader and calls a ProgressFunc on each read.
+// It also calls ProgressReporter.Update when reporter is set, enabling real-time
+// byte-level structured progress events to be sent to the server.
 type progressReader struct {
-	r       io.Reader
-	total   int64
-	written int64
-	fn      ProgressFunc
-	phase   string
+	r        io.Reader
+	total    int64
+	written  int64
+	fn       ProgressFunc
+	phase    string
+	reporter ProgressReporter
 }
 
 func (p *progressReader) Read(b []byte) (int, error) {
@@ -766,6 +838,9 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	p.written += int64(n)
 	if p.fn != nil {
 		p.fn(p.written, p.total, p.phase)
+	}
+	if p.reporter != nil {
+		p.reporter.Update(p.written)
 	}
 	return n, err
 }
