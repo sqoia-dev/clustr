@@ -650,21 +650,118 @@ func isMounted(dev, target string) bool {
 	return false
 }
 
-// unmountAll unmounts everything under mountRoot in reverse order (deepest first).
-// Syncs first to flush pending writes, then retries umount -R up to 10 times with
-// 1-second waits to allow kernel writeback to drain. Only falls back to lazy detach
-// if all retries fail. Lazy detach (umount -l) is intentionally a last resort because
-// it leaves the block device marked "in use" by the kernel, which causes the subsequent
-// Finalize remount to fail with EBUSY.
+// xfsSyncMountRoot freezes then immediately thaws every XFS filesystem mounted
+// under mountRoot. freeze(xfs_freeze -f) forces the XFS log to fully commit all
+// in-memory journal entries to disk and quiesces I/O; thaw(xfs_freeze -u) resumes
+// normal operation. After this cycle the filesystem has no pending dirty log
+// entries and is safe to unmount without EBUSY from lingering log I/O.
+//
+// XFS uses an asynchronous delayed-logging model: sync(2) flushes the page cache
+// but does NOT wait for the XFS circular log buffer to commit. On a large tar
+// extraction that writes thousands of inodes, the log can remain active for several
+// seconds after sync returns, causing umount to fail with EBUSY. xfs_freeze is the
+// only reliable way to drain it without a fixed-duration sleep.
+//
+// Mounts are processed deepest-first so nested mounts (e.g. /boot nested inside /)
+// are frozen before their parent.
+func xfsSyncMountRoot(mountRoot string) {
+	log := logger()
+
+	// Read /proc/mounts and find all XFS mounts under mountRoot (or exactly mountRoot).
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		log.Warn().Err(err).Msg("xfsSyncMountRoot: cannot read /proc/mounts — skipping xfs_freeze")
+		return
+	}
+
+	var xfsMounts []string
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		target := fields[1]
+		fstype := fields[2]
+		// Only XFS mounts at or under mountRoot.
+		if fstype != "xfs" {
+			continue
+		}
+		if target != mountRoot && !strings.HasPrefix(target, mountRoot+"/") {
+			continue
+		}
+		xfsMounts = append(xfsMounts, target)
+	}
+
+	if len(xfsMounts) == 0 {
+		// No XFS mounts found — fall back to a global sync.
+		_ = exec.Command("sync").Run()
+		return
+	}
+
+	// Sort deepest-first (longest path first) so nested mounts are frozen before
+	// their parents. Sorting by path length descending achieves this.
+	for i := 0; i < len(xfsMounts)-1; i++ {
+		for j := i + 1; j < len(xfsMounts); j++ {
+			if len(xfsMounts[j]) > len(xfsMounts[i]) {
+				xfsMounts[i], xfsMounts[j] = xfsMounts[j], xfsMounts[i]
+			}
+		}
+	}
+
+	for _, mp := range xfsMounts {
+		if out, err := exec.Command("xfs_freeze", "-f", mp).CombinedOutput(); err != nil {
+			log.Warn().Str("mountpoint", mp).Err(err).Str("output", string(out)).
+				Msg("xfs_freeze -f failed — XFS log may not be fully committed")
+			continue
+		}
+		log.Info().Str("mountpoint", mp).Msg("xfs_freeze: log committed and filesystem frozen")
+		// Immediately thaw — we only needed the freeze to drain the log.
+		if out, err := exec.Command("xfs_freeze", "-u", mp).CombinedOutput(); err != nil {
+			log.Warn().Str("mountpoint", mp).Err(err).Str("output", string(out)).
+				Msg("xfs_freeze -u failed — filesystem may remain frozen; unmount will proceed")
+		} else {
+			log.Info().Str("mountpoint", mp).Msg("xfs_freeze: filesystem thawed")
+		}
+	}
+}
+
+// logMountBusyDiagnostics emits lsof and /proc/mounts output at Warn level.
+// Called when umount -R fails so the next failure has actionable context in logs.
+func logMountBusyDiagnostics(mountRoot string) {
+	log := logger()
+	if out, err := exec.Command("lsof", "+D", mountRoot).CombinedOutput(); err == nil && len(out) > 0 {
+		log.Warn().Str("mountRoot", mountRoot).Str("lsof", string(out)).
+			Msg("umount EBUSY diagnostic: open files under mountRoot")
+	}
+	if out, err := exec.Command("fuser", "-vm", mountRoot).CombinedOutput(); err == nil && len(out) > 0 {
+		log.Warn().Str("mountRoot", mountRoot).Str("fuser", string(out)).
+			Msg("umount EBUSY diagnostic: processes using mountRoot")
+	}
+	data, _ := os.ReadFile("/proc/mounts")
+	log.Warn().Str("proc_mounts", string(data)).Msg("umount EBUSY diagnostic: current mounts")
+}
+
+// unmountAll unmounts everything under mountRoot.
+// Before unmounting, it freezes-then-thaws every XFS filesystem under mountRoot
+// via xfs_freeze to force the XFS log to fully commit — this is the reliable fix
+// for EBUSY after large tar extractions on XFS. sync(2) alone is insufficient
+// because it flushes the page cache but does not drain XFS's internal log buffer.
+//
+// After the XFS freeze/thaw, clean unmount should succeed immediately. We keep
+// three retries as a safety margin for non-XFS cases. Only falls back to lazy
+// detach if all retries fail. Lazy detach (umount -l) is intentionally a last
+// resort because it leaves the block device marked "in use" by the kernel, which
+// causes the subsequent Finalize remount to fail with EBUSY.
 func (d *FilesystemDeployer) unmountAll(mountRoot string) {
 	log := logger()
-	// Flush dirty pages — reduces the chance of EBUSY on umount.
-	_ = exec.Command("sync").Run()
 
-	// Retry umount -R up to 10 times, waiting 1s between attempts.
-	// Kernel write-back after a large tar extraction can keep the filesystem
-	// busy for several seconds even after sync returns.
-	const maxUmountRetries = 10
+	// Force XFS log commit before unmounting. This drains the async journal
+	// that keeps the filesystem busy after large writes.
+	xfsSyncMountRoot(mountRoot)
+
+	// After xfs_freeze the filesystem should unmount cleanly on the first try.
+	// Keep three retries for safety (non-XFS filesystems, ext4 writeback, etc).
+	const maxUmountRetries = 3
 	for attempt := 1; attempt <= maxUmountRetries; attempt++ {
 		err := exec.Command("umount", "-R", mountRoot).Run()
 		if err == nil {
@@ -677,14 +774,26 @@ func (d *FilesystemDeployer) unmountAll(mountRoot string) {
 		if attempt < maxUmountRetries {
 			log.Debug().Str("mountRoot", mountRoot).Err(err).Int("attempt", attempt).
 				Msg("umount -R not ready yet — retrying in 1s")
-			_ = exec.Command("sync").Run()
+			// Re-run xfs_freeze in case a retry is needed — there may be a second
+			// partition (e.g. /boot) that was not yet drained on the first pass.
+			xfsSyncMountRoot(mountRoot)
 			time.Sleep(time.Second)
 		} else {
 			log.Warn().Str("mountRoot", mountRoot).Err(err).
-				Msg("umount -R failed after all retries — falling back to lazy detach (umount -l -R)")
+				Msg("umount -R failed after all retries — collecting diagnostics then falling back to lazy detach")
+			logMountBusyDiagnostics(mountRoot)
+			// umount -l: lazy detach. The kernel detaches the mount from the filesystem
+			// namespace immediately but keeps the mount alive until all open file
+			// descriptors on it are closed. The block device is released when the last
+			// fd closes. In practice this means Finalize's re-mount attempt may still
+			// see EBUSY for a short window — mountPartitions already retries 5 times
+			// to handle this.
 			if lazyErr := exec.Command("umount", "-l", "-R", mountRoot).Run(); lazyErr != nil {
 				log.Error().Str("mountRoot", mountRoot).Err(lazyErr).
-					Msg("lazy umount also failed — filesystem may remain mounted")
+					Msg("lazy umount also failed — filesystem may remain mounted; Finalize will retry mount")
+			} else {
+				log.Info().Str("mountRoot", mountRoot).
+					Msg("lazy umount succeeded — mount detached; block device will release when all fds close")
 			}
 		}
 	}

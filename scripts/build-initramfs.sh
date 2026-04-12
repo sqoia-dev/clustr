@@ -357,6 +357,7 @@ ${transitive}"
         mkswap          # swap partition setup (util-linux)
         grub2-install   # bootloader install into deployed OS MBR/EFI (chroot use)
         grub2-mkconfig  # generate /boot/grub2/grub.cfg inside chroot
+        xfs_freeze      # force XFS log commit before unmount (prevents EBUSY on umount)
     )
     for tool in "${DEPLOY_TOOLS_SBIN[@]}"; do
         find_and_install_bin "$tool" "$WORKDIR/usr/sbin" || true
