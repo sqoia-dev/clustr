@@ -127,6 +127,7 @@ func (s *Server) buildRouter() chi.Router {
 		BootDir:   s.cfg.PXE.BootDir,
 		TFTPDir:   s.cfg.PXE.TFTPDir,
 		ServerURL: serverURL,
+		DB:        s.db,
 	}
 
 	// Embedded web UI — served without bearer auth.

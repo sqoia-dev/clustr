@@ -43,3 +43,36 @@ func GenerateBootScript(serverURL string) ([]byte, error) {
 	}
 	return buf.Bytes(), nil
 }
+
+// diskBootScriptTemplate is the iPXE response returned for nodes in NodeStateDeployed.
+//
+// iPXE's "exit" command surrenders control back to the BIOS/UEFI firmware, which
+// then falls through to the next entry in the boot order — local disk. This
+// requires PXE to be first in the BIOS boot order (set once during rack/stack)
+// and is the canonical PXE-server-as-source-of-truth pattern (xCAT, Warewulf,
+// Cobbler all work this way).
+//
+// The hostname comment is templated in so operators can confirm the correct node
+// is receiving the disk-boot response in packet captures or iPXE serial output.
+const diskBootScriptTemplate = `#!ipxe
+echo Node {{.Hostname}} is deployed -- booting from local disk
+exit
+`
+
+var diskBootTmpl = template.Must(template.New("diskboot").Parse(diskBootScriptTemplate))
+
+// diskBootScriptData holds template vars for the disk boot script.
+type diskBootScriptData struct {
+	Hostname string
+}
+
+// GenerateDiskBootScript returns an iPXE script that hands control back to
+// the BIOS/UEFI boot order (local disk). Used for nodes in NodeStateDeployed.
+func GenerateDiskBootScript(hostname string) ([]byte, error) {
+	data := diskBootScriptData{Hostname: hostname}
+	var buf bytes.Buffer
+	if err := diskBootTmpl.Execute(&buf, data); err != nil {
+		return nil, fmt.Errorf("pxe/boot: render disk boot script: %w", err)
+	}
+	return buf.Bytes(), nil
+}

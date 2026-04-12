@@ -84,7 +84,7 @@ func (d *DHCPServer) Start(ctx context.Context) error {
 	}()
 
 	if err := srv.Serve(); err != nil {
-		// Serve returns on Close — only treat as error if context is not done.
+		// Serve returns on Close -- only treat as error if context is not done.
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -104,7 +104,7 @@ func (d *DHCPServer) handleDHCP(conn net.PacketConn, peer net.Addr, req *dhcpv4.
 	isIPXE := strings.Contains(userClass, "iPXE")
 
 	if !isPXEClient && !isIPXE {
-		// Not a PXE/iPXE client — ignore.
+		// Not a PXE/iPXE client -- ignore.
 		return
 	}
 
@@ -180,7 +180,7 @@ func (d *DHCPServer) populateBootOptions(resp *dhcpv4.DHCPv4, req *dhcpv4.DHCPv4
 	resp.YourIPAddr = ip
 	resp.ServerIPAddr = d.serverIP
 
-	// Subnet mask — /24 for the provisioning range.
+	// Subnet mask -- /24 for the provisioning range.
 	resp.UpdateOption(dhcpv4.OptSubnetMask(net.CIDRMask(24, 32)))
 	resp.UpdateOption(dhcpv4.OptRouter(d.serverIP))
 	resp.UpdateOption(dhcpv4.OptIPAddressLeaseTime(d.leaseDur))
@@ -198,13 +198,19 @@ func (d *DHCPServer) populateBootOptions(resp *dhcpv4.DHCPv4, req *dhcpv4.DHCPv4
 // bootFilename selects the appropriate boot file based on client architecture.
 // Arch type is carried in DHCP option 93 (ClientSystemArchitectureType).
 // If the client is already running iPXE, return the HTTP URL to the boot script.
+//
+// The URL includes ?mac=${mac} so that iPXE expands its own ${mac} variable
+// when fetching the script. The boot handler uses this MAC to look up node state
+// and return either the full deploy script or an exit (boot-from-disk) response,
+// making the PXE server the source of truth for boot routing.
 func bootFilename(req *dhcpv4.DHCPv4, isIPXE bool, serverIP net.IP, httpPort string) string {
 	if isIPXE {
-		// Already chainloaded into iPXE — give it the boot script URL.
-		return fmt.Sprintf("http://%s:%s/api/v1/boot/ipxe", serverIP, httpPort)
+		// Already chainloaded into iPXE -- give it the boot script URL.
+		// ${mac} is an iPXE variable; iPXE expands it before fetching the URL.
+		return fmt.Sprintf("http://%s:%s/api/v1/boot/ipxe?mac=${mac}", serverIP, httpPort)
 	}
 
-	// Read option 93 — client system architecture.
+	// Read option 93 -- client system architecture.
 	archOpt := req.Options.Get(dhcpv4.OptionClientSystemArchitectureType)
 	if len(archOpt) >= 2 {
 		archType := uint16(archOpt[0])<<8 | uint16(archOpt[1])
