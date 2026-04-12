@@ -28,8 +28,15 @@ type LogsHandler struct {
 // IngestLogs handles POST /api/v1/logs
 // Accepts a JSON array of LogEntry objects and persists them.
 func (h *LogsHandler) IngestLogs(w http.ResponseWriter, r *http.Request) {
+	const maxLogsBodyBytes = 5 << 20 // 5 MiB
+	r.Body = http.MaxBytesReader(w, r.Body, maxLogsBodyBytes)
+
 	var entries []api.LogEntry
 	if err := json.NewDecoder(r.Body).Decode(&entries); err != nil {
+		if err.Error() == "http: request body too large" {
+			http.Error(w, "request body too large (max 5MB)", http.StatusRequestEntityTooLarge)
+			return
+		}
 		writeValidationError(w, "invalid JSON body: expected array of log entries")
 		return
 	}

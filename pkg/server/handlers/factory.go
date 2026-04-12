@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog/log"
@@ -106,9 +107,14 @@ func (h *FactoryHandler) Import(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, img)
 }
 
-// ImportPath handles POST /api/v1/factory/import-path
+// defaultISODir is the allowed base directory for server-local ISO imports.
+// Override with CLONR_ISO_DIR environment variable.
+const defaultISODir = "/var/lib/clonr/iso"
+
+// ImportPath handles POST /api/v1/factory/import-path (and /factory/import-iso alias)
 // For server-local ISO imports: accepts a JSON body with "path", "name", "version".
 // Only useful when the CLI is running on the same host as the server.
+// The path must be within CLONR_ISO_DIR (default /var/lib/clonr/iso).
 func (h *FactoryHandler) ImportPath(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Path    string `json:"path"`
@@ -131,6 +137,19 @@ func (h *FactoryHandler) ImportPath(w http.ResponseWriter, r *http.Request) {
 	absPath, err := filepath.Abs(body.Path)
 	if err != nil {
 		writeValidationError(w, "cannot resolve path")
+		return
+	}
+
+	// Enforce that the path is under the configured ISO directory to prevent
+	// arbitrary host path access.
+	isoDir := os.Getenv("CLONR_ISO_DIR")
+	if isoDir == "" {
+		isoDir = defaultISODir
+	}
+	isoDir = filepath.Clean(isoDir)
+	if !strings.HasPrefix(absPath, isoDir+string(filepath.Separator)) && absPath != isoDir {
+		log.Warn().Str("path", absPath).Str("iso_dir", isoDir).Msg("factory import-path: path outside allowed directory")
+		writeValidationError(w, "path must be within the configured ISO directory (CLONR_ISO_DIR)")
 		return
 	}
 

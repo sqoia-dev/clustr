@@ -9,7 +9,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -469,8 +471,74 @@ func (f *Factory) captureAsync(imageID string, req CaptureRequest) {
 
 // ─── internal helpers ────────────────────────────────────────────────────────
 
+// privateIPNets lists RFC-1918, link-local, and loopback CIDR ranges that
+// should not be reachable via pull URLs to prevent SSRF attacks.
+var privateIPNets []*net.IPNet
+
+func init() {
+	for _, cidr := range []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"169.254.0.0/16", // link-local
+		"127.0.0.0/8",    // loopback
+		"::1/128",        // IPv6 loopback
+		"fc00::/7",       // IPv6 unique local
+		"fe80::/10",      // IPv6 link-local
+	} {
+		_, ipnet, err := net.ParseCIDR(cidr)
+		if err == nil {
+			privateIPNets = append(privateIPNets, ipnet)
+		}
+	}
+}
+
+// validatePullURL checks that the URL is safe to fetch: only http/https schemes
+// and no private/loopback IP addresses (SSRF prevention). Set the environment
+// variable CLONR_ALLOW_PRIVATE_URLS=true to bypass this check in lab environments.
+func validatePullURL(rawURL string) error {
+	if os.Getenv("CLONR_ALLOW_PRIVATE_URLS") == "true" {
+		return nil
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %w", err)
+	}
+
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return fmt.Errorf("pull URL must use http or https scheme (got %q)", u.Scheme)
+	}
+
+	host := u.Hostname()
+	ips, err := net.LookupHost(host)
+	if err != nil {
+		// If DNS resolution fails, reject the URL to be safe.
+		return fmt.Errorf("cannot resolve host %q: %w", host, err)
+	}
+
+	for _, ipStr := range ips {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			continue
+		}
+		for _, block := range privateIPNets {
+			if block.Contains(ip) {
+				return fmt.Errorf("pull URL resolves to private/internal IP %s — "+
+					"set CLONR_ALLOW_PRIVATE_URLS=true to allow this in lab environments", ipStr)
+			}
+		}
+	}
+	return nil
+}
+
 // downloadURL streams url into dst using a context-aware GET request.
 func downloadURL(ctx context.Context, rawURL string, dst *os.File) error {
+	if err := validatePullURL(rawURL); err != nil {
+		return fmt.Errorf("URL validation: %w", err)
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
@@ -499,8 +567,11 @@ func extractTar(srcPath, dstPath string) error {
 }
 
 // rsyncDir rsyncs src into dst, preserving all attributes.
+// --copy-unsafe-links causes symlinks that point outside the source tree to be
+// copied as regular files rather than preserved as symlinks, preventing
+// path traversal attacks via malicious symlinks in untrusted ISO content.
 func rsyncDir(ctx context.Context, src, dst string) error {
-	cmd := exec.CommandContext(ctx, "rsync", "-aAXH", "--numeric-ids", src, dst)
+	cmd := exec.CommandContext(ctx, "rsync", "-aAXH", "--numeric-ids", "--copy-unsafe-links", src, dst)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("rsync: %w\noutput: %s", err, string(out))
 	}

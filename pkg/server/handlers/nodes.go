@@ -189,8 +189,15 @@ func (h *NodesHandler) GetNodeByMAC(w http.ResponseWriter, r *http.Request) {
 // the MAC is new, or updates the hardware_profile if the node already exists.
 // Returns the NodeConfig and an action directive ("deploy" or "wait").
 func (h *NodesHandler) RegisterNode(w http.ResponseWriter, r *http.Request) {
+	const maxRegisterBodyBytes = 1 << 20 // 1 MiB
+	r.Body = http.MaxBytesReader(w, r.Body, maxRegisterBodyBytes)
+
 	var req api.RegisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err.Error() == "http: request body too large" {
+			http.Error(w, "request body too large (max 1MB)", http.StatusRequestEntityTooLarge)
+			return
+		}
 		writeValidationError(w, "invalid JSON body")
 		return
 	}
