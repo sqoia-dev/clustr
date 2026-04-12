@@ -369,9 +369,25 @@ const Pages = {
             const viewer = document.getElementById('dash-log-viewer');
             if (viewer) {
                 const stream = new LogStream(viewer);
+                // Pre-load the last 50 log entries so the viewer shows history
+                // before any new SSE events arrive.
+                try {
+                    const resp = await API.logs.query({ limit: 50 });
+                    const entries = (resp.logs || []).reverse(); // oldest-first for natural scroll
+                    if (entries.length > 0) {
+                        stream.loadEntries(entries);
+                    } else {
+                        viewer.innerHTML = '<div class="empty-state" style="padding:20px"><div class="empty-state-text">Waiting for log events…</div></div>';
+                    }
+                } catch (_) {
+                    viewer.innerHTML = '<div class="empty-state" style="padding:20px"><div class="empty-state-text">Waiting for log events…</div></div>';
+                }
                 stream.onConnect(() => {
                     const ind = document.getElementById('dash-follow-ind');
                     if (ind) { ind.className = 'follow-indicator live'; ind.innerHTML = '<span class="follow-dot"></span>Live'; }
+                    // Clear empty-state placeholder if present
+                    const es = viewer.querySelector('.empty-state');
+                    if (es) es.remove();
                 });
                 stream.onDisconnect((permanent) => {
                     const ind = document.getElementById('dash-follow-ind');
