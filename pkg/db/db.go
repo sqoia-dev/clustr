@@ -123,18 +123,28 @@ func (db *DB) CreateBaseImage(ctx context.Context, img api.BaseImage) error {
 	if err != nil {
 		return fmt.Errorf("db: marshal tags: %w", err)
 	}
+	builtForRoles := img.BuiltForRoles
+	if builtForRoles == nil {
+		builtForRoles = []string{}
+	}
+	builtForRolesJSON, err := json.Marshal(builtForRoles)
+	if err != nil {
+		return fmt.Errorf("db: marshal built_for_roles: %w", err)
+	}
 
 	_, err = db.sql.ExecContext(ctx, `
 		INSERT INTO base_images
 			(id, name, version, os, arch, status, format, size_bytes, checksum,
-			 blob_path, disk_layout, tags, source_url, notes, error_message, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 blob_path, disk_layout, tags, source_url, notes, error_message,
+			 built_for_roles, build_method, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		img.ID, img.Name, img.Version, img.OS, img.Arch,
 		string(img.Status), string(img.Format),
 		img.SizeBytes, img.Checksum, "",
 		string(diskLayout), string(tags),
 		img.SourceURL, img.Notes, img.ErrorMessage,
+		string(builtForRolesJSON), img.BuildMethod,
 		img.CreatedAt.Unix(),
 	)
 	if err != nil {
@@ -148,7 +158,7 @@ func (db *DB) GetBaseImage(ctx context.Context, id string) (api.BaseImage, error
 	row := db.sql.QueryRowContext(ctx, `
 		SELECT id, name, version, os, arch, status, format, size_bytes, checksum,
 		       blob_path, disk_layout, tags, source_url, notes, error_message,
-		       created_at, finalized_at
+		       built_for_roles, build_method, created_at, finalized_at
 		FROM base_images WHERE id = ?
 	`, id)
 
@@ -186,14 +196,14 @@ func (db *DB) ListBaseImages(ctx context.Context, status string) ([]api.BaseImag
 		rows, err = db.sql.QueryContext(ctx, `
 			SELECT id, name, version, os, arch, status, format, size_bytes, checksum,
 			       blob_path, disk_layout, tags, source_url, notes, error_message,
-			       created_at, finalized_at
+			       built_for_roles, build_method, created_at, finalized_at
 			FROM base_images WHERE status = ? ORDER BY created_at DESC
 		`, status)
 	} else {
 		rows, err = db.sql.QueryContext(ctx, `
 			SELECT id, name, version, os, arch, status, format, size_bytes, checksum,
 			       blob_path, disk_layout, tags, source_url, notes, error_message,
-			       created_at, finalized_at
+			       built_for_roles, build_method, created_at, finalized_at
 			FROM base_images ORDER BY created_at DESC
 		`)
 	}
@@ -790,14 +800,15 @@ type scanner interface {
 
 func scanBaseImage(s scanner) (api.BaseImage, error) {
 	var (
-		img             api.BaseImage
-		status          string
-		format          string
-		diskLayoutJSON  string
-		tagsJSON        string
-		createdAtUnix   int64
-		finalizedAtUnix sql.NullInt64
-		blobPath        string // scanned but not exposed in API type
+		img                api.BaseImage
+		status             string
+		format             string
+		diskLayoutJSON     string
+		tagsJSON           string
+		builtForRolesJSON  string
+		createdAtUnix      int64
+		finalizedAtUnix    sql.NullInt64
+		blobPath           string // scanned but not exposed in API type
 	)
 
 	err := s.Scan(
@@ -806,6 +817,7 @@ func scanBaseImage(s scanner) (api.BaseImage, error) {
 		&img.SizeBytes, &img.Checksum, &blobPath,
 		&diskLayoutJSON, &tagsJSON,
 		&img.SourceURL, &img.Notes, &img.ErrorMessage,
+		&builtForRolesJSON, &img.BuildMethod,
 		&createdAtUnix, &finalizedAtUnix,
 	)
 	if err == sql.ErrNoRows {
@@ -831,6 +843,12 @@ func scanBaseImage(s scanner) (api.BaseImage, error) {
 	}
 	if img.Tags == nil {
 		img.Tags = []string{}
+	}
+	if builtForRolesJSON != "" && builtForRolesJSON != "null" {
+		if err := json.Unmarshal([]byte(builtForRolesJSON), &img.BuiltForRoles); err != nil {
+			// Non-fatal: old rows may have malformed JSON; just leave the field nil.
+			img.BuiltForRoles = nil
+		}
 	}
 
 	return img, nil
