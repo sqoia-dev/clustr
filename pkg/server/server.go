@@ -22,13 +22,14 @@ import (
 
 // Server wraps the HTTP server and all its dependencies.
 type Server struct {
-	cfg        config.ServerConfig
-	db         *db.DB
-	broker     *LogBroker
-	shells     *image.ShellManager
-	powerCache *PowerCache
-	router     chi.Router
-	http       *http.Server
+	cfg          config.ServerConfig
+	db           *db.DB
+	broker       *LogBroker
+	progress     *ProgressStore
+	shells       *image.ShellManager
+	powerCache   *PowerCache
+	router       chi.Router
+	http         *http.Server
 }
 
 // New creates a Server wired with the given config and database.
@@ -38,6 +39,7 @@ func New(cfg config.ServerConfig, database *db.DB) *Server {
 		cfg:        cfg,
 		db:         database,
 		broker:     NewLogBroker(),
+		progress:   NewProgressStore(),
 		shells:     shells,
 		powerCache: NewPowerCache(15 * time.Second),
 	}
@@ -96,6 +98,7 @@ func (s *Server) buildRouter() chi.Router {
 		Shells:   s.shells,
 	}
 	logs := &handlers.LogsHandler{DB: s.db, Broker: s.broker}
+	progress := &handlers.ProgressHandler{Store: s.progress}
 	ipmiH := &handlers.IPMIHandler{DB: s.db, Cache: s.powerCache}
 	boot := &handlers.BootHandler{
 		BootDir:   s.cfg.PXE.BootDir,
@@ -120,7 +123,8 @@ func (s *Server) buildRouter() chi.Router {
 		r.Get("/boot/ipxe.efi", boot.ServeIPXEEFI)
 		r.Get("/boot/undionly.kpxe", boot.ServeUndionlyKPXE)
 		r.Post("/nodes/register", nodes.RegisterNode)
-		r.Post("/logs", logs.IngestLogs) // nodes ship logs without tokens
+		r.Post("/logs", logs.IngestLogs)                   // nodes ship logs without tokens
+		r.Post("/deploy/progress", progress.IngestProgress) // nodes ship progress without tokens
 
 		// Authenticated endpoints.
 		r.Group(func(r chi.Router) {
@@ -178,6 +182,11 @@ func (s *Server) buildRouter() chi.Router {
 			// Logs — stream must be registered before plain /logs.
 			r.Get("/logs/stream", logs.StreamLogs)
 			r.Get("/logs", logs.QueryLogs)
+
+			// Deployment progress — stream must be registered before plain routes.
+			r.Get("/deploy/progress/stream", progress.StreamProgress)
+			r.Get("/deploy/progress/{mac}", progress.GetProgress)
+			r.Get("/deploy/progress", progress.ListProgress)
 		})
 	})
 
