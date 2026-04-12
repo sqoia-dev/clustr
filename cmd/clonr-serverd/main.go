@@ -108,6 +108,9 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// Wire up and start the HTTP server.
 	srv := server.New(cfg, database)
 
+	// Start background workers (reimage scheduler, etc.) before accepting traffic.
+	srv.StartBackgroundWorkers(ctx)
+
 	if err := srv.ListenAndServe(ctx); err != nil {
 		return fmt.Errorf("server error: %w", err)
 	}

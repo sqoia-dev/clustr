@@ -333,6 +333,11 @@ type RegisterResponse struct {
 	//   "wait"    — no image assigned yet; poll GET /api/v1/nodes/by-mac/:mac every 30s.
 	//   "capture" — admin wants to capture this node's image (future).
 	Action string `json:"action"`
+	// DryRun, when true, instructs the deploy client to execute the full PXE
+	// boot sequence (disk selection, partitioning decisions, etc.) but skip the
+	// actual disk wipe and filesystem operations. Set when the triggering
+	// reimage request had dry_run=true.
+	DryRun bool `json:"dry_run,omitempty"`
 }
 
 // ─── Factory request types ────────────────────────────────────────────────────
