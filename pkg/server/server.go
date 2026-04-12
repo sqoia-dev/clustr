@@ -22,22 +22,24 @@ import (
 
 // Server wraps the HTTP server and all its dependencies.
 type Server struct {
-	cfg    config.ServerConfig
-	db     *db.DB
-	broker *LogBroker
-	shells *image.ShellManager
-	router chi.Router
-	http   *http.Server
+	cfg        config.ServerConfig
+	db         *db.DB
+	broker     *LogBroker
+	shells     *image.ShellManager
+	powerCache *PowerCache
+	router     chi.Router
+	http       *http.Server
 }
 
 // New creates a Server wired with the given config and database.
 func New(cfg config.ServerConfig, database *db.DB) *Server {
 	shells := image.NewShellManager(database, cfg.ImageDir, log.Logger)
 	s := &Server{
-		cfg:    cfg,
-		db:     database,
-		broker: NewLogBroker(),
-		shells: shells,
+		cfg:        cfg,
+		db:         database,
+		broker:     NewLogBroker(),
+		shells:     shells,
+		powerCache: NewPowerCache(15 * time.Second),
 	}
 	s.router = s.buildRouter()
 	s.http = &http.Server{
@@ -94,6 +96,7 @@ func (s *Server) buildRouter() chi.Router {
 		Shells:   s.shells,
 	}
 	logs := &handlers.LogsHandler{DB: s.db, Broker: s.broker}
+	ipmiH := &handlers.IPMIHandler{DB: s.db, Cache: s.powerCache}
 	boot := &handlers.BootHandler{
 		BootDir:   s.cfg.PXE.BootDir,
 		TFTPDir:   s.cfg.PXE.TFTPDir,
@@ -156,6 +159,17 @@ func (s *Server) buildRouter() chi.Router {
 			r.Get("/nodes/{id}", nodes.GetNode)
 			r.Put("/nodes/{id}", nodes.UpdateNode)
 			r.Delete("/nodes/{id}", nodes.DeleteNode)
+
+			// IPMI / power management — subpaths of /nodes/{id} must be
+			// registered in the same chi group so the auth middleware applies.
+			r.Get("/nodes/{id}/power", ipmiH.GetPowerStatus)
+			r.Post("/nodes/{id}/power/on", ipmiH.PowerOn)
+			r.Post("/nodes/{id}/power/off", ipmiH.PowerOff)
+			r.Post("/nodes/{id}/power/cycle", ipmiH.PowerCycle)
+			r.Post("/nodes/{id}/power/reset", ipmiH.PowerReset)
+			r.Post("/nodes/{id}/power/pxe", ipmiH.SetBootPXE)
+			r.Post("/nodes/{id}/power/disk", ipmiH.SetBootDisk)
+			r.Get("/nodes/{id}/sensors", ipmiH.GetSensors)
 
 			// Logs — stream must be registered before plain /logs.
 			r.Get("/logs/stream", logs.StreamLogs)
