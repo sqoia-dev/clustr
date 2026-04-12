@@ -6,6 +6,7 @@ package ipmi
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -52,18 +53,32 @@ type Client struct {
 }
 
 // args builds the ipmitool argument list, prepending remote flags when c.Host is set.
+// The BMC password is passed via the IPMITOOL_PASSWORD environment variable and
+// the -E flag rather than -P, so it never appears in the process argument list
+// (which is visible to other processes via /proc/<pid>/cmdline on Linux).
 func (c *Client) args(sub ...string) []string {
 	if c.Host == "" {
 		return sub
 	}
-	remote := []string{"-H", c.Host, "-U", c.Username, "-P", c.Password}
+	// -E tells ipmitool to read the password from $IPMITOOL_PASSWORD.
+	remote := []string{"-H", c.Host, "-U", c.Username, "-E"}
 	return append(remote, sub...)
 }
 
 // run executes ipmitool with the given subcommand arguments and returns stdout.
+// When c.Password is set, it is injected into the child process environment as
+// IPMITOOL_PASSWORD; the variable is not inherited from the parent process env
+// in a way that exposes it — it is appended to the environment slice only for
+// this invocation.
 func (c *Client) run(ctx context.Context, sub ...string) (string, error) {
 	args := c.args(sub...)
-	out, err := exec.CommandContext(ctx, "ipmitool", args...).Output()
+	cmd := exec.CommandContext(ctx, "ipmitool", args...)
+	if c.Host != "" && c.Password != "" {
+		// Inherit the parent environment (PATH, HOME, etc.) so ipmitool can
+		// locate its binaries, then override the password variable.
+		cmd.Env = append(os.Environ(), "IPMITOOL_PASSWORD="+c.Password)
+	}
+	out, err := cmd.Output()
 	if err != nil {
 		var stderr string
 		if ee, ok := err.(*exec.ExitError); ok {
@@ -197,6 +212,9 @@ func (c *Client) SetBootDisk(ctx context.Context) error {
 func (c *Client) SOLActivate(ctx context.Context) error {
 	args := c.args("sol", "activate")
 	cmd := exec.CommandContext(ctx, "ipmitool", args...)
+	if c.Host != "" && c.Password != "" {
+		cmd.Env = append(os.Environ(), "IPMITOOL_PASSWORD="+c.Password)
+	}
 	cmd.Stdin = nil  // SOL manages its own TTY
 	cmd.Stdout = nil
 	cmd.Stderr = nil

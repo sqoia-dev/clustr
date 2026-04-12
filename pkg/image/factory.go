@@ -25,16 +25,21 @@ import (
 	"github.com/sqoia-dev/clonr/pkg/db"
 )
 
-// CaptureRequest describes a live-node rsync capture operation.
+// CaptureRequest describes a live-node SSH+rsync capture operation.
 type CaptureRequest struct {
-	// Source is the rsync source spec: "user@host:/" or a local path.
-	Source  string
-	Name    string
-	Version string
-	OS      string
-	Arch    string
-	Tags    []string
-	Notes   string
+	// SourceHost is the SSH-reachable hostname or IP of the node to capture.
+	SourceHost   string
+	SSHUser      string
+	SSHPassword  string // applied at capture time, not stored
+	SSHKeyPath   string
+	SSHPort      int      // defaults to 22 when zero
+	Name         string
+	Version      string
+	OS           string
+	Arch         string
+	Tags         []string
+	Notes        string
+	ExcludePaths []string // rsync --exclude patterns
 }
 
 // Factory turns raw inputs into finalized BaseImages stored under ImageDir.
@@ -382,17 +387,63 @@ func (f *Factory) extractLiveOS(ctx context.Context, imageID, squashPath, rootfs
 	return rsyncDir(ctx, rootfsMnt+"/", rootfsPath)
 }
 
-// CaptureNode rsyncs a running node's filesystem into ImageDir/<id>/rootfs/,
-// scrubs node-specific identity data, and finalizes the record.
+// defaultCaptureExcludes are the rsync --exclude patterns always applied during capture.
+// These paths are volatile, virtual, or identity-bearing and must never be captured.
+var defaultCaptureExcludes = []string{
+	"/proc/*",
+	"/sys/*",
+	"/dev/*",
+	"/run/*",
+	"/tmp/*",
+	"/var/tmp/*",
+	"/var/cache/*",
+	"/var/log/*",
+	"/boot/efi/*",
+	"/lost+found",
+	"/mnt/*",
+	"/media/*",
+	"/root/.bash_history",
+	"/home/*/.bash_history",
+	"/home/*/.ssh/authorized_keys",
+}
+
+// CaptureNode rsyncs a live server's filesystem into ImageDir/<id>/rootfs/ via SSH,
+// scrubs node-specific identity data, auto-detects the disk layout, and finalizes
+// the BaseImage record. Returns immediately with a "building" image; capture runs async.
+// Poll GET /api/v1/images/:id to track status transitions: building -> ready | error.
+//
+// SSH host key verification is intentionally disabled (StrictHostKeyChecking=no) because
+// capture targets are administrator-controlled golden nodes on a trusted management network.
+// sshpass must be installed on the server host when SSHPassword is used.
 func (f *Factory) CaptureNode(ctx context.Context, req CaptureRequest) (*api.BaseImage, error) {
-	if req.Source == "" {
-		return nil, fmt.Errorf("factory: capture source is required")
+	if req.SourceHost == "" {
+		return nil, fmt.Errorf("factory: source_host is required")
+	}
+
+	// Reject capturing ourselves to prevent circular rsync + scrub of live system.
+	if err := f.rejectSelfCapture(req.SourceHost); err != nil {
+		return nil, err
+	}
+
+	sshUser := req.SSHUser
+	if sshUser == "" {
+		sshUser = "root"
+	}
+	sshPort := req.SSHPort
+	if sshPort == 0 {
+		sshPort = 22
 	}
 
 	id := uuid.New().String()
 	if req.Tags == nil {
 		req.Tags = []string{}
 	}
+
+	notes := req.Notes
+	if notes != "" {
+		notes += "\n"
+	}
+	notes += "Captured via SSH rsync (StrictHostKeyChecking=no -- trusted golden node)."
 
 	img := api.BaseImage{
 		ID:        id,
@@ -403,22 +454,74 @@ func (f *Factory) CaptureNode(ctx context.Context, req CaptureRequest) (*api.Bas
 		Status:    api.ImageStatusBuilding,
 		Format:    api.ImageFormatFilesystem,
 		Tags:      req.Tags,
-		Notes:     req.Notes,
+		Notes:     notes,
 		CreatedAt: time.Now().UTC(),
 	}
 
-	f.Logger.Info().Str("image_id", id).Str("source", req.Source).Msg("factory: capture node started")
+	f.Logger.Info().
+		Str("image_id", id).
+		Str("source_host", req.SourceHost).
+		Str("ssh_user", sshUser).
+		Int("ssh_port", sshPort).
+		Msg("factory: capture node started")
 
 	if err := f.Store.CreateBaseImage(ctx, img); err != nil {
 		return nil, fmt.Errorf("factory: create image record: %w", err)
 	}
 
-	go f.captureAsync(id, req)
+	go f.captureAsync(id, req, sshUser, sshPort)
 
 	return &img, nil
 }
 
-func (f *Factory) captureAsync(imageID string, req CaptureRequest) {
+// rejectSelfCapture returns an error if host resolves to one of our own IPs or hostnames.
+func (f *Factory) rejectSelfCapture(sourceHost string) error {
+	host := sourceHost
+	if idx := strings.Index(host, "@"); idx != -1 {
+		host = host[idx+1:]
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+
+	selfHostname, _ := os.Hostname()
+	if selfHostname != "" && (host == selfHostname || strings.HasPrefix(host, selfHostname+".")) {
+		return fmt.Errorf("factory: refusing to capture our own host (%s)", host)
+	}
+
+	sourceIPs, err := net.LookupHost(host)
+	if err != nil {
+		return nil // DNS failure — let rsync surface the error
+	}
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	for _, iface := range ifaces {
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil {
+				continue
+			}
+			for _, sip := range sourceIPs {
+				if sip == ip.String() {
+					return fmt.Errorf("factory: refusing to capture our own host (source IP %s matches local interface)", sip)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (f *Factory) captureAsync(imageID string, req CaptureRequest, sshUser string, sshPort int) {
 	ctx := context.Background()
 
 	rootfs := filepath.Join(f.ImageDir, imageID, "rootfs")
@@ -428,33 +531,92 @@ func (f *Factory) captureAsync(imageID string, req CaptureRequest) {
 		return
 	}
 
-	f.Logger.Info().Str("image_id", imageID).Str("source", req.Source).Msg("factory: rsyncing node")
+	// Cleanup partial rootfs on any failure path.
+	success := false
+	defer func() {
+		if !success {
+			if err := os.RemoveAll(filepath.Join(f.ImageDir, imageID, "rootfs")); err != nil && !os.IsNotExist(err) {
+				f.Logger.Warn().Err(err).Str("image_id", imageID).Msg("factory: cleanup partial rootfs")
+			}
+		}
+	}()
 
-	excludes := []string{
-		"--exclude=/proc/*",
-		"--exclude=/sys/*",
-		"--exclude=/dev/*",
-		"--exclude=/run/*",
-		"--exclude=/tmp/*",
-		"--exclude=/var/tmp/*",
-		"--exclude=/var/cache/*",
+	// SSH transport options: always disable host key checking for golden nodes.
+	sshOpts := fmt.Sprintf("ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p %d", sshPort)
+	if req.SSHKeyPath != "" {
+		sshOpts += " -i " + req.SSHKeyPath
 	}
-	rsyncArgs := append([]string{"-aAXH", "--numeric-ids", "--delete"}, excludes...)
-	rsyncArgs = append(rsyncArgs, req.Source, rootfs+"/")
 
-	cmd := exec.CommandContext(ctx, "rsync", rsyncArgs...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		msg := fmt.Sprintf("rsync failed: %v\noutput: %s", err, string(out))
+	// Strip any embedded user@ from SourceHost — we control the user via sshUser.
+	srcHost := req.SourceHost
+	if idx := strings.Index(srcHost, "@"); idx != -1 {
+		srcHost = srcHost[idx+1:]
+	}
+	rsyncSrc := fmt.Sprintf("%s@%s:/", sshUser, srcHost)
+
+	// Build exclude list: built-in defaults + caller-supplied extras.
+	var excludeArgs []string
+	for _, p := range defaultCaptureExcludes {
+		excludeArgs = append(excludeArgs, "--exclude="+p)
+	}
+	for _, p := range req.ExcludePaths {
+		if p != "" {
+			excludeArgs = append(excludeArgs, "--exclude="+p)
+		}
+	}
+
+	rsyncArgs := []string{"-aAXvH", "--numeric-ids", "--one-file-system", "-e", sshOpts}
+	rsyncArgs = append(rsyncArgs, excludeArgs...)
+	rsyncArgs = append(rsyncArgs, rsyncSrc, rootfs+"/")
+
+	var cmd *exec.Cmd
+	if req.SSHPassword != "" {
+		// sshpass wraps rsync to inject the password; requires: apt install sshpass
+		args := append([]string{"-p", req.SSHPassword, "rsync"}, rsyncArgs...)
+		cmd = exec.CommandContext(ctx, "sshpass", args...)
+	} else {
+		cmd = exec.CommandContext(ctx, "rsync", rsyncArgs...)
+	}
+
+	f.Logger.Info().
+		Str("image_id", imageID).
+		Str("src", rsyncSrc).
+		Msg("factory: rsync started -- this may take several minutes for a full OS image")
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := fmt.Sprintf("rsync failed: %v", err)
+		if len(out) > 0 {
+			tail := out
+			if len(tail) > 1024 {
+				tail = tail[len(tail)-1024:]
+			}
+			msg += "\nrsync output (tail):\n" + string(tail)
+		}
 		f.Logger.Error().Str("image_id", imageID).Msg(msg)
 		_ = f.Store.UpdateBaseImageStatus(ctx, imageID, api.ImageStatusError, msg)
 		return
 	}
 
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	f.Logger.Info().
+		Str("image_id", imageID).
+		Int("file_lines", len(lines)).
+		Msg("factory: rsync complete")
+
+	// Auto-detect disk layout from the captured rootfs before scrubbing (EFI check).
+	diskLayout := f.detectDiskLayout(rootfs)
+	if err := f.Store.UpdateDiskLayout(ctx, imageID, diskLayout); err != nil {
+		f.Logger.Warn().Err(err).Str("image_id", imageID).Msg("factory: set disk layout (non-fatal)")
+	}
+
+	// Scrub identity AFTER rsync completes — never during, or we remove files mid-transfer.
 	f.Logger.Info().Str("image_id", imageID).Msg("factory: scrubbing node identity")
 	if err := ScrubNodeIdentity(rootfs); err != nil {
 		f.Logger.Warn().Err(err).Str("image_id", imageID).Msg("factory: scrub had warnings (continuing)")
 	}
 
+	f.Logger.Info().Str("image_id", imageID).Msg("factory: computing rootfs checksum")
 	size, checksum, err := checksumDir(rootfs)
 	if err != nil {
 		f.Logger.Error().Err(err).Str("image_id", imageID).Msg("factory: checksum failed")
@@ -474,7 +636,36 @@ func (f *Factory) captureAsync(imageID string, req CaptureRequest) {
 		return
 	}
 
-	f.Logger.Info().Str("image_id", imageID).Int64("size_bytes", size).Msg("factory: capture complete")
+	success = true
+	f.Logger.Info().
+		Str("image_id", imageID).
+		Int64("size_bytes", size).
+		Msg("factory: capture complete -- image is ready")
+}
+
+// detectDiskLayout inspects the captured rootfs to infer a disk layout.
+// Checks for /boot/efi (UEFI) or falls back to BIOS/MBR. Admin should review before deploy.
+func (f *Factory) detectDiskLayout(rootfs string) api.DiskLayout {
+	efiDir := filepath.Join(rootfs, "boot", "efi")
+	efiEntries, err := os.ReadDir(efiDir)
+	if err == nil && len(efiEntries) > 0 {
+		return api.DiskLayout{
+			Partitions: []api.PartitionSpec{
+				{Label: "esp", SizeBytes: 512 * 1024 * 1024, Filesystem: "vfat", MountPoint: "/boot/efi", Flags: []string{"boot", "esp"}},
+				{Label: "boot", SizeBytes: 1 * 1024 * 1024 * 1024, Filesystem: "xfs", MountPoint: "/boot"},
+				{Label: "root", SizeBytes: 0, Filesystem: "xfs", MountPoint: "/"},
+			},
+			Bootloader: api.Bootloader{Type: "grub2", Target: "x86_64-efi"},
+		}
+	}
+	return api.DiskLayout{
+		Partitions: []api.PartitionSpec{
+			{Label: "biosboot", SizeBytes: 1 * 1024 * 1024, Filesystem: "", MountPoint: "", Flags: []string{"bios_grub"}},
+			{Label: "boot", SizeBytes: 1 * 1024 * 1024 * 1024, Filesystem: "xfs", MountPoint: "/boot"},
+			{Label: "root", SizeBytes: 0, Filesystem: "xfs", MountPoint: "/"},
+		},
+		Bootloader: api.Bootloader{Type: "grub2", Target: "i386-pc"},
+	}
 }
 
 // ─── internal helpers ────────────────────────────────────────────────────────
