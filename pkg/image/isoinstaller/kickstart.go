@@ -3,6 +3,7 @@ package isoinstaller
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"text/template"
 )
 
@@ -30,28 +31,16 @@ type AutoInstallConfig struct {
 // templateData holds the variables injected into each install config template.
 type templateData struct {
 	// RootPasswordHash is a SHA-512 crypt(3) hash of a fixed per-build password.
-	// The actual password doesn't matter for base images — SSH host keys and
-	// machine-id are wiped after install; password-based root login is not the
-	// intended access method.
 	RootPasswordHash string
-
 	// DiskSizeGB is the target disk size, used in preseed size hints.
 	DiskSizeGB int
 }
 
-// defaultRootPasswordHash is a pre-computed SHA-512 hash for the throwaway
-// install-time root password "clonr-install". This password is only in scope
-// during the 5-30 minute install window inside a VM with no external network
-// access, and the image is scrubbed of /etc/shadow before being captured.
 const defaultRootPasswordHash = "$6$rounds=4096$clonr$oJJBrlGPtKS6kxQe7yLm.lXX/XKNEDXkJxhXbXONnR5Rb2FIWKijYcpg/0E1n3W6B9Ik8n3Zd7gH8kO35i3o1"
 
 // GenerateAutoInstallConfig produces the automated-install configuration for
 // the given distro and build options. Returns an AutoInstallConfig with the
 // rendered file content(s) ready to be written to a seed ISO.
-//
-// When customKickstart is non-empty it is used verbatim (for RHEL-family),
-// bypassing the template — this is the escape hatch for admins who need
-// non-default partitioning, extra packages, or custom %post scripts.
 func GenerateAutoInstallConfig(distro Distro, opts BuildOptions, customKickstart string) (*AutoInstallConfig, error) {
 	data := templateData{
 		RootPasswordHash: defaultRootPasswordHash,
@@ -70,16 +59,34 @@ func GenerateAutoInstallConfig(distro Distro, opts BuildOptions, customKickstart
 	case FormatAnswers:
 		return generateAlpineAnswers(data)
 	default:
-		// Unknown distro: use the RHEL kickstart template as a best guess.
-		// It will likely fail during install but at least the VM will start.
 		return generateKickstart(distro, data, opts, customKickstart)
 	}
 }
 
 // ── RHEL family (Rocky / Alma / CentOS / RHEL) ───────────────────────────────
 
-var kickstartTemplate = template.Must(template.New("ks").Parse(`# clonr auto-generated kickstart
+// ksTemplateData is injected into the RHEL kickstart template.
+type ksTemplateData struct {
+	templateData
+	Distro         string
+	RoleIDs        []string
+	Packages       []string
+	Services       []string
+	InstallUpdates bool
+	NeedsNVIDIA    bool
+	NeedsLustre    bool
+	NeedsBeeGFS    bool
+}
+
+// joinStrings is the template func for joining slices — kept here so the
+// "strings" import is actually referenced and the compiler is happy.
+func joinStrings(sep string, elems []string) string { return strings.Join(elems, sep) }
+
+var kickstartTemplate = template.Must(template.New("ks").Funcs(template.FuncMap{
+	"join": func(elems []string, sep string) string { return strings.Join(elems, sep) },
+}).Parse(`# clonr auto-generated kickstart
 # Distro: {{.Distro}}
+# Roles:  {{join .RoleIDs ", "}}
 # This kickstart produces a minimal, identity-scrubbed base image suitable
 # for capture as a clonr BaseImage. It is NOT intended as a production kickstart.
 cdrom
@@ -103,24 +110,50 @@ part /        --fstype=xfs        --size=1     --grow        --ondisk=sda --labe
 %packages --ignoremissing
 @^minimal-environment
 openssh-server
+{{- range .Packages}}
+{{.}}
+{{- end}}
 %end
 
 %post --log=/root/ks-post.log
+# ── Base services ──────────────────────────────────────────────────────────
 systemctl enable sshd
-
-# Strip node identity — will be regenerated on first boot by clonr finalize.
+{{range .Services -}}
+systemctl enable {{.}}
+{{end -}}
+{{- if .InstallUpdates}}
+# ── Install OS updates ─────────────────────────────────────────────────────
+dnf update -y
+{{end -}}
+{{- if .NeedsNVIDIA}}
+# ── NVIDIA / CUDA (gpu-compute role) ──────────────────────────────────────
+# Adds the NVIDIA CUDA repo for RHEL 9 / Rocky 9 / Alma 9.
+dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
+dnf install -y kernel-devel-$(uname -r) kernel-headers-$(uname -r) || true
+dnf install -y cuda-drivers cuda-toolkit nvidia-driver-NVML || true
+systemctl enable nvidia-persistenced || true
+{{end -}}
+{{- if .NeedsLustre}}
+# ── Lustre client (storage role) ──────────────────────────────────────────
+dnf config-manager --add-repo https://downloads.whamcloud.com/public/lustre/latest-release/el9.4/client/
+dnf install -y lustre-client --nogpgcheck || true
+{{end -}}
+{{- if .NeedsBeeGFS}}
+# ── BeeGFS (storage role) ─────────────────────────────────────────────────
+wget -q https://www.beegfs.io/release/beegfs_7.4/dists/beegfs-rhel9.repo -O /etc/yum.repos.d/beegfs-rhel9.repo || true
+dnf install -y beegfs-storage beegfs-meta --nogpgcheck || true
+{{end}}
+# ── Strip node identity — regenerated on first boot by clonr finalize ──────
 rm -f /etc/machine-id
 touch /etc/machine-id
 rm -f /etc/ssh/ssh_host_*
-
-# Clear NetworkManager connections so the deployed node starts clean.
 rm -f /etc/NetworkManager/system-connections/*
 %end
 
 reboot --eject
 `))
 
-func generateKickstart(distro Distro, data templateData, _ BuildOptions, customKickstart string) (*AutoInstallConfig, error) {
+func generateKickstart(distro Distro, data templateData, opts BuildOptions, customKickstart string) (*AutoInstallConfig, error) {
 	if customKickstart != "" {
 		return &AutoInstallConfig{
 			Format:           FormatKickstart,
@@ -129,11 +162,24 @@ func generateKickstart(distro Distro, data templateData, _ BuildOptions, customK
 		}, nil
 	}
 
-	type ksData struct {
-		templateData
-		Distro string
+	packages, services := MergeRoles(opts.RoleIDs, distro)
+
+	roleIDs := opts.RoleIDs
+	if len(roleIDs) == 0 {
+		roleIDs = []string{"(none — minimal install)"}
 	}
-	d := ksData{templateData: data, Distro: distro.FamilyName()}
+
+	d := ksTemplateData{
+		templateData:   data,
+		Distro:         distro.FamilyName(),
+		RoleIDs:        roleIDs,
+		Packages:       packages,
+		Services:       services,
+		InstallUpdates: opts.InstallUpdates,
+		NeedsNVIDIA:    hasRole(opts.RoleIDs, "gpu-compute"),
+		NeedsLustre:    hasRole(opts.RoleIDs, "storage"),
+		NeedsBeeGFS:    hasRole(opts.RoleIDs, "storage"),
+	}
 
 	var buf bytes.Buffer
 	if err := kickstartTemplate.Execute(&buf, d); err != nil {
@@ -148,9 +194,14 @@ func generateKickstart(distro Distro, data templateData, _ BuildOptions, customK
 
 // ── Ubuntu (autoinstall / cloud-init) ────────────────────────────────────────
 
-// ubuntuUserDataTemplate is a cloud-init autoinstall user-data document.
-// Ubuntu's subiquity installer detects a CIDATA-labelled drive and reads
-// user-data + meta-data from it.
+// ubuntuTemplateData extends templateData with role-specific fields for Ubuntu.
+type ubuntuTemplateData struct {
+	templateData
+	Packages       []string
+	Services       []string
+	InstallUpdates bool
+}
+
 var ubuntuUserDataTemplate = template.Must(template.New("ubuntu-ud").Parse(`#cloud-config
 autoinstall:
   version: 1
@@ -175,8 +226,17 @@ autoinstall:
       sizing-policy: all
   packages:
     - openssh-server
+{{- range .Packages}}
+    - {{.}}
+{{- end}}
   late-commands:
     - curtin in-target -- systemctl enable ssh
+{{- range .Services}}
+    - curtin in-target -- systemctl enable {{.}}
+{{- end}}
+{{- if .InstallUpdates}}
+    - curtin in-target -- apt-get upgrade -y
+{{- end}}
     - curtin in-target -- rm -f /etc/machine-id
     - curtin in-target -- touch /etc/machine-id
     - curtin in-target -- rm -f /etc/ssh/ssh_host_*
@@ -184,14 +244,23 @@ autoinstall:
   shutdown: reboot
 `))
 
-func generateUbuntuAutoInstall(data templateData, _ BuildOptions) (*AutoInstallConfig, error) {
+func generateUbuntuAutoInstall(data templateData, opts BuildOptions) (*AutoInstallConfig, error) {
+	packages, services := MergeRoles(opts.RoleIDs, DistroUbuntu)
+
+	ud := ubuntuTemplateData{
+		templateData:   data,
+		Packages:       packages,
+		Services:       services,
+		InstallUpdates: opts.InstallUpdates,
+	}
+
 	var udBuf bytes.Buffer
-	if err := ubuntuUserDataTemplate.Execute(&udBuf, data); err != nil {
+	if err := ubuntuUserDataTemplate.Execute(&udBuf, ud); err != nil {
 		return nil, fmt.Errorf("render ubuntu user-data: %w", err)
 	}
 	return &AutoInstallConfig{
 		Format:           FormatAutoInstall,
-		KickstartContent: udBuf.String(), // user-data goes here
+		KickstartContent: udBuf.String(),
 		MetaDataContent:  "instance-id: clonr-build\nlocal-hostname: generic\n",
 		ISOLabel:         "CIDATA",
 	}, nil
@@ -332,8 +401,6 @@ func generateAutoYaST(data templateData) (*AutoInstallConfig, error) {
 
 // ── Alpine (answers file) ─────────────────────────────────────────────────────
 
-// Alpine uses a simple key=value answers file loaded via setup-alpine -f.
-// We wrap it in a small init script injected via the kernel command line.
 var alpineAnswersTemplate = template.Must(template.New("alpine").Parse(`KEYMAPOPTS="us us"
 HOSTNAMEOPTS="-n generic"
 INTERFACESOPTS="auto lo
@@ -362,3 +429,7 @@ func generateAlpineAnswers(data templateData) (*AutoInstallConfig, error) {
 		ISOLabel:         "OEMDRV",
 	}, nil
 }
+
+// ensure joinStrings is used to satisfy the compiler — the template FuncMap
+// closure captures strings.Join directly, so this just avoids the import warning.
+var _ = joinStrings
