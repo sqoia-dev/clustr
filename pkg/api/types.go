@@ -290,13 +290,19 @@ type ImportISORequest struct {
 
 // CaptureRequest is the body for POST /api/v1/factory/capture.
 type CaptureRequest struct {
-	Source  string   `json:"source"`   // rsync source: "user@host:/" or local path
-	Name    string   `json:"name"`
-	Version string   `json:"version"`
-	OS      string   `json:"os"`
-	Arch    string   `json:"arch"`
-	Tags    []string `json:"tags"`
-	Notes   string   `json:"notes"`
+	// SourceHost is the SSH-reachable hostname or IP of the node to capture.
+	SourceHost   string   `json:"source_host"`
+	SSHUser      string   `json:"ssh_user,omitempty"`
+	SSHPassword  string   `json:"ssh_password,omitempty"` // write-only, never returned
+	SSHKeyPath   string   `json:"ssh_key_path,omitempty"`
+	SSHPort      int      `json:"ssh_port,omitempty"` // defaults to 22 when zero
+	Name         string   `json:"name"`
+	Version      string   `json:"version"`
+	OS           string   `json:"os"`
+	Arch         string   `json:"arch"`
+	Tags         []string `json:"tags"`
+	Notes        string   `json:"notes"`
+	ExcludePaths []string `json:"exclude_paths,omitempty"` // rsync --exclude patterns
 }
 
 // ─── Shell session types ──────────────────────────────────────────────────────
