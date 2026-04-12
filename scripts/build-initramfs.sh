@@ -127,60 +127,53 @@ else
     echo "      kernel version: $KVER"
 
     # Modules needed for virtio NIC: failover → net_failover → virtio_net
+    # failover lives in net/core/, the rest in drivers/net/.
+    # We fetch the .ko.xz files and decompress to plain .ko because busybox
+    # insmod uses the init_module syscall which needs an uncompressed ELF.
+    mkdir -p "$WORKDIR/lib/modules/$KVER/kernel/net/core"
+    mkdir -p "$WORKDIR/lib/modules/$KVER/kernel/drivers/net"
+
+    # List of module paths relative to /lib/modules/$KVER/kernel/
     MODULES=(
         "net/core/failover.ko.xz"
-        "net/net_failover.ko.xz"
-        "net/virtio_net.ko.xz"
+        "drivers/net/net_failover.ko.xz"
+        "drivers/net/virtio_net.ko.xz"
     )
 
-    MODDIR="$WORKDIR/lib/modules/$KVER/kernel/drivers"
-    mkdir -p "$MODDIR/net"
-    mkdir -p "$WORKDIR/lib/modules/$KVER/kernel/net/core"
-
-    for mod in "${MODULES[@]}"; do
-        REMOTE_PATH="/lib/modules/$KVER/kernel/drivers/$mod"
-        # Adjust path for net/core modules which live outside drivers/
-        if [[ "$mod" == net/core/* ]]; then
-            REMOTE_PATH="/lib/modules/$KVER/kernel/${mod}"
-            LOCAL_DIR="$WORKDIR/lib/modules/$KVER/kernel/$(dirname "$mod")"
-        else
-            REMOTE_PATH="/lib/modules/$KVER/kernel/drivers/${mod}"
-            LOCAL_DIR="$WORKDIR/lib/modules/$KVER/kernel/drivers/$(dirname "$mod")"
-        fi
-        mkdir -p "$LOCAL_DIR"
-        LOCAL_FILE="$LOCAL_DIR/$(basename "$mod")"
+    for mod_rel in "${MODULES[@]}"; do
+        REMOTE_PATH="/lib/modules/$KVER/kernel/${mod_rel}"
+        # Destination: strip .xz suffix for the local .ko file
+        LOCAL_KO_XZ="$WORKDIR/lib/modules/$KVER/kernel/${mod_rel}"
+        LOCAL_KO="${LOCAL_KO_XZ%.xz}"
+        mkdir -p "$(dirname "$LOCAL_KO_XZ")"
 
         if sshpass -p "$CLONR_SERVER_PASS" scp -o StrictHostKeyChecking=no \
             "${CLONR_SERVER_USER}@${CLONR_SERVER_HOST}:${REMOTE_PATH}" \
-            "$LOCAL_FILE" 2>/dev/null; then
-            echo "      fetched: $(basename "$mod")"
+            "$LOCAL_KO_XZ" 2>/dev/null; then
+            # Decompress in place: failover.ko.xz → failover.ko
+            if xz -d "$LOCAL_KO_XZ" 2>/dev/null; then
+                echo "      fetched+decompressed: $(basename "$LOCAL_KO")"
+            else
+                echo "WARNING: failed to decompress ${LOCAL_KO_XZ}" >&2
+                rm -f "$LOCAL_KO_XZ"
+            fi
         else
             echo "WARNING: failed to fetch ${REMOTE_PATH}" >&2
         fi
     done
 
-    # Generate a minimal modules.dep so modprobe can resolve the chain.
-    # Format: module_path: [dep_path ...]
-    # virtio_net depends on net_failover; net_failover depends on failover.
+    # Generate a minimal modules.dep for plain .ko files.
     MODDEP_DIR="$WORKDIR/lib/modules/$KVER"
-    MODDEP_FILE="$MODDEP_DIR/modules.dep"
-
-    VIRTIO_NET_PATH="kernel/drivers/net/virtio_net.ko.xz"
-    FAILOVER_PATH="kernel/net/core/failover.ko.xz"
-    NET_FAILOVER_PATH="kernel/drivers/net/net_failover.ko.xz"
-
-    cat > "$MODDEP_FILE" << MODDEP
-kernel/net/core/failover.ko.xz:
-kernel/drivers/net/net_failover.ko.xz: kernel/net/core/failover.ko.xz
-kernel/drivers/net/virtio_net.ko.xz: kernel/drivers/net/net_failover.ko.xz kernel/net/core/failover.ko.xz
+    cat > "$MODDEP_DIR/modules.dep" << MODDEP
+kernel/net/core/failover.ko:
+kernel/drivers/net/net_failover.ko: kernel/net/core/failover.ko
+kernel/drivers/net/virtio_net.ko: kernel/drivers/net/net_failover.ko kernel/net/core/failover.ko
 MODDEP
 
-    # modules.alias for virtio NIC alias lookup (optional but keeps modprobe quiet).
     cat > "$MODDEP_DIR/modules.alias" << MODALIAS
 alias virtio:d00000001v* virtio_net
 MODALIAS
 
-    # modules.dep.bin is not needed when modprobe has the text modules.dep.
     echo "      generated modules.dep for $KVER"
 fi
 
@@ -282,11 +275,11 @@ KVER=\$(uname -r)
 MODBASE="/lib/modules/\$KVER"
 echo "Loading NIC modules for \$KVER..."
 
-insmod "\$MODBASE/kernel/net/core/failover.ko.xz"   2>/dev/null \
+insmod "\$MODBASE/kernel/net/core/failover.ko"        2>/dev/null \
     && echo "  [ok] failover"     || echo "  [!] failover (already loaded or missing)"
-insmod "\$MODBASE/kernel/drivers/net/net_failover.ko.xz" 2>/dev/null \
+insmod "\$MODBASE/kernel/drivers/net/net_failover.ko" 2>/dev/null \
     && echo "  [ok] net_failover" || echo "  [!] net_failover (already loaded or missing)"
-insmod "\$MODBASE/kernel/drivers/net/virtio_net.ko.xz"   2>/dev/null \
+insmod "\$MODBASE/kernel/drivers/net/virtio_net.ko"   2>/dev/null \
     && echo "  [ok] virtio_net"   || echo "  [!] virtio_net (already loaded or missing)"
 echo ""
 
