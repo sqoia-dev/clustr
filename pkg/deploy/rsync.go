@@ -256,10 +256,15 @@ func (d *FilesystemDeployer) partitionDisk(ctx context.Context, disk string) err
 		if p.Label != "" {
 			args = append(args, fmt.Sprintf("--change-name=%d:%s", num, p.Label))
 		}
-		// Set partition type GUID for ESP.
+		// Set partition type GUID based on flags.
 		for _, flag := range p.Flags {
-			if flag == "esp" || flag == "boot" {
+			switch flag {
+			case "esp", "boot":
+				// EFI System Partition: type code ef00
 				args = append(args, fmt.Sprintf("--typecode=%d:ef00", num))
+			case "bios_grub":
+				// BIOS boot partition: type code ef02 (used by GRUB2 on GPT/BIOS systems)
+				args = append(args, fmt.Sprintf("--typecode=%d:ef02", num))
 			}
 		}
 	}
@@ -320,9 +325,10 @@ func (d *FilesystemDeployer) createFilesystems(ctx context.Context, disk string)
 		case "swap":
 			mkfsBin = "mkswap"
 			mkfsArgs = []string{dev}
-		case "":
-			// No filesystem (raw partition, e.g. BIOS boot).
-			log.Printf("deploy: partition %d: no filesystem (raw/BIOS boot), skipping mkfs", i+1)
+		case "", "biosboot", "bios_grub":
+			// No filesystem — raw partition for BIOS boot (GPT BIOS boot partition)
+			// or an explicitly unformatted partition. sgdisk already set the type GUID.
+			log.Printf("deploy: partition %d: skipping mkfs for %q (BIOS boot / raw)", i+1, p.Filesystem)
 			continue
 		default:
 			return nil, fmt.Errorf("unsupported filesystem %q for partition %d", p.Filesystem, i+1)
