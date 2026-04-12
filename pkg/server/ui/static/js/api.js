@@ -65,6 +65,21 @@ const API = {
         return this._parse(resp);
     },
 
+    // Generic request helper used by dynamic endpoints (layout, groups, etc.).
+    async request(method, path, body) {
+        const opts = {
+            method,
+            headers: method === 'GET' || method === 'DELETE'
+                ? this._headers({ 'Content-Type': undefined })
+                : this._headers(),
+        };
+        if (body !== undefined && method !== 'GET' && method !== 'DELETE') {
+            opts.body = JSON.stringify(body);
+        }
+        const resp = await fetch(this.BASE + path, opts);
+        return this._parse(resp);
+    },
+
     // Convenience methods.
     images: {
         list(status = '')           { return API.get('/images', status ? { status } : {}); },
@@ -162,6 +177,13 @@ const API = {
                 xhr.send(fd);
             });
         },
+    },
+    nodeGroups: {
+        list()              { return API.get('/node-groups'); },
+        get(id)             { return API.get(`/node-groups/${id}`); },
+        create(body)        { return API.post('/node-groups', body); },
+        update(id, body)    { return API.put(`/node-groups/${id}`, body); },
+        del(id)             { return API.del(`/node-groups/${id}`); },
     },
     health: {
         get()                 { return API.get('/health'); },

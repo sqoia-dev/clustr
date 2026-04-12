@@ -2059,6 +2059,7 @@ const Pages = {
                     <div class="tab active" onclick="Pages._switchTab(this, 'tab-overview')">Overview</div>
                     <div class="tab" onclick="Pages._switchTab(this, 'tab-hardware')">Hardware</div>
                     <div class="tab" onclick="Pages._switchTab(this, 'tab-bmc');Pages._onBMCTabOpen('${node.id}', ${!!(node.bmc || node.power_provider)})">Power / IPMI</div>
+                    <div class="tab" onclick="Pages._switchTab(this, 'tab-disklayout');Pages._onDiskLayoutTabOpen('${node.id}')">Disk Layout</div>
                     <div class="tab" onclick="Pages._switchTab(this, 'tab-config')">Configuration</div>
                     <div class="tab" onclick="Pages._switchTab(this, 'tab-logs')">Logs</div>
                 </div>
@@ -2213,6 +2214,13 @@ const Pages = {
                     )}</div></div>` : '')}
                 </div>
 
+                <!-- Disk Layout tab -->
+                <div id="tab-disklayout" class="tab-panel">
+                    <div id="disklayout-content">
+                        <div class="loading"><div class="spinner"></div>Loading layout…</div>
+                    </div>
+                </div>
+
                 <!-- Configuration tab -->
                 <div id="tab-config" class="tab-panel">
                     ${node.ssh_keys && node.ssh_keys.length ? cardWrap('SSH Public Keys', `
@@ -2343,6 +2351,299 @@ const Pages = {
             if (!cycle) setTimeout(() => Pages._refreshPowerStatus(nodeId), 2000);
         } catch (e) {
             if (feedback) { feedback.textContent = `Error: ${e.message}`; feedback.className = 'alert alert-error'; }
+        }
+    },
+
+    // ── Disk Layout tab ───────────────────────────────────────────────────────
+
+    // _onDiskLayoutTabOpen loads the effective layout and recommendation for the
+    // disk layout editor tab. Called once when the tab is first opened.
+    async _onDiskLayoutTabOpen(nodeId) {
+        const container = document.getElementById('disklayout-content');
+        if (!container) return;
+        container.innerHTML = `<div class="loading"><div class="spinner"></div>Loading…</div>`;
+        try {
+            const [effectiveResp, recResp] = await Promise.allSettled([
+                API.request('GET', `/api/v1/nodes/${nodeId}/effective-layout`),
+                API.request('GET', `/api/v1/nodes/${nodeId}/layout-recommendation`),
+            ]);
+            const effective = effectiveResp.status === 'fulfilled' ? effectiveResp.value : null;
+            const rec = recResp.status === 'fulfilled' ? recResp.value : null;
+            container.innerHTML = Pages._renderDiskLayoutTab(nodeId, effective, rec);
+        } catch (e) {
+            container.innerHTML = alertBox(`Failed to load disk layout: ${e.message}`);
+        }
+    },
+
+    _renderDiskLayoutTab(nodeId, effective, rec) {
+        const sourceLabel = {
+            node:  '<span class="badge badge-info">Node Override</span>',
+            group: '<span class="badge badge-neutral">Group Override</span>',
+            image: '<span class="badge badge-archived">Image Default</span>',
+        };
+
+        const layoutToTable = (layout) => {
+            if (!layout || !layout.partitions || layout.partitions.length === 0) {
+                return `<div class="text-dim" style="padding:12px">No partitions defined.</div>`;
+            }
+            const totalFixed = layout.partitions.reduce((s, p) => s + (p.size_bytes || 0), 0);
+            // Visual bar: compute each partition's width as a % of total fixed space (or uniform if fill).
+            const hasFill = layout.partitions.some(p => !p.size_bytes);
+            const barParts = layout.partitions.map(p => {
+                const pct = (hasFill || totalFixed === 0)
+                    ? (p.size_bytes ? Math.round(p.size_bytes / (totalFixed || 1) * 80) : 20)
+                    : Math.max(2, Math.round(p.size_bytes / totalFixed * 100));
+                const colors = {
+                    xfs: '#3b82f6', ext4: '#8b5cf6', vfat: '#10b981', swap: '#f59e0b',
+                    biosboot: '#6b7280', bios_grub: '#6b7280',
+                };
+                const bg = colors[p.filesystem] || '#94a3b8';
+                return `<div style="flex:${pct};background:${bg};min-width:24px;display:flex;align-items:center;justify-content:center;font-size:10px;color:#fff;overflow:hidden;white-space:nowrap;padding:0 4px" title="${escHtml(p.label||p.mountpoint||p.filesystem)}">${escHtml(p.label||p.mountpoint||'')}</div>`;
+            }).join('');
+            const bar = `<div style="display:flex;height:32px;border-radius:6px;overflow:hidden;margin-bottom:12px;border:1px solid var(--border)">${barParts}</div>`;
+
+            const rows = layout.partitions.map((p, i) => {
+                const sizeStr = p.size_bytes
+                    ? fmtBytes(p.size_bytes)
+                    : '<span class="badge badge-neutral" style="font-size:10px">fill</span>';
+                return `<tr>
+                    <td>${escHtml(p.label || '—')}</td>
+                    <td>${sizeStr}</td>
+                    <td><span class="badge badge-neutral" style="font-size:10px">${escHtml(p.filesystem || '—')}</span></td>
+                    <td class="text-mono">${escHtml(p.mountpoint || '—')}</td>
+                    <td class="text-dim">${(p.flags||[]).join(', ') || '—'}</td>
+                    <td class="text-dim">${escHtml(p.device||'(auto)')}</td>
+                </tr>`;
+            }).join('');
+
+            const bootloader = layout.bootloader
+                ? `<div style="margin-top:8px;font-size:12px;color:var(--text-secondary)">Bootloader: <strong>${escHtml(layout.bootloader.type||'')} (${escHtml(layout.bootloader.target||'')})</strong></div>`
+                : '';
+            if (layout.target_device) {
+                // show target device hint
+            }
+
+            return `
+                ${bar}
+                <div class="table-wrap"><table>
+                    <thead><tr><th>Label</th><th>Size</th><th>Filesystem</th><th>Mountpoint</th><th>Flags</th><th>Device</th></tr></thead>
+                    <tbody>${rows}</tbody>
+                </table></div>
+                ${bootloader}`;
+        };
+
+        let effectiveSection = '';
+        if (effective) {
+            const src = sourceLabel[effective.source] || `<span class="badge badge-neutral">${escHtml(effective.source)}</span>`;
+            effectiveSection = cardWrap(
+                `Current Effective Layout &nbsp;${src}`,
+                `<div class="card-body">
+                    ${layoutToTable(effective.layout)}
+                </div>`,
+                `<div class="flex gap-8">
+                    <button class="btn btn-secondary btn-sm" onclick="Pages._showLayoutOverrideEditor('${nodeId}', ${JSON.stringify(JSON.stringify(effective.layout))})">
+                        Edit Override
+                    </button>
+                    ${effective.source !== 'image' ? `<button class="btn btn-secondary btn-sm" onclick="Pages._clearLayoutOverride('${nodeId}')">Clear Override</button>` : ''}
+                </div>`
+            );
+        }
+
+        let recSection = '';
+        if (rec) {
+            const warnings = (rec.warnings || []).map(w =>
+                `<div class="alert alert-warning" style="margin:4px 0;font-size:12px">${escHtml(w)}</div>`).join('');
+            recSection = cardWrap(
+                'Recommended Layout',
+                `<div class="card-body">
+                    ${layoutToTable(rec.layout)}
+                    ${warnings}
+                    ${rec.reasoning ? `<details style="margin-top:12px"><summary style="cursor:pointer;font-size:12px;color:var(--text-secondary)">Reasoning</summary><pre style="font-size:11px;margin-top:8px;white-space:pre-wrap;color:var(--text-secondary)">${escHtml(rec.reasoning)}</pre></details>` : ''}
+                </div>`,
+                `<button class="btn btn-primary btn-sm" onclick="Pages._applyRecommendedLayout('${nodeId}', ${JSON.stringify(JSON.stringify(rec.layout))})">Apply Recommended Layout</button>`
+            );
+        } else if (rec === null) {
+            recSection = cardWrap('Recommended Layout',
+                `<div class="card-body">${emptyState('No recommendation available', 'Hardware profile not yet discovered (node must PXE-boot to register hardware).')}</div>`);
+        }
+
+        return effectiveSection + recSection;
+    },
+
+    async _applyRecommendedLayout(nodeId, layoutJSON) {
+        const layout = JSON.parse(layoutJSON);
+        if (!confirm('Apply the recommended disk layout as a node-level override? This will override the image/group default for this node only.')) return;
+        try {
+            await API.request('PUT', `/api/v1/nodes/${nodeId}/layout-override`, { layout });
+            Pages._onDiskLayoutTabOpen(nodeId);
+        } catch (e) {
+            alert(`Failed to apply layout: ${e.message}`);
+        }
+    },
+
+    async _clearLayoutOverride(nodeId) {
+        if (!confirm('Clear the node-level disk layout override? The group or image default will be used instead.')) return;
+        try {
+            await API.request('PUT', `/api/v1/nodes/${nodeId}/layout-override`, { clear_layout_override: true });
+            Pages._onDiskLayoutTabOpen(nodeId);
+        } catch (e) {
+            alert(`Failed to clear override: ${e.message}`);
+        }
+    },
+
+    _showLayoutOverrideEditor(nodeId, layoutJSON) {
+        const layout = JSON.parse(layoutJSON);
+        // Build an editable partition table in a modal.
+        const rows = (layout.partitions || []).map((p, i) => `
+            <tr>
+                <td><input type="text" value="${escHtml(p.label||'')}" onchange="Pages._layoutEditorUpdate(${i},'label',this.value)" style="width:90px"></td>
+                <td>
+                    <input type="text" value="${p.size_bytes ? fmtBytes(p.size_bytes) : 'fill'}" onchange="Pages._layoutEditorParseSizeInput(${i},this.value)" style="width:80px" placeholder="e.g. 100GB or fill">
+                </td>
+                <td>
+                    <select onchange="Pages._layoutEditorUpdate(${i},'filesystem',this.value)">
+                        ${['xfs','ext4','vfat','swap','biosboot'].map(fs =>
+                            `<option value="${fs}" ${p.filesystem===fs?'selected':''}>${fs}</option>`).join('')}
+                    </select>
+                </td>
+                <td><input type="text" value="${escHtml(p.mountpoint||'')}" onchange="Pages._layoutEditorUpdate(${i},'mountpoint',this.value)" style="width:90px"></td>
+                <td>
+                    <button class="btn btn-danger btn-sm" onclick="Pages._layoutEditorRemoveRow(${i})" style="padding:2px 8px">✕</button>
+                </td>
+            </tr>`).join('');
+
+        const overlay = document.createElement('div');
+        overlay.id = 'layout-editor-modal';
+        overlay.className = 'modal-overlay';
+        overlay.innerHTML = `
+            <div class="modal" style="max-width:720px;width:95vw">
+                <div class="modal-header"><h2>Edit Disk Layout Override</h2></div>
+                <div class="modal-body" style="padding:20px">
+                    <div id="layout-editor-warnings" style="margin-bottom:10px"></div>
+                    <div class="table-wrap">
+                        <table id="layout-editor-table">
+                            <thead><tr><th>Label</th><th>Size</th><th>Filesystem</th><th>Mountpoint</th><th></th></tr></thead>
+                            <tbody id="layout-editor-tbody">${rows}</tbody>
+                        </table>
+                    </div>
+                    <div style="margin-top:10px;display:flex;gap:8px">
+                        <button class="btn btn-secondary btn-sm" onclick="Pages._layoutEditorAddRow()">Add Partition</button>
+                        <button class="btn btn-secondary btn-sm" onclick="Pages._layoutEditorFillLast()">Set Last → Fill</button>
+                    </div>
+                    <div id="layout-editor-result" style="margin-top:10px"></div>
+                    <div class="form-actions" style="margin-top:16px">
+                        <button class="btn btn-secondary" onclick="document.getElementById('layout-editor-modal').remove()">Cancel</button>
+                        <button class="btn btn-primary" id="layout-save-btn" onclick="Pages._layoutEditorSave('${nodeId}')">Save Override</button>
+                    </div>
+                </div>
+            </div>`;
+        // Store current layout state on the element.
+        overlay._layoutState = JSON.parse(JSON.stringify(layout));
+        overlay._nodeId = nodeId;
+        document.body.appendChild(overlay);
+        overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+    },
+
+    _getLayoutEditorModal() {
+        return document.getElementById('layout-editor-modal');
+    },
+
+    _layoutEditorUpdate(idx, field, value) {
+        const modal = this._getLayoutEditorModal();
+        if (!modal) return;
+        modal._layoutState.partitions[idx][field] = value;
+        this._layoutEditorValidate(modal);
+    },
+
+    _layoutEditorParseSizeInput(idx, value) {
+        const modal = this._getLayoutEditorModal();
+        if (!modal) return;
+        const trimmed = value.trim().toLowerCase();
+        let bytes = 0;
+        if (trimmed === 'fill' || trimmed === '0' || trimmed === '') {
+            bytes = 0;
+        } else {
+            const match = trimmed.match(/^([\d.]+)\s*(mb|gb|tb|kb|b)?$/);
+            if (match) {
+                const n = parseFloat(match[1]);
+                const unit = match[2] || 'b';
+                const mult = {b:1, kb:1024, mb:1024**2, gb:1024**3, tb:1024**4};
+                bytes = Math.round(n * (mult[unit]||1));
+            }
+        }
+        modal._layoutState.partitions[idx].size_bytes = bytes;
+        this._layoutEditorValidate(modal);
+    },
+
+    _layoutEditorRemoveRow(idx) {
+        const modal = this._getLayoutEditorModal();
+        if (!modal) return;
+        modal._layoutState.partitions.splice(idx, 1);
+        // Re-render the table body.
+        this._layoutEditorRebuildRows(modal);
+        this._layoutEditorValidate(modal);
+    },
+
+    _layoutEditorAddRow() {
+        const modal = this._getLayoutEditorModal();
+        if (!modal) return;
+        modal._layoutState.partitions.push({ label: '', size_bytes: 0, filesystem: 'xfs', mountpoint: '' });
+        this._layoutEditorRebuildRows(modal);
+    },
+
+    _layoutEditorFillLast() {
+        const modal = this._getLayoutEditorModal();
+        if (!modal || !modal._layoutState.partitions.length) return;
+        const last = modal._layoutState.partitions[modal._layoutState.partitions.length - 1];
+        last.size_bytes = 0;
+        this._layoutEditorRebuildRows(modal);
+    },
+
+    _layoutEditorRebuildRows(modal) {
+        const tbody = document.getElementById('layout-editor-tbody');
+        if (!tbody) return;
+        const parts = modal._layoutState.partitions;
+        tbody.innerHTML = parts.map((p, i) => `
+            <tr>
+                <td><input type="text" value="${escHtml(p.label||'')}" onchange="Pages._layoutEditorUpdate(${i},'label',this.value)" style="width:90px"></td>
+                <td><input type="text" value="${p.size_bytes ? fmtBytes(p.size_bytes) : 'fill'}" onchange="Pages._layoutEditorParseSizeInput(${i},this.value)" style="width:80px"></td>
+                <td><select onchange="Pages._layoutEditorUpdate(${i},'filesystem',this.value)">${
+                    ['xfs','ext4','vfat','swap','biosboot'].map(fs =>
+                        `<option value="${fs}" ${p.filesystem===fs?'selected':''}>${fs}</option>`).join('')
+                }</select></td>
+                <td><input type="text" value="${escHtml(p.mountpoint||'')}" onchange="Pages._layoutEditorUpdate(${i},'mountpoint',this.value)" style="width:90px"></td>
+                <td><button class="btn btn-danger btn-sm" onclick="Pages._layoutEditorRemoveRow(${i})" style="padding:2px 8px">✕</button></td>
+            </tr>`).join('');
+        this._layoutEditorValidate(modal);
+    },
+
+    _layoutEditorValidate(modal) {
+        const warningsEl = document.getElementById('layout-editor-warnings');
+        const saveBtn = document.getElementById('layout-save-btn');
+        if (!warningsEl || !modal) return;
+        const parts = modal._layoutState.partitions;
+        const errs = [];
+        const hasRoot = parts.some(p => p.mountpoint === '/');
+        if (!hasRoot) errs.push('Must have a / (root) partition');
+        const fillCount = parts.filter(p => !p.size_bytes).length;
+        if (fillCount > 1) errs.push('Only one partition may use "fill" (size_bytes = 0)');
+        warningsEl.innerHTML = errs.map(e => `<div class="alert alert-error" style="margin:2px 0;font-size:12px">${escHtml(e)}</div>`).join('');
+        if (saveBtn) saveBtn.disabled = errs.length > 0;
+    },
+
+    async _layoutEditorSave(nodeId) {
+        const modal = this._getLayoutEditorModal();
+        if (!modal) return;
+        const saveBtn = document.getElementById('layout-save-btn');
+        const resultEl = document.getElementById('layout-editor-result');
+        if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Saving…'; }
+        try {
+            await API.request('PUT', `/api/v1/nodes/${nodeId}/layout-override`, { layout: modal._layoutState });
+            modal.remove();
+            Pages._onDiskLayoutTabOpen(nodeId);
+        } catch (e) {
+            if (resultEl) resultEl.innerHTML = `<div class="alert alert-error">${escHtml(e.message)}</div>`;
+            if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = 'Save Override'; }
         }
     },
 
