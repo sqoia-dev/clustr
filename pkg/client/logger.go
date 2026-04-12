@@ -19,6 +19,7 @@ const (
 	defaultBufferSize    = 50
 	defaultFlushInterval = 2 * time.Second
 	closeFlushTimeout    = 5 * time.Second
+	urgentFlushTimeout   = 3 * time.Second // used for WARN/ERROR and shutdown flushes
 )
 
 // RemoteLogWriter buffers zerolog JSON output and ships it to the server in
@@ -115,6 +116,10 @@ func (w *RemoteLogWriter) SetHostname(hostname string) {
 
 // Write implements io.Writer. Each call is expected to be a single zerolog
 // JSON line. Non-JSON input is shipped as a raw "info" message.
+//
+// WARN and ERROR level entries trigger an immediate flush signal so they are
+// not held in the buffer for up to the normal 2s flush interval — critical
+// messages arrive at the server as soon as possible.
 func (w *RemoteLogWriter) Write(p []byte) (int, error) {
 	n := len(p)
 
@@ -138,7 +143,10 @@ func (w *RemoteLogWriter) Write(p []byte) (int, error) {
 	shouldFlush := len(w.buffer) >= w.bufferSize
 	w.mu.Unlock()
 
-	if shouldFlush {
+	// Flush immediately for WARN and ERROR — don't wait for the 2s ticker.
+	isUrgent := entry.Level == "warn" || entry.Level == "error" || entry.Level == "fatal" || entry.Level == "panic"
+
+	if shouldFlush || isUrgent {
 		// Signal the background flusher; never block the caller.
 		select {
 		case w.flushCh <- struct{}{}:
@@ -162,7 +170,7 @@ func (w *RemoteLogWriter) Flush() error {
 	w.buffer = w.buffer[:0]
 	w.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), urgentFlushTimeout)
 	defer cancel()
 
 	if err := w.client.SendLogs(ctx, batch); err != nil {
@@ -177,6 +185,35 @@ func (w *RemoteLogWriter) Flush() error {
 		return err
 	}
 	return nil
+}
+
+// FlushSync performs a synchronous flush with the urgent (3s) timeout.
+// Call this in defer chains or before os.Exit to ensure buffered logs are shipped.
+func (w *RemoteLogWriter) FlushSync() {
+	done := make(chan struct{}, 1)
+	go func() {
+		_ = w.Flush()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(urgentFlushTimeout):
+	}
+}
+
+// RecoverAndFlush is intended to be used as a deferred panic recovery wrapper.
+// It flushes buffered log entries synchronously before re-panicking, ensuring
+// that WARN/ERROR messages logged just before a crash reach the server.
+//
+// Usage:
+//
+//	defer remoteWriter.RecoverAndFlush()
+func (w *RemoteLogWriter) RecoverAndFlush() {
+	if r := recover(); r != nil {
+		// Flush synchronously — we have at most urgentFlushTimeout before we re-panic.
+		w.FlushSync()
+		panic(r) // re-panic so the caller's recover() or runtime can handle it
+	}
 }
 
 // Close flushes remaining buffered entries (best-effort, 5s timeout) and
