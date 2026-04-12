@@ -578,8 +578,23 @@ func (d *FilesystemDeployer) mountPartitions(ctx context.Context, devs []string,
 				Msg("mountPartitions: already mounted — skipping")
 			continue
 		}
-		if err := runCmd(ctx, "mount", m.dev, target); err != nil {
-			return fmt.Errorf("mount %s → %s: %w", m.dev, target, err)
+		// Retry mount up to 5 times with 1s backoff. After a lazy umount the kernel
+		// may still mark the device as in-use for a brief window; retrying avoids a
+		// spurious EBUSY failure.
+		var mountErr error
+		for attempt := 1; attempt <= 5; attempt++ {
+			mountErr = runCmd(ctx, "mount", m.dev, target)
+			if mountErr == nil {
+				break
+			}
+			if attempt < 5 {
+				logger().Debug().Str("dev", m.dev).Str("target", target).Err(mountErr).
+					Int("attempt", attempt).Msg("mount: retrying in 1s (device may still be releasing)")
+				time.Sleep(time.Second)
+			}
+		}
+		if mountErr != nil {
+			return fmt.Errorf("mount %s → %s: %w", m.dev, target, mountErr)
 		}
 	}
 	return nil
@@ -602,21 +617,41 @@ func isMounted(dev, target string) bool {
 }
 
 // unmountAll unmounts everything under mountRoot in reverse order (deepest first).
-// Syncs first to flush pending writes, then attempts a clean umount -R.
-// If the clean umount fails (e.g. EBUSY from lingering kernel writeback or an
-// open fd left by a subprocess), falls back to a lazy detach (umount -l -R) so
-// the in-flight IO completes in the background but the mount point is released
-// immediately. This prevents the "Resource busy" error in Finalize's re-mount.
+// Syncs first to flush pending writes, then retries umount -R up to 10 times with
+// 1-second waits to allow kernel writeback to drain. Only falls back to lazy detach
+// if all retries fail. Lazy detach (umount -l) is intentionally a last resort because
+// it leaves the block device marked "in use" by the kernel, which causes the subsequent
+// Finalize remount to fail with EBUSY.
 func (d *FilesystemDeployer) unmountAll(mountRoot string) {
 	log := logger()
-	// Flush dirty pages before unmounting — reduces the chance of EBUSY.
+	// Flush dirty pages — reduces the chance of EBUSY on umount.
 	_ = exec.Command("sync").Run()
-	if err := exec.Command("umount", "-R", mountRoot).Run(); err != nil {
-		log.Warn().Str("mountRoot", mountRoot).Err(err).
-			Msg("umount -R failed — falling back to lazy detach (umount -l -R)")
-		if lazyErr := exec.Command("umount", "-l", "-R", mountRoot).Run(); lazyErr != nil {
-			log.Error().Str("mountRoot", mountRoot).Err(lazyErr).
-				Msg("lazy umount also failed — filesystem may remain mounted")
+
+	// Retry umount -R up to 10 times, waiting 1s between attempts.
+	// Kernel write-back after a large tar extraction can keep the filesystem
+	// busy for several seconds even after sync returns.
+	const maxUmountRetries = 10
+	for attempt := 1; attempt <= maxUmountRetries; attempt++ {
+		err := exec.Command("umount", "-R", mountRoot).Run()
+		if err == nil {
+			if attempt > 1 {
+				log.Info().Str("mountRoot", mountRoot).Int("attempt", attempt).
+					Msg("umount -R succeeded after retries")
+			}
+			return
+		}
+		if attempt < maxUmountRetries {
+			log.Debug().Str("mountRoot", mountRoot).Err(err).Int("attempt", attempt).
+				Msg("umount -R not ready yet — retrying in 1s")
+			_ = exec.Command("sync").Run()
+			time.Sleep(time.Second)
+		} else {
+			log.Warn().Str("mountRoot", mountRoot).Err(err).
+				Msg("umount -R failed after all retries — falling back to lazy detach (umount -l -R)")
+			if lazyErr := exec.Command("umount", "-l", "-R", mountRoot).Run(); lazyErr != nil {
+				log.Error().Str("mountRoot", mountRoot).Err(lazyErr).
+					Msg("lazy umount also failed — filesystem may remain mounted")
+			}
 		}
 	}
 }
