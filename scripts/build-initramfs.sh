@@ -239,12 +239,26 @@ else
     # insmod uses the init_module syscall which needs an uncompressed ELF.
     mkdir -p "$WORKDIR/lib/modules/$KVER/kernel/net/core"
     mkdir -p "$WORKDIR/lib/modules/$KVER/kernel/drivers/net"
+    mkdir -p "$WORKDIR/lib/modules/$KVER/kernel/drivers/scsi"
+    mkdir -p "$WORKDIR/lib/modules/$KVER/kernel/drivers/block"
 
     # List of module paths relative to /lib/modules/$KVER/kernel/
+    # Network: failover → net_failover → virtio_net
+    # Storage (virtio-scsi-pci controller, e.g. Proxmox scsi0 with scsihw=virtio-scsi-pci):
+    #   virtio_scsi  — the HBA driver; makes the SCSI bus visible to the kernel
+    #   sd_mod       — the SCSI disk driver; turns a SCSI target into /dev/sdX
+    #                  Without sd_mod, virtio_scsi sees the device but never creates
+    #                  the block node, so /sys/class/block/ stays empty.
+    # Storage (virtio block device, e.g. Proxmox virtio0):
+    #   virtio_blk   — direct virtio block driver, creates /dev/vdX
+    # All have no module dependencies on the Rocky 9 kernel.
     MODULES=(
         "net/core/failover.ko.xz"
         "drivers/net/net_failover.ko.xz"
         "drivers/net/virtio_net.ko.xz"
+        "drivers/scsi/virtio_scsi.ko.xz"
+        "drivers/scsi/sd_mod.ko.xz"
+        "drivers/block/virtio_blk.ko.xz"
     )
 
     for mod_rel in "${MODULES[@]}"; do
@@ -275,10 +289,16 @@ else
 kernel/net/core/failover.ko:
 kernel/drivers/net/net_failover.ko: kernel/net/core/failover.ko
 kernel/drivers/net/virtio_net.ko: kernel/drivers/net/net_failover.ko kernel/net/core/failover.ko
+kernel/drivers/scsi/virtio_scsi.ko:
+kernel/drivers/scsi/sd_mod.ko:
+kernel/drivers/block/virtio_blk.ko:
 MODDEP
 
     cat > "$MODDEP_DIR/modules.alias" << MODALIAS
 alias virtio:d00000001v* virtio_net
+alias virtio:d00000008v* virtio_scsi
+alias virtio:d00000002v* virtio_blk
+alias scsi:t-0x00* sd_mod
 MODALIAS
 
     echo "      generated modules.dep for $KVER"
@@ -412,7 +432,10 @@ log "dmesg virtio: \$(dmesg 2>/dev/null | grep -iE 'virtio|net' | tail -5 | tr '
 for mod in \
     "\$MODBASE/kernel/net/core/failover.ko" \
     "\$MODBASE/kernel/drivers/net/net_failover.ko" \
-    "\$MODBASE/kernel/drivers/net/virtio_net.ko"; do
+    "\$MODBASE/kernel/drivers/net/virtio_net.ko" \
+    "\$MODBASE/kernel/drivers/scsi/virtio_scsi.ko" \
+    "\$MODBASE/kernel/drivers/scsi/sd_mod.ko" \
+    "\$MODBASE/kernel/drivers/block/virtio_blk.ko"; do
     name=\$(basename "\$mod")
     if [ -f "\$mod" ]; then
         err=\$(insmod "\$mod" 2>&1)
@@ -425,6 +448,28 @@ for mod in \
         ls -la "\$(dirname \$mod)" 2>&1 | tee -a "\$LOG"
     fi
 done
+
+# Wait for storage devices to enumerate after module load.
+# virtio_scsi probes asynchronously — the SCSI device appears in dmesg almost
+# immediately, but the block device node (/dev/sda) is created by the kernel
+# slightly later. Poll /sys/class/block/ until at least one disk appears (or
+# 10 seconds elapse). Exclude loop devices and ram disks.
+log "waiting for block devices to appear in /sys/class/block/..."
+for _wait in 1 2 3 4 5 6 7 8 9 10; do
+    BLKDEVS=\$(ls /sys/class/block/ 2>/dev/null | grep -vE '^(loop|ram)' | tr '\n' ' ')
+    if [ -n "\$BLKDEVS" ]; then
+        log "block devices appeared after \${_wait}s: \$BLKDEVS"
+        break
+    fi
+    sleep 1
+done
+if [ -z "\$BLKDEVS" ]; then
+    log "WARNING: no block devices appeared after 10s — disk discovery will return empty"
+fi
+log "block devices: \$(ls /sys/class/block/ 2>/dev/null | tr '\n' ' ' || echo NONE)"
+log "/dev contents: \$(ls /dev/ 2>/dev/null | tr '\n' ' ' | head -c 200)"
+log "lsblk test (simple): \$(/usr/bin/lsblk --json --bytes --output NAME,SIZE,TYPE 2>&1 | head -c 500 || echo LSBLK_FAILED)"
+log "lsblk test (full cols): \$(/usr/bin/lsblk --json --bytes --output NAME,SIZE,TYPE,MODEL,SERIAL,FSTYPE,MOUNTPOINT,TRAN,ROTA,PHY-SEC,LOG-SEC,PTTYPE,PTUUID,PARTUUID,PARTTYPE,PARTLABEL 2>&1 | head -c 800 || echo LSBLK_FULL_FAILED)"
 
 log "loaded: \$(cat /proc/modules 2>/dev/null | grep -E 'virtio|failover' | cut -d' ' -f1 | tr '\n' ' ')"
 log "ifaces: \$(ls /sys/class/net/ 2>/dev/null | tr '\n' ' ')"
@@ -493,7 +538,13 @@ HTTPPID=\$!
 log "log server: httpd :9999 (pid \$HTTPPID), nc :9998"
 
 # ── Step 8: run clonr deploy --auto ───────────────────────────────────────────
+# Ensure PATH includes /usr/bin so exec.Command("lsblk",...) in Go can find it.
+# busybox sh may not set a complete PATH by default, which would cause Go's
+# os/exec.LookPath to fail silently, returning no disks.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export CLONR_SERVER="\${CLONR_SERVER:-http://10.99.0.1:8080}"
+log "PATH: \$PATH"
+log "lsblk location: \$(which lsblk 2>&1 || echo NOT_FOUND)"
 log "running: /usr/bin/clonr deploy --auto --server \${CLONR_SERVER}"
 
 /usr/bin/clonr deploy --auto --server "\${CLONR_SERVER}" 2>&1 >> "\$LOG"

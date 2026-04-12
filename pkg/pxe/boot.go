@@ -7,13 +7,22 @@ import (
 )
 
 // iPXE boot script template.
-// The ${mac} and ${next-server} variables are expanded by iPXE itself at runtime.
-// We inject clonr.server at kernel command line level.
+// The ${mac} variable is expanded by iPXE itself at runtime.
+//
+// On UEFI systems, iPXE requires the initrd to be loaded with --name and then
+// referenced by that name in the kernel command line via initrd=<name>. Without
+// the --name form, the initrd is loaded into memory but the kernel never receives
+// a reference to it, causing "VFS: Unable to mount root fs on unknown-block(0,0)".
+//
+// The kernel line must include initrd=initramfs.img so the Linux boot protocol
+// handler in iPXE knows to pass the named image as the initrd to the kernel.
+//
+// This applies to both UEFI (ipxe.efi) and BIOS (undionly.kpxe) clients because
+// the named-initrd form is the only reliably portable syntax across iPXE versions.
 const bootScriptTemplate = `#!ipxe
 set server-url {{.ServerURL}}
-kernel ${server-url}/api/v1/boot/vmlinuz
-initrd ${server-url}/api/v1/boot/initramfs.img
-imgargs vmlinuz clonr.server=${server-url} clonr.mac=${mac} console=ttyS0,115200n8
+kernel ${server-url}/api/v1/boot/vmlinuz initrd=initramfs.img clonr.server=${server-url} clonr.mac=${mac} console=ttyS0,115200n8
+initrd --name initramfs.img ${server-url}/api/v1/boot/initramfs.img
 boot
 `
 
