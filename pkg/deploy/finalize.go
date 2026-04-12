@@ -56,7 +56,7 @@ func applyNodeConfig(ctx context.Context, cfg api.NodeConfig, mountRoot string) 
 		if err := applyBMCConfig(ctx, cfg.BMC); err != nil {
 			// Non-fatal: BMC configuration failure should not abort a deployment.
 			// The operator can manually configure the BMC afterward.
-			_ = fmt.Errorf("finalize: bmc (non-fatal): %w", err)
+			log.Printf("WARNING: finalize: bmc (non-fatal): %v", err)
 		}
 	}
 

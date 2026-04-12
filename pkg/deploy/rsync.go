@@ -164,8 +164,27 @@ func (d *FilesystemDeployer) Deploy(ctx context.Context, opts DeployOpts, progre
 	return nil
 }
 
-// Finalize applies node-specific identity to the deployed filesystem.
+// Finalize re-mounts the deployed partitions, applies node-specific identity,
+// then unmounts cleanly. Re-mounting is necessary because Deploy defers
+// unmountAll, so by the time Finalize is called the partitions are already
+// unmounted. This mirrors BlockDeployer.Finalize.
 func (d *FilesystemDeployer) Finalize(ctx context.Context, cfg api.NodeConfig, mountRoot string) error {
+	if d.targetDisk == "" {
+		return fmt.Errorf("deploy: Preflight must be called before Finalize")
+	}
+
+	// Re-create the partition device list from the stored layout.
+	partDevs := make([]string, len(d.layout.Partitions))
+	for i := range d.layout.Partitions {
+		partDevs[i] = partitionDevice(d.targetDisk, i+1)
+	}
+
+	// Re-mount all partitions so applyNodeConfig can write into the filesystem.
+	if err := d.mountPartitions(ctx, partDevs, mountRoot); err != nil {
+		return fmt.Errorf("deploy: finalize: re-mount partitions: %w", err)
+	}
+	defer d.unmountAll(mountRoot)
+
 	if err := applyNodeConfig(ctx, cfg, mountRoot); err != nil {
 		return err
 	}
@@ -434,7 +453,7 @@ func (d *FilesystemDeployer) downloadToTempAndExtract(ctx context.Context, body 
 		progress(0, totalBytes, "extracting")
 	}
 
-	tarCmd := exec.CommandContext(ctx, "tar", "-xzf", "-", "-C", opts.MountRoot)
+	tarCmd := exec.CommandContext(ctx, "tar", "-xaf", "-", "-C", opts.MountRoot)
 	tarCmd.Stdin = &progressReader{r: tmpFile, total: totalBytes, fn: progress, phase: "extracting"}
 	if out, err := tarCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("tar extract: %w\noutput: %s", err, string(out))
