@@ -570,6 +570,18 @@ func (h *ImagesHandler) streamFilesystemBlob(w http.ResponseWriter, r *http.Requ
 		"--exclude=./usr/bin/sudo",
 		"--exclude=./usr/bin/sudoreplay",
 		"--exclude=./usr/libexec/sudo/sesh",
+		// sssd configuration and runtime dirs — mode 711/750, owned root:sssd.
+		// tar exits 2 trying to read these under NoNewPrivileges=yes.
+		// The deployed node re-joins sssd/IPA on first boot via firstboot scripts.
+		"--exclude=./etc/sssd",
+		// polkit rules — mode 700 on strict SELinux systems; unreadable by tar.
+		"--exclude=./etc/polkit-1/rules.d",
+		// Home directory for the clonr deploy agent — should not be in the image
+		// rootfs; exclude it so the deployed node gets a clean /home/clonr on setup.
+		"--exclude=./home/clonr",
+		// staprun (SystemTap) — SUID root binary (mode 4110), unreadable under
+		// NoNewPrivileges=yes; excluded to prevent tar exit 2.
+		"--exclude=./usr/bin/staprun",
 		// Deterministic output flags — required for stable sha256 across repeated
 		// streams of the same image content. Without these, entry order and embedded
 		// timestamps vary between runs (directory readdir order, ctime drift),
@@ -722,6 +734,13 @@ func (h *ImagesHandler) streamFilesystemBlob(w http.ResponseWriter, r *http.Requ
 
 	// Normal path: pipe remaining bytes synchronously, then wait.
 	pipeRemaining()
+	// After pipeRemaining returns, tar may still be alive (writing into a full
+	// kernel pipe buffer) if the client disconnected mid-stream via TCP reset
+	// rather than HTTP-level close (in which case r.Context().Done() may not yet
+	// be signalled when the default branch above was taken). Kill the process so
+	// the goroutine below can unblock from cmd.Wait() immediately. Killing a
+	// process that already exited is a no-op on Linux (ESRCH).
+	_ = cmd.Process.Kill()
 	tarErr := <-done
 
 	if tarErr != nil {
