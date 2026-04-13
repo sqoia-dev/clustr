@@ -3,16 +3,21 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/rs/zerolog/log"
+	"github.com/sqoia-dev/clonr/pkg/api"
 	"github.com/sqoia-dev/clonr/pkg/config"
 	"github.com/sqoia-dev/clonr/pkg/db"
 	"github.com/sqoia-dev/clonr/pkg/image"
@@ -35,6 +40,7 @@ type Server struct {
 	powerCache          *PowerCache
 	powerRegistry       *power.Registry
 	reimageOrchestrator *reimage.Orchestrator
+	sessionSecret       []byte // HMAC key for browser session tokens
 	router              chi.Router
 	http                *http.Server
 	logsHandler         *handlers.LogsHandler
@@ -75,6 +81,20 @@ func New(cfg config.ServerConfig, database *db.DB) *Server {
 
 	shells := image.NewShellManager(database, cfg.ImageDir, log.Logger)
 	buildProg := NewBuildProgressStore(cfg.ImageDir)
+
+	// Resolve or generate the session HMAC secret.
+	var secret []byte
+	if cfg.SessionSecret != "" {
+		secret = []byte(cfg.SessionSecret)
+	} else {
+		var err error
+		secret, err = generateSessionSecret()
+		if err != nil {
+			log.Fatal().Err(err).Msg("server: failed to generate session secret")
+		}
+		log.Warn().Msg("CLONR_SESSION_SECRET not set — generated ephemeral session secret (sessions will not survive restarts)")
+	}
+
 	s := &Server{
 		cfg:                 cfg,
 		db:                  database,
@@ -85,6 +105,7 @@ func New(cfg config.ServerConfig, database *db.DB) *Server {
 		powerCache:          NewPowerCache(15 * time.Second),
 		powerRegistry:       registry,
 		reimageOrchestrator: reimageOrch,
+		sessionSecret:       secret,
 	}
 	s.router = s.buildRouter()
 	s.http = &http.Server{
@@ -154,6 +175,10 @@ func (s *Server) buildRouter() chi.Router {
 	// apiKeyAuth is applied only to the /api/v1 subrouter below,
 	// so that the embedded web UI at / and /ui/* is always accessible.
 
+	// Build the auth handler — wire DB lookup and session sign/validate functions
+	// so the handler doesn't import the server package (avoids circular import).
+	authH := s.buildAuthHandler()
+
 	// Derive public server URL from listen addr for boot script generation.
 	// Use net.SplitHostPort to extract only the port from ListenAddr (which may
 	// be "0.0.0.0:8080"), then combine it with the PXE ServerIP.
@@ -211,12 +236,19 @@ func (s *Server) buildRouter() chi.Router {
 	fileServer := http.FileServer(http.FS(staticFS))
 	r.Handle("/ui/*", http.StripPrefix("/ui", fileServer))
 	r.Get("/", serveIndex(staticFS))
+	// /login — dedicated login page (served from same static FS as the main UI).
+	r.Get("/login", serveLoginPage(staticFS))
 
 	r.Route("/api/v1", func(r chi.Router) {
-		// All /api/v1 routes: resolve the API key scope from the Bearer token.
-		// Public endpoints (boot files, node register, logs) accept node-scope keys
-		// OR unauthenticated requests (nodes may not yet have a key at PXE time).
-		r.Use(apiKeyAuth(s.db, s.cfg.AuthDevMode))
+		// All /api/v1 routes: resolve the API key scope from the Bearer token
+		// or the session cookie (ADR-0006). Public endpoints (boot files, node
+		// register, logs) accept node-scope keys OR unauthenticated requests.
+		r.Use(apiKeyAuth(s.db, s.cfg.AuthDevMode, s.sessionSecret, s.cfg.SessionSecure))
+
+		// Auth endpoints — no scope required (login is pre-auth by definition).
+		r.Post("/auth/login", authH.HandleLogin)
+		r.Post("/auth/logout", authH.HandleLogout)
+		r.Get("/auth/me", authH.HandleMe)
 
 		// Fully public — no key required (PXE-booted nodes before any key is issued).
 		r.Get("/boot/ipxe", boot.ServeIPXEScript)
@@ -333,6 +365,95 @@ func (s *Server) buildRouter() chi.Router {
 	})
 
 	return r
+}
+
+// serveLoginPage serves login.html from the embedded static FS.
+func serveLoginPage(staticFS fs.FS) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		f, err := staticFS.Open("login.html")
+		if err != nil {
+			http.Error(w, "login page not found", http.StatusNotFound)
+			return
+		}
+		defer f.Close()
+		stat, err := f.Stat()
+		if err != nil {
+			http.Error(w, "login page not found", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		http.ServeContent(w, r, "login.html", stat.ModTime(), f.(io.ReadSeeker))
+	}
+}
+
+// buildAuthHandler constructs the AuthHandler with closures that call into
+// the server's DB and session-signing functions. This avoids the handlers
+// package importing the server package (which would be circular).
+func (s *Server) buildAuthHandler() *handlers.AuthHandler {
+	const cookieName = "clonr_session"
+
+	loginFn := func(rawKey string) (keyPrefix string, scope string, ok bool) {
+		// Strip typed prefix before hashing, same as apiKeyAuth middleware.
+		hashInput := rawKey
+		for _, pfx := range []string{"clonr-admin-", "clonr-node-"} {
+			if strings.HasPrefix(rawKey, pfx) {
+				hashInput = strings.TrimPrefix(rawKey, pfx)
+				break
+			}
+		}
+		h := sha256.Sum256([]byte(hashInput))
+		hashHex := fmt.Sprintf("%x", h)
+		sc, err := s.db.LookupAPIKey(context.Background(), hashHex)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return "", "", false
+			}
+			log.Error().Err(err).Msg("auth handler: db lookup failed")
+			return "", "", false
+		}
+		// Login only allows admin-scope keys.
+		if sc != api.KeyScopeAdmin {
+			return "", "", false
+		}
+		kid := hashInput
+		if len(kid) > 8 {
+			kid = kid[:8]
+		}
+		return kid, string(sc), true
+	}
+
+	signFn := func(keyPrefix string) (string, time.Time, error) {
+		p := newSessionPayload(keyPrefix)
+		token, err := signSessionToken(s.sessionSecret, p)
+		if err != nil {
+			return "", time.Time{}, err
+		}
+		return token, time.Unix(p.EXP, 0), nil
+	}
+
+	validateFn := func(token string) (scope string, exp time.Time, needsReissue bool, newToken string, ok bool) {
+		result, err := validateSessionToken(s.sessionSecret, token)
+		if err != nil {
+			return "", time.Time{}, false, "", false
+		}
+		reissued := ""
+		if result.needsReissue {
+			slid := slideSessionPayload(result.payload)
+			if t, serr := signSessionToken(s.sessionSecret, slid); serr == nil {
+				reissued = t
+				result.payload = slid
+			}
+		}
+		return result.payload.Scope, time.Unix(result.payload.EXP, 0), result.needsReissue, reissued, true
+	}
+
+	return &handlers.AuthHandler{
+		Login:      loginFn,
+		Sign:       signFn,
+		Validate:   validateFn,
+		CookieName: cookieName,
+		Secure:     s.cfg.SessionSecure,
+	}
 }
 
 // serveIndex serves index.html from the embedded static FS.

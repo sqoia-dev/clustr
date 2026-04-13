@@ -27,15 +27,20 @@ func scopeFromContext(ctx context.Context) api.KeyScope {
 	return v
 }
 
-// apiKeyAuth returns a middleware that resolves the API key scope from the
-// Bearer token, stores it in the context, and continues.
+// apiKeyAuth returns a middleware that resolves the auth scope from either:
+//  1. The session cookie (clonr_session) validated via HMAC — cookie takes precedence.
+//  2. The Authorization: Bearer token — SHA-256 hash lookup against api_keys table.
 //
 // This middleware does NOT reject unauthenticated requests — it is a resolver.
 // Use requireScope to enforce a minimum scope on specific route groups.
 //
+// When a session cookie is valid and needs sliding, the middleware re-signs and
+// re-issues the cookie transparently before passing to the next handler.
+//
 // Dev-mode escape hatch: if CLONR_AUTH_DEV_MODE=1 is explicitly set,
 // all requests are treated as admin scope. Never the default.
-func apiKeyAuth(database *db.DB, devMode bool) func(http.Handler) http.Handler {
+func apiKeyAuth(database *db.DB, devMode bool, sessionSecret []byte, sessionSecure bool) func(http.Handler) http.Handler {
+	const cookieName = "clonr_session"
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if devMode {
@@ -44,9 +49,48 @@ func apiKeyAuth(database *db.DB, devMode bool) func(http.Handler) http.Handler {
 				return
 			}
 
+			// --- Source 1: session cookie ---
+			if len(sessionSecret) > 0 {
+				if c, err := r.Cookie(cookieName); err == nil && c.Value != "" {
+					result, verr := validateSessionToken(sessionSecret, c.Value)
+					if verr == nil {
+						// Valid session — slide if needed.
+						if result.needsReissue {
+							slid := slideSessionPayload(result.payload)
+							if newToken, serr := signSessionToken(sessionSecret, slid); serr == nil {
+								cookieExp := time.Unix(slid.EXP, 0)
+								http.SetCookie(w, &http.Cookie{
+									Name:     cookieName,
+									Value:    newToken,
+									Path:     "/",
+									HttpOnly: true,
+									Secure:   sessionSecure,
+									SameSite: http.SameSiteStrictMode,
+									MaxAge:   int(time.Until(cookieExp).Seconds()),
+								})
+							}
+						}
+						ctx := context.WithValue(r.Context(), ctxKeyScope{}, api.KeyScope(result.payload.Scope))
+						next.ServeHTTP(w, r.WithContext(ctx))
+						return
+					}
+					// Cookie present but invalid/expired — clear it and fall through.
+					http.SetCookie(w, &http.Cookie{
+						Name:     cookieName,
+						Value:    "",
+						Path:     "/",
+						HttpOnly: true,
+						Secure:   sessionSecure,
+						SameSite: http.SameSiteStrictMode,
+						MaxAge:   -1,
+					})
+				}
+			}
+
+			// --- Source 2: Bearer token ---
 			raw := extractBearerToken(r)
 			if raw == "" {
-				// No key provided — pass through with empty scope.
+				// No auth provided — pass through with empty scope.
 				// requireScope will reject if the route needs auth.
 				next.ServeHTTP(w, r)
 				return
@@ -86,16 +130,25 @@ func apiKeyAuth(database *db.DB, devMode bool) func(http.Handler) http.Handler {
 // requireScope returns a middleware that enforces a minimum scope on the route.
 // It must be placed after apiKeyAuth in the middleware chain (which populates the context).
 // adminOnly=true → only admin keys pass; adminOnly=false → both admin and node keys pass.
+//
+// Unauthenticated requests (empty scope) always get 401.
+// Authenticated requests with insufficient scope get 403.
 func requireScope(adminOnly bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			scope := scopeFromContext(r.Context())
+			// No credentials at all → 401 Unauthorized.
+			if scope == "" {
+				writeUnauthorized(w, "authentication required")
+				return
+			}
+			// Valid scope but insufficient level → 403 Forbidden.
 			if adminOnly && scope != api.KeyScopeAdmin {
 				writeForbidden(w, "this route requires an admin-scope API key")
 				return
 			}
 			if scope != api.KeyScopeAdmin && scope != api.KeyScopeNode {
-				writeUnauthorized(w, "unrecognized scope")
+				writeForbidden(w, "unrecognized scope")
 				return
 			}
 			next.ServeHTTP(w, r)

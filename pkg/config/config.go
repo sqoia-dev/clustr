@@ -11,14 +11,16 @@ import (
 // ServerConfig holds all runtime configuration for clonr-serverd.
 // Values can be loaded from a JSON file or from environment variables.
 type ServerConfig struct {
-	ListenAddr   string        `json:"listen_addr"`   // default ":8080"
-	ImageDir     string        `json:"image_dir"`     // default "/var/lib/clonr/images"
-	DBPath       string        `json:"db_path"`       // default "/var/lib/clonr/clonr.db"
-	AuthToken    string        `json:"auth_token"`    // legacy: from CLONR_AUTH_TOKEN; superseded by api_keys table
-	AuthDevMode  bool          `json:"auth_dev_mode"` // from CLONR_AUTH_DEV_MODE=1; bypasses auth for local dev ONLY
-	LogLevel     string        `json:"log_level"`     // debug, info, warn, error — default "info"
-	LogRetention time.Duration `json:"log_retention"` // from CLONR_LOG_RETENTION; default 14d
-	PXE          PXEConfig     `json:"pxe"`
+	ListenAddr      string        `json:"listen_addr"`      // default ":8080"
+	ImageDir        string        `json:"image_dir"`        // default "/var/lib/clonr/images"
+	DBPath          string        `json:"db_path"`          // default "/var/lib/clonr/clonr.db"
+	AuthToken       string        `json:"auth_token"`       // legacy: from CLONR_AUTH_TOKEN; superseded by api_keys table
+	AuthDevMode     bool          `json:"auth_dev_mode"`    // from CLONR_AUTH_DEV_MODE=1; bypasses auth for local dev ONLY
+	SessionSecret   string        `json:"session_secret"`   // CLONR_SESSION_SECRET: HMAC key for browser session tokens (32+ bytes)
+	SessionSecure   bool          `json:"session_secure"`   // CLONR_SESSION_SECURE=1: set Secure flag on session cookie (requires TLS)
+	LogLevel        string        `json:"log_level"`        // debug, info, warn, error — default "info"
+	LogRetention    time.Duration `json:"log_retention"`    // from CLONR_LOG_RETENTION; default 14d
+	PXE             PXEConfig     `json:"pxe"`
 }
 
 // PXEConfig holds configuration for the built-in PXE (DHCP + TFTP) server.
@@ -56,14 +58,16 @@ type Config struct {
 // sensible production defaults. Environment variables take precedence over defaults.
 func LoadServerConfig() ServerConfig {
 	return ServerConfig{
-		ListenAddr:   envOrDefault("CLONR_LISTEN_ADDR", ":8080"),
-		ImageDir:     envOrDefault("CLONR_IMAGE_DIR", "/var/lib/clonr/images"),
-		DBPath:       envOrDefault("CLONR_DB_PATH", "/var/lib/clonr/clonr.db"),
-		AuthToken:    os.Getenv("CLONR_AUTH_TOKEN"), // legacy, no longer used for auth enforcement
-		AuthDevMode:  os.Getenv("CLONR_AUTH_DEV_MODE") == "1",
-		LogLevel:     envOrDefault("CLONR_LOG_LEVEL", "info"),
-		LogRetention: parseLogRetention(),
-		PXE:          LoadPXEConfig(),
+		ListenAddr:    envOrDefault("CLONR_LISTEN_ADDR", ":8080"),
+		ImageDir:      envOrDefault("CLONR_IMAGE_DIR", "/var/lib/clonr/images"),
+		DBPath:        envOrDefault("CLONR_DB_PATH", "/var/lib/clonr/clonr.db"),
+		AuthToken:     os.Getenv("CLONR_AUTH_TOKEN"), // legacy, no longer used for auth enforcement
+		AuthDevMode:   os.Getenv("CLONR_AUTH_DEV_MODE") == "1",
+		SessionSecret: os.Getenv("CLONR_SESSION_SECRET"),
+		SessionSecure: os.Getenv("CLONR_SESSION_SECURE") == "1",
+		LogLevel:      envOrDefault("CLONR_LOG_LEVEL", "info"),
+		LogRetention:  parseLogRetention(),
+		PXE:           LoadPXEConfig(),
 	}
 }
 
