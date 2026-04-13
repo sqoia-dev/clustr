@@ -1044,9 +1044,14 @@ func (d *FilesystemDeployer) streamExtract(ctx context.Context, body io.Reader, 
 	//
 	// minBytesPerSec = 1024 (1 KB/s) — even a 1-Gbps LAN degraded to a crawl
 	// should sustain this; anything slower is a stall or dead connection.
-	// stallTimeout  = 5s — short enough to detect a dead connection quickly
-	// without false-positive triggering on transient scheduler jitter.
-	tw, watchCtx := newThroughputWatchdog(ctx, body, 1024, 5*time.Second)
+	// stallTimeout  = 120s — long enough to tolerate XFS metadata stalls during
+	// large-directory extraction on LVM thin-provisioned VM disks. The kernel
+	// module directory (~4700 files, 199MB) can cause XFS to stall for 30-60s
+	// during journal commits on thin-provision volumes, producing zero bytes
+	// read from the HTTP body for that window. 30s was too aggressive and fired
+	// spuriously on this workload; 120s gives a safe margin while still
+	// detecting genuinely dead connections (true network failures stall forever).
+	tw, watchCtx := newThroughputWatchdog(ctx, body, 1024, 120*time.Second)
 	defer tw.stopWatchdog() // always stop the goroutine on return
 
 	// Set up the reader chain: body(watchdog) → [hasher tee] → progress → decompressor? → tar stdin.
@@ -1136,6 +1141,31 @@ func (d *FilesystemDeployer) streamExtract(ctx context.Context, body io.Reader, 
 
 	default:
 		log.Info().Msg("no compression magic detected — treating stream as uncompressed tar")
+	}
+
+	// Tune kernel VM parameters to prevent OOM kill of tar during large extracts.
+	// By default, Linux allows dirty page cache to grow to 20% of RAM (dirty_ratio)
+	// before blocking writers. On a 4 GB VM with no swap, this means ~800 MB of
+	// dirty XFS pages can accumulate before the kernel flushes — sufficient to
+	// trigger the OOM killer on the tar process when combined with initramfs
+	// overhead. Lowering dirty_ratio to 5% (200 MB) and dirty_background_ratio to
+	// 3% (120 MB) forces more frequent writeback, keeping memory pressure low
+	// during the entire 1.4 GB streaming extract.
+	//
+	// These are best-effort: if /proc/sys is not writable (non-initramfs env,
+	// permission denied) we log a warning and continue — the deploy will still work
+	// on hosts with sufficient RAM or swap, just may OOM on resource-constrained
+	// initramfs environments.
+	for _, kv := range []struct{ path, value string }{
+		{"/proc/sys/vm/dirty_ratio", "5"},
+		{"/proc/sys/vm/dirty_background_ratio", "3"},
+		{"/proc/sys/vm/dirty_writeback_centisecs", "100"},
+	} {
+		if err := os.WriteFile(kv.path, []byte(kv.value), 0644); err != nil {
+			log.Warn().Str("path", kv.path).Err(err).Msg("vm tuning: could not write sysctl (non-fatal)")
+		} else {
+			log.Info().Str("path", kv.path).Str("value", kv.value).Msg("vm tuning: sysctl applied")
+		}
 	}
 
 	// tar -xvf - streams each extracted filename to stdout, which we scan and log
