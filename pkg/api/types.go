@@ -34,6 +34,19 @@ const (
 	ImageFormatBlock      ImageFormat = "block"      // raw block device image (partclone/dd)
 )
 
+// ImageFirmware identifies the firmware interface the image was built for.
+// Allowed values: "uefi" (default, OVMF/EDK2) and "bios" (legacy SeaBIOS / i386-pc GRUB).
+type ImageFirmware string
+
+const (
+	// FirmwareUEFI is the default — OVMF pflash drives in QEMU, efibootmgr on deploy.
+	FirmwareUEFI ImageFirmware = "uefi"
+	// FirmwareBIOS targets legacy BIOS nodes: SeaBIOS in the installer VM,
+	// grub2-install --target=i386-pc at deploy time. GPT+biosboot partition is used
+	// so disks >2 TB are supported.
+	FirmwareBIOS ImageFirmware = "bios"
+)
+
 // FstabEntry describes a single mount to add to /etc/fstab during finalization.
 // Entries are stored on NodeConfig and NodeGroup; the effective list is the
 // group entries merged with node entries (node overrides group by mount point).
@@ -116,29 +129,33 @@ type Bootloader struct {
 // BaseImage is a deployable OS image, stripped of all node-specific identity.
 // It is immutable once finalized (Status == ImageStatusReady).
 type BaseImage struct {
-	ID           string      `json:"id"`
-	Name         string      `json:"name"`
-	Version      string      `json:"version"`
-	OS           string      `json:"os"`
-	Arch         string      `json:"arch"`
-	Status       ImageStatus `json:"status"`
-	Format       ImageFormat `json:"format"`
-	SizeBytes    int64       `json:"size_bytes"`
-	Checksum     string      `json:"checksum"`     // sha256 hex of the blob
-	DiskLayout   DiskLayout  `json:"disk_layout"`
-	Tags         []string    `json:"tags"`
-	SourceURL    string      `json:"source_url,omitempty"`
-	Notes        string      `json:"notes"`
-	ErrorMessage string      `json:"error_message,omitempty"`
+	ID           string        `json:"id"`
+	Name         string        `json:"name"`
+	Version      string        `json:"version"`
+	OS           string        `json:"os"`
+	Arch         string        `json:"arch"`
+	Status       ImageStatus   `json:"status"`
+	Format       ImageFormat   `json:"format"`
+	// Firmware identifies the firmware interface this image was built for.
+	// "uefi" (default) or "bios" (legacy). Existing images without this field
+	// stored default to "uefi" via the DB column DEFAULT.
+	Firmware     ImageFirmware `json:"firmware"`
+	SizeBytes    int64         `json:"size_bytes"`
+	Checksum     string        `json:"checksum"`     // sha256 hex of the blob
+	DiskLayout   DiskLayout    `json:"disk_layout"`
+	Tags         []string      `json:"tags"`
+	SourceURL    string        `json:"source_url,omitempty"`
+	Notes        string        `json:"notes"`
+	ErrorMessage string        `json:"error_message,omitempty"`
 	// BuildMethod identifies how the image was created: "pull", "import", "capture", "iso".
 	// Used by the UI to decide which detail view to show (e.g. build progress panel).
-	BuildMethod  string      `json:"build_method,omitempty"`
+	BuildMethod  string        `json:"build_method,omitempty"`
 	// BuiltForRoles holds the HPC role IDs that were selected when the image was
 	// built via the Build from ISO flow. Used by the node-assignment UI to warn
 	// when a node's role tag doesn't match the image's built-for roles.
-	BuiltForRoles []string   `json:"built_for_roles,omitempty"`
-	CreatedAt    time.Time   `json:"created_at"`
-	FinalizedAt  *time.Time  `json:"finalized_at,omitempty"`
+	BuiltForRoles []string     `json:"built_for_roles,omitempty"`
+	CreatedAt    time.Time     `json:"created_at"`
+	FinalizedAt  *time.Time    `json:"finalized_at,omitempty"`
 }
 
 // InterfaceConfig holds the static network configuration for one NIC on a node.
@@ -742,6 +759,15 @@ type BuildFromISORequest struct {
 	// When omitted, the root account uses a fixed per-build hash and no user
 	// directive is emitted.
 	DefaultPassword string `json:"default_password,omitempty"`
+
+	// Firmware selects the firmware mode for the installer VM and resulting image.
+	// Allowed values: "uefi" (default) and "bios" (legacy SeaBIOS). When empty,
+	// "uefi" is assumed for backward compatibility.
+	// - "uefi": OVMF pflash drives are passed to QEMU; ESP partition is created;
+	//   efibootmgr is used during finalization.
+	// - "bios": SeaBIOS (-bios flag) is used; a biosboot GPT partition is created;
+	//   grub2-install --target=i386-pc is run during finalization.
+	Firmware string `json:"firmware,omitempty"`
 
 	// Tags is an optional list of string tags attached to the resulting image.
 	Tags []string `json:"tags,omitempty"`

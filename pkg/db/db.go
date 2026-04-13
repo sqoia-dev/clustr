@@ -133,15 +133,20 @@ func (db *DB) CreateBaseImage(ctx context.Context, img api.BaseImage) error {
 		return fmt.Errorf("db: marshal built_for_roles: %w", err)
 	}
 
+	firmware := string(img.Firmware)
+	if firmware == "" {
+		firmware = "uefi"
+	}
+
 	_, err = db.sql.ExecContext(ctx, `
 		INSERT INTO base_images
-			(id, name, version, os, arch, status, format, size_bytes, checksum,
+			(id, name, version, os, arch, status, format, firmware, size_bytes, checksum,
 			 blob_path, disk_layout, tags, source_url, notes, error_message,
 			 built_for_roles, build_method, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		img.ID, img.Name, img.Version, img.OS, img.Arch,
-		string(img.Status), string(img.Format),
+		string(img.Status), string(img.Format), firmware,
 		img.SizeBytes, img.Checksum, "",
 		string(diskLayout), string(tags),
 		img.SourceURL, img.Notes, img.ErrorMessage,
@@ -157,7 +162,7 @@ func (db *DB) CreateBaseImage(ctx context.Context, img api.BaseImage) error {
 // GetBaseImage retrieves a single BaseImage by ID.
 func (db *DB) GetBaseImage(ctx context.Context, id string) (api.BaseImage, error) {
 	row := db.sql.QueryRowContext(ctx, `
-		SELECT id, name, version, os, arch, status, format, size_bytes, checksum,
+		SELECT id, name, version, os, arch, status, format, firmware, size_bytes, checksum,
 		       blob_path, disk_layout, tags, source_url, notes, error_message,
 		       built_for_roles, build_method, created_at, finalized_at
 		FROM base_images WHERE id = ?
@@ -195,14 +200,14 @@ func (db *DB) ListBaseImages(ctx context.Context, status string) ([]api.BaseImag
 
 	if status != "" {
 		rows, err = db.sql.QueryContext(ctx, `
-			SELECT id, name, version, os, arch, status, format, size_bytes, checksum,
+			SELECT id, name, version, os, arch, status, format, firmware, size_bytes, checksum,
 			       blob_path, disk_layout, tags, source_url, notes, error_message,
 			       built_for_roles, build_method, created_at, finalized_at
 			FROM base_images WHERE status = ? ORDER BY created_at DESC
 		`, status)
 	} else {
 		rows, err = db.sql.QueryContext(ctx, `
-			SELECT id, name, version, os, arch, status, format, size_bytes, checksum,
+			SELECT id, name, version, os, arch, status, format, firmware, size_bytes, checksum,
 			       blob_path, disk_layout, tags, source_url, notes, error_message,
 			       built_for_roles, build_method, created_at, finalized_at
 			FROM base_images ORDER BY created_at DESC
@@ -836,6 +841,7 @@ func scanBaseImage(s scanner) (api.BaseImage, error) {
 		img                api.BaseImage
 		status             string
 		format             string
+		firmware           string
 		diskLayoutJSON     string
 		tagsJSON           string
 		builtForRolesJSON  string
@@ -846,7 +852,7 @@ func scanBaseImage(s scanner) (api.BaseImage, error) {
 
 	err := s.Scan(
 		&img.ID, &img.Name, &img.Version, &img.OS, &img.Arch,
-		&status, &format,
+		&status, &format, &firmware,
 		&img.SizeBytes, &img.Checksum, &blobPath,
 		&diskLayoutJSON, &tagsJSON,
 		&img.SourceURL, &img.Notes, &img.ErrorMessage,
@@ -862,6 +868,10 @@ func scanBaseImage(s scanner) (api.BaseImage, error) {
 
 	img.Status = api.ImageStatus(status)
 	img.Format = api.ImageFormat(format)
+	if firmware == "" {
+		firmware = "uefi"
+	}
+	img.Firmware = api.ImageFirmware(firmware)
 	img.CreatedAt = time.Unix(createdAtUnix, 0).UTC()
 	if finalizedAtUnix.Valid {
 		t := time.Unix(finalizedAtUnix.Int64, 0).UTC()
