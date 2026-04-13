@@ -116,6 +116,29 @@ This is the version that gets shown to the world. It must actually work on real 
 
 ---
 
+---
+
+### Multi-disk and RAID Support
+
+Code-level analysis findings from parallel clone test (2026-04-12). These inform sequencing across v1.0, v1.1, and Sprint 2.
+
+**RAID1 — fully wired end-to-end** ✅ v1.0  
+RAID1 is complete from recommender through deploy. The recommender heuristic in `pkg/image/layout/recommend.go` identifies two-disk same-size configurations and emits a RAID1 layout. `deploy/raid.go` assembles the array with `mdadm` and hands it to the filesystem deploy path. No gaps for the two-disk case.
+
+**RAID5 / RAID6 / RAID10 — mechanically supported, no recommender heuristic** — v1.1 gap  
+`deploy/raid.go` has the mdadm invocations and parity logic for RAID5, RAID6, and RAID10. The recommender switch at `pkg/image/layout/recommend.go:121-143` has no cases for these levels — an operator can request them via explicit layout spec but the server will never auto-recommend them. This is the right conservative default for v1.0; the heuristics need to be added in v1.1 once we have real multi-disk test data.
+
+**"Leave non-OS disks untouched" policy — operator UX gap** — Sprint 2 ticket  
+There is currently no way for an operator to declare that `sdb`, `sdc`, etc. should not be touched during deploy. The recommender will attempt to use all discovered disks. For nodes with existing data volumes, scratch disks, or dedicated swap partitions, this is a correctness risk. Recommended fix: add a `DiskRole` annotation to `NodeConfig` (e.g., `role: os | data | scratch | skip`) or an explicit opt-in flag per disk. Until this is in place, operators must ensure only the target OS disk is visible during PXE deploy.
+
+**`identicalSize` helper needs an N-disk variant** — Sprint 2 ticket, S effort  
+The current helper checks two-disk size equality. Unlocking three- and four-disk heuristics (RAID5, RAID6, RAID10 auto-recommend) requires an N-disk variant. Straightforward change, gates the v1.1 recommender expansion.
+
+**Bare-metal SCSI transport detection gap** — v1.1  
+`pkg/hardware/disk.go` does not distinguish SCSI transport variants (SAS vs. SATA vs. NVMe-over-Fabric). Disk ordering and recommended layout can differ materially between transport types on real HPC hardware. The gap is benign for the lab (all virtio/SATA), but needs closing before production bare-metal validation at the v1.1 scale target.
+
+---
+
 ### v1.2 "Polish" — Hardening and Enterprise Readiness
 
 - Delta images: content-addressed overlay layers (server-side assembly, node receives full rootfs)
