@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -43,11 +44,44 @@ type CaptureRequest struct {
 	ExcludePaths []string // rsync --exclude patterns
 }
 
+// BuildProgressReporter is the interface Factory uses to report ISO build progress.
+// Implemented by *server.BuildProgressStore via *server.BuildHandle; when nil,
+// progress reporting is silently skipped (non-ISO builds).
+type BuildProgressReporter interface {
+	// Start registers a new build and returns a handle for the factory to push
+	// phase/progress/serial-line events.
+	Start(imageID string) BuildHandle
+}
+
+// BuildHandle is the per-build progress handle returned by BuildProgressReporter.Start.
+type BuildHandle interface {
+	SetPhase(phase string)
+	SetProgress(done, total int64)
+	AddSerialLine(line string)
+	AddStderrLine(line string)
+	Fail(msg string)
+	Complete()
+}
+
+// noopBuildHandle is used when no BuildProgressReporter is wired in.
+type noopBuildHandle struct{}
+
+func (noopBuildHandle) SetPhase(_ string)          {}
+func (noopBuildHandle) SetProgress(_, _ int64)     {}
+func (noopBuildHandle) AddSerialLine(_ string)      {}
+func (noopBuildHandle) AddStderrLine(_ string)      {}
+func (noopBuildHandle) Fail(_ string)               {}
+func (noopBuildHandle) Complete()                   {}
+
 // Factory turns raw inputs into finalized BaseImages stored under ImageDir.
 type Factory struct {
-	Store    *db.DB
-	ImageDir string
-	Logger   zerolog.Logger
+	Store         *db.DB
+	ImageDir      string
+	Logger        zerolog.Logger
+	// BuildProgress, when non-nil, receives phase/progress/serial events during
+	// ISO builds so the admin can monitor the VM installer in real time.
+	// Wire in *server.BuildProgressStore via an adapter (see server.go).
+	BuildProgress BuildProgressReporter
 }
 
 // PullImage downloads a cloud image from a URL, extracts/mounts it, copies
@@ -769,6 +803,106 @@ func downloadURL(ctx context.Context, rawURL string, dst *os.File) error {
 	return nil
 }
 
+// downloadURLWithProgress streams url into dst, calling onProgress(done,total)
+// periodically during the download. When Content-Length is not available,
+// total is -1. Throttled to at most one callback per second.
+func downloadURLWithProgress(ctx context.Context, rawURL string, dst *os.File, onProgress func(done, total int64)) error {
+	if err := validatePullURL(rawURL); err != nil {
+		return fmt.Errorf("URL validation: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("http get: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("HTTP %d from %s", resp.StatusCode, rawURL)
+	}
+
+	total := resp.ContentLength // -1 when unknown
+	var done int64
+	lastReport := time.Now()
+
+	buf := make([]byte, 256*1024)
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+				return fmt.Errorf("write: %w", writeErr)
+			}
+			done += int64(n)
+			if onProgress != nil && time.Since(lastReport) >= time.Second {
+				onProgress(done, total)
+				lastReport = time.Now()
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("read: %w", readErr)
+		}
+	}
+	if onProgress != nil {
+		onProgress(done, total)
+	}
+	return nil
+}
+
+// copyFile copies src to dst, creating dst if it does not exist.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
+}
+
+// buildManifest is the JSON structure persisted as build.json.
+type buildManifest struct {
+	ImageID     string        `json:"image_id"`
+	Distro      string        `json:"distro"`
+	RoleIDs     []string      `json:"role_ids,omitempty"`
+	SizeBytes   int64         `json:"size_bytes"`
+	Checksum    string        `json:"checksum"`
+	ElapsedSecs float64       `json:"elapsed_secs"`
+	BuiltAt     time.Time     `json:"built_at"`
+}
+
+// writeBuildManifest persists a build.json summary in imageRoot.
+func writeBuildManifest(imageRoot, imageID, distro string, roleIDs []string, sizeBytes int64, checksum string, elapsed time.Duration) error {
+	m := buildManifest{
+		ImageID:     imageID,
+		Distro:      distro,
+		RoleIDs:     roleIDs,
+		SizeBytes:   sizeBytes,
+		Checksum:    checksum,
+		ElapsedSecs: elapsed.Seconds(),
+		BuiltAt:     time.Now().UTC(),
+	}
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(imageRoot, "build.json"), data, 0o644)
+}
+
 // extractTar extracts a .tar.gz / .tgz / .tar into dst using the system tar.
 func extractTar(srcPath, dstPath string) error {
 	cmd := exec.Command("tar", "-xf", srcPath, "-C", dstPath)
@@ -1058,30 +1192,52 @@ func (f *Factory) BuildFromISO(ctx context.Context, req api.BuildFromISORequest)
 func (f *Factory) buildISOAsync(imageID string, req api.BuildFromISORequest, distro isoinstaller.Distro) {
 	ctx := context.Background()
 
+	// ── Progress handle ───────────────────────────────────────────────────
+	// Acquire a progress handle if a reporter is wired in; otherwise use the
+	// no-op handle so the rest of the function doesn't need nil checks.
+	var ph BuildHandle
+	if f.BuildProgress != nil {
+		ph = f.BuildProgress.Start(imageID)
+	} else {
+		ph = noopBuildHandle{}
+	}
+
+	// failBuild is a helper that marks the progress handle and DB record failed.
+	failBuild := func(msg string, err error) {
+		fullMsg := msg
+		if err != nil {
+			fullMsg = fmt.Sprintf("%s: %v", msg, err)
+		}
+		ph.Fail(fullMsg)
+		_ = f.Store.UpdateBaseImageStatus(ctx, imageID, api.ImageStatusError, fullMsg)
+	}
+
 	// ── Download ISO ──────────────────────────────────────────────────────
 	f.Logger.Info().Str("image_id", imageID).Str("url", req.URL).Msg("factory: downloading installer ISO")
+	ph.SetPhase("downloading_iso")
 
 	tmpISO, err := os.CreateTemp("", "clonr-iso-*.iso")
 	if err != nil {
 		f.Logger.Error().Err(err).Str("image_id", imageID).Msg("factory: create temp iso file")
-		_ = f.Store.UpdateBaseImageStatus(ctx, imageID, api.ImageStatusError, err.Error())
+		failBuild("create temp iso file", err)
 		return
 	}
 	tmpISO.Close()
 	defer os.Remove(tmpISO.Name())
 
-	// Re-open for writing.
+	// Re-open for writing with a counting writer so we can report download progress.
 	isoFile, err := os.OpenFile(tmpISO.Name(), os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		f.Logger.Error().Err(err).Str("image_id", imageID).Msg("factory: open temp iso file")
-		_ = f.Store.UpdateBaseImageStatus(ctx, imageID, api.ImageStatusError, err.Error())
+		failBuild("open temp iso file", err)
 		return
 	}
-	if err := downloadURL(ctx, req.URL, isoFile); err != nil {
+	if err := downloadURLWithProgress(ctx, req.URL, isoFile, func(done, total int64) {
+		ph.SetProgress(done, total)
+	}); err != nil {
 		isoFile.Close()
 		f.Logger.Error().Err(err).Str("image_id", imageID).Msg("factory: download ISO failed")
-		_ = f.Store.UpdateBaseImageStatus(ctx, imageID, api.ImageStatusError,
-			fmt.Sprintf("download ISO: %v", err))
+		failBuild("download ISO", err)
 		return
 	}
 	isoFile.Close()
@@ -1095,11 +1251,14 @@ func (f *Factory) buildISOAsync(imageID string, req api.BuildFromISORequest, dis
 		}
 	}
 
+	// ── Generating config ────────────────────────────────────────────────
+	ph.SetPhase("generating_config")
+
 	// ── Create work directory ─────────────────────────────────────────────
 	workDir, err := os.MkdirTemp("", "clonr-iso-build-*")
 	if err != nil {
 		f.Logger.Error().Err(err).Str("image_id", imageID).Msg("factory: create work dir")
-		_ = f.Store.UpdateBaseImageStatus(ctx, imageID, api.ImageStatusError, err.Error())
+		failBuild("create work dir", err)
 		return
 	}
 	defer os.RemoveAll(workDir)
@@ -1112,6 +1271,7 @@ func (f *Factory) buildISOAsync(imageID string, req api.BuildFromISORequest, dis
 		Int("memory_mb", req.MemoryMB).
 		Int("cpus", req.CPUs).
 		Msg("factory: launching installer VM")
+	ph.SetPhase("creating_disk")
 
 	// Extend the install timeout when OS updates are requested.
 	installTimeout := 30 * time.Minute
@@ -1131,13 +1291,26 @@ func (f *Factory) buildISOAsync(imageID string, req api.BuildFromISORequest, dis
 		CustomKickstart: req.CustomKickstart,
 		RoleIDs:         req.RoleIDs,
 		InstallUpdates:  req.InstallUpdates,
+		// Progress callbacks — feed events into the build handle.
+		OnPhase:       ph.SetPhase,
+		OnSerialLine:  ph.AddSerialLine,
+		OnStderrLine:  ph.AddStderrLine,
 	}
 
 	result, err := isoinstaller.Build(ctx, buildOpts)
+
+	// ── Persist build log regardless of success/failure ───────────────────
+	imageRoot := filepath.Join(f.ImageDir, imageID)
+	if mkErr := os.MkdirAll(imageRoot, 0o755); mkErr == nil {
+		if result != nil && result.SerialLogPath != "" {
+			destLog := filepath.Join(imageRoot, "build.log")
+			_ = copyFile(result.SerialLogPath, destLog)
+		}
+	}
+
 	if err != nil {
 		f.Logger.Error().Err(err).Str("image_id", imageID).Msg("factory: installer VM failed")
-		_ = f.Store.UpdateBaseImageStatus(ctx, imageID, api.ImageStatusError,
-			fmt.Sprintf("installer VM: %v", err))
+		failBuild("installer VM", err)
 		return
 	}
 
@@ -1148,11 +1321,11 @@ func (f *Factory) buildISOAsync(imageID string, req api.BuildFromISORequest, dis
 		Msg("factory: installer VM complete — extracting rootfs")
 
 	// ── Extract rootfs from installed disk ────────────────────────────────
-	imageRoot := filepath.Join(f.ImageDir, imageID)
+	ph.SetPhase("extracting")
 	rootfsPath := filepath.Join(imageRoot, "rootfs")
 	if err := os.MkdirAll(rootfsPath, 0o755); err != nil {
 		f.Logger.Error().Err(err).Str("image_id", imageID).Msg("factory: create rootfs dir")
-		_ = f.Store.UpdateBaseImageStatus(ctx, imageID, api.ImageStatusError, err.Error())
+		failBuild("create rootfs dir", err)
 		return
 	}
 
@@ -1162,8 +1335,7 @@ func (f *Factory) buildISOAsync(imageID string, req api.BuildFromISORequest, dis
 	}
 	if err := isoinstaller.ExtractRootfs(extractOpts); err != nil {
 		f.Logger.Error().Err(err).Str("image_id", imageID).Msg("factory: rootfs extraction failed")
-		_ = f.Store.UpdateBaseImageStatus(ctx, imageID, api.ImageStatusError,
-			fmt.Sprintf("extract rootfs: %v", err))
+		failBuild("extract rootfs", err)
 		return
 	}
 
@@ -1174,32 +1346,38 @@ func (f *Factory) buildISOAsync(imageID string, req api.BuildFromISORequest, dis
 	}
 
 	// ── Scrub identity ────────────────────────────────────────────────────
+	ph.SetPhase("scrubbing")
 	f.Logger.Info().Str("image_id", imageID).Msg("factory: scrubbing node identity")
 	if err := ScrubNodeIdentity(rootfsPath); err != nil {
 		f.Logger.Warn().Err(err).Str("image_id", imageID).Msg("factory: scrub had warnings (continuing)")
 	}
 
 	// ── Checksum ──────────────────────────────────────────────────────────
+	ph.SetPhase("finalizing")
 	f.Logger.Info().Str("image_id", imageID).Msg("factory: computing rootfs checksum")
 	size, checksum, err := checksumDir(rootfsPath)
 	if err != nil {
 		f.Logger.Error().Err(err).Str("image_id", imageID).Msg("factory: checksum failed")
-		_ = f.Store.UpdateBaseImageStatus(ctx, imageID, api.ImageStatusError, err.Error())
+		failBuild("checksum rootfs", err)
 		return
 	}
 
 	if err := f.Store.SetBlobPath(ctx, imageID, rootfsPath); err != nil {
 		f.Logger.Error().Err(err).Str("image_id", imageID).Msg("factory: set blob path")
-		_ = f.Store.UpdateBaseImageStatus(ctx, imageID, api.ImageStatusError, err.Error())
+		failBuild("set blob path", err)
 		return
 	}
 
 	if err := f.Store.FinalizeBaseImage(ctx, imageID, size, checksum); err != nil {
 		f.Logger.Error().Err(err).Str("image_id", imageID).Msg("factory: finalize failed")
-		_ = f.Store.UpdateBaseImageStatus(ctx, imageID, api.ImageStatusError, err.Error())
+		failBuild("finalize image", err)
 		return
 	}
 
+	// ── Persist build manifest ────────────────────────────────────────────
+	_ = writeBuildManifest(imageRoot, imageID, string(distro), req.RoleIDs, size, checksum, result.ElapsedTime)
+
+	ph.Complete()
 	f.Logger.Info().
 		Str("image_id", imageID).
 		Int64("size_bytes", size).
