@@ -40,6 +40,21 @@ func Validate(layout api.DiskLayout, targetDisk hardware.Disk) ValidationResult 
 		fillCount     int
 	)
 
+	// allowedFilesystems is the set of filesystem types supported by the deploy
+	// initramfs (mkfs.xfs, mkfs.ext4, mkfs.vfat, mkswap are the only tools
+	// present). "biosboot" and "" (none/raw) are also valid for special partitions.
+	allowedFilesystems := map[string]bool{
+		"xfs":      true,
+		"ext4":     true,
+		"vfat":     true,
+		"fat32":    true, // alias for vfat
+		"fat":      true, // alias for vfat
+		"swap":     true,
+		"biosboot": true,
+		"bios_grub": true,
+		"":         true, // none / raw / LVM PV — no mkfs run
+	}
+
 	for i, p := range layout.Partitions {
 		idx := i + 1
 
@@ -53,6 +68,43 @@ func Validate(layout api.DiskLayout, targetDisk hardware.Disk) ValidationResult 
 			}
 		} else {
 			fixedTotal += p.SizeBytes
+		}
+
+		// Filesystem type validation.
+		fs := strings.ToLower(p.Filesystem)
+		if !allowedFilesystems[fs] {
+			errs = append(errs, fmt.Sprintf(
+				"partition %d (%s): unsupported filesystem %q — must be one of: xfs, ext4, vfat, swap, biosboot, or empty (none/raw); btrfs is not available in the deploy initramfs",
+				idx, p.Label, p.Filesystem))
+		}
+
+		isESPMount := strings.ToLower(p.MountPoint) == "/boot/efi"
+		isESPFlag := false
+		for _, flag := range p.Flags {
+			if flag == "esp" || flag == "boot" {
+				isESPFlag = true
+			}
+		}
+		isESPFS := fs == "vfat" || fs == "fat32" || fs == "fat"
+
+		// ESP must be vfat — UEFI firmware can only read FAT filesystems.
+		if (isESPMount || isESPFlag) && !isESPFS && fs != "" {
+			errs = append(errs, fmt.Sprintf(
+				"partition %d (%s): ESP (EFI System Partition) must use filesystem vfat — UEFI firmware cannot read %q",
+				idx, p.Label, p.Filesystem))
+		}
+
+		// Swap mountpoint must use swap filesystem.
+		if strings.ToLower(p.MountPoint) == "swap" && fs != "swap" && fs != "" {
+			errs = append(errs, fmt.Sprintf(
+				"partition %d (%s): swap partition must use filesystem swap, not %q",
+				idx, p.Label, p.Filesystem))
+		}
+		// swap filesystem must be on a swap-designated partition.
+		if fs == "swap" && strings.ToLower(p.MountPoint) != "swap" && p.MountPoint != "" {
+			errs = append(errs, fmt.Sprintf(
+				"partition %d (%s): filesystem swap is only valid for swap partitions (mountpoint must be 'swap' or empty), got %q",
+				idx, p.Label, p.MountPoint))
 		}
 
 		switch strings.ToLower(p.MountPoint) {
@@ -75,10 +127,10 @@ func Validate(layout api.DiskLayout, targetDisk hardware.Disk) ValidationResult 
 			}
 		}
 
-		if p.Filesystem == "vfat" || p.Filesystem == "fat32" || p.Filesystem == "fat" {
+		if isESPFS {
 			hasESP = true
 		}
-		if p.Filesystem == "biosboot" || p.Filesystem == "bios_grub" {
+		if fs == "biosboot" || fs == "bios_grub" {
 			hasBIOSGrub = true
 		}
 	}

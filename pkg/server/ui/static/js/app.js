@@ -4124,8 +4124,8 @@ const Pages = {
                 </td>
                 <td>
                     <select onchange="Pages._layoutEditorUpdate(${i},'filesystem',this.value)">
-                        ${['xfs','ext4','vfat','swap','biosboot'].map(fs =>
-                            `<option value="${fs}" ${p.filesystem===fs?'selected':''}>${fs}</option>`).join('')}
+                        ${[['xfs','xfs'],['ext4','ext4'],['vfat','vfat (ESP/FAT)'],['swap','swap'],['biosboot','biosboot'],['','none (raw/LVM PV)']].map(([val,lbl]) =>
+                            `<option value="${val}" ${(p.filesystem||'')===val?'selected':''}>${lbl}</option>`).join('')}
                     </select>
                 </td>
                 <td><input type="text" value="${escHtml(p.mountpoint||'')}" onchange="Pages._layoutEditorUpdate(${i},'mountpoint',this.value)" style="width:90px"></td>
@@ -4230,8 +4230,8 @@ const Pages = {
                 <td><input type="text" value="${escHtml(p.label||'')}" onchange="Pages._layoutEditorUpdate(${i},'label',this.value)" style="width:90px"></td>
                 <td><input type="text" value="${p.size_bytes ? fmtBytes(p.size_bytes) : 'fill'}" onchange="Pages._layoutEditorParseSizeInput(${i},this.value)" style="width:80px"></td>
                 <td><select onchange="Pages._layoutEditorUpdate(${i},'filesystem',this.value)">${
-                    ['xfs','ext4','vfat','swap','biosboot'].map(fs =>
-                        `<option value="${fs}" ${p.filesystem===fs?'selected':''}>${fs}</option>`).join('')
+                    [['xfs','xfs'],['ext4','ext4'],['vfat','vfat (ESP/FAT)'],['swap','swap'],['biosboot','biosboot'],['','none (raw/LVM PV)']].map(([val,lbl]) =>
+                        `<option value="${val}" ${(p.filesystem||'')===val?'selected':''}>${lbl}</option>`).join('')
                 }</select></td>
                 <td><input type="text" value="${escHtml(p.mountpoint||'')}" onchange="Pages._layoutEditorUpdate(${i},'mountpoint',this.value)" style="width:90px"></td>
                 <td><button class="btn btn-danger btn-sm" onclick="Pages._layoutEditorRemoveRow(${i})" style="padding:2px 8px">✕</button></td>
@@ -4249,6 +4249,18 @@ const Pages = {
         if (!hasRoot) errs.push('Must have a / (root) partition');
         const fillCount = parts.filter(p => !p.size_bytes).length;
         if (fillCount > 1) errs.push('Only one partition may use "fill" (size_bytes = 0)');
+        // ESP must be vfat — UEFI firmware cannot read other filesystem types.
+        for (const p of parts) {
+            const isESP = p.mountpoint === '/boot/efi' || (p.flags || []).includes('esp');
+            const fs = (p.filesystem || '').toLowerCase();
+            if (isESP && fs !== '' && fs !== 'vfat' && fs !== 'fat32' && fs !== 'fat') {
+                errs.push(`ESP partition (${p.mountpoint || p.label || '/boot/efi'}) must use vfat — UEFI firmware cannot read "${p.filesystem}"`);
+            }
+            // Swap mountpoint must pair with swap filesystem.
+            if (p.mountpoint === 'swap' && fs !== '' && fs !== 'swap') {
+                errs.push(`Partition with mountpoint "swap" must use the swap filesystem, not "${p.filesystem}"`);
+            }
+        }
         warningsEl.innerHTML = errs.map(e => `<div class="alert alert-error" style="margin:2px 0;font-size:12px">${escHtml(e)}</div>`).join('');
         if (saveBtn) saveBtn.disabled = errs.length > 0;
     },
@@ -4923,8 +4935,8 @@ const Pages = {
             <td><input type="text" value="${p.size_bytes ? fmtBytes(p.size_bytes) : 'fill'}"
                 onchange="Pages._ngLayoutParseSize(${idx},this.value)" style="width:80px" placeholder="e.g. 100GB or fill"></td>
             <td><select onchange="Pages._ngLayoutUpdate(${idx},'filesystem',this.value)">
-                ${['xfs','ext4','vfat','swap','biosboot'].map(fs =>
-                    `<option value="${fs}" ${p.filesystem===fs?'selected':''}>${fs}</option>`).join('')}
+                ${[['xfs','xfs'],['ext4','ext4'],['vfat','vfat (ESP/FAT)'],['swap','swap'],['biosboot','biosboot'],['','none (raw/LVM PV)']].map(([val,lbl]) =>
+                    `<option value="${val}" ${(p.filesystem||'')===val?'selected':''}>${lbl}</option>`).join('')}
             </select></td>
             <td><input type="text" value="${escHtml(p.mountpoint||'')}"
                 onchange="Pages._ngLayoutUpdate(${idx},'mountpoint',this.value)" style="width:90px"></td>
