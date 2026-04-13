@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -380,6 +382,13 @@ func (h *ImagesHandler) DownloadBlob(w http.ResponseWriter, r *http.Request) {
 // streamFilesystemBlob tars the rootfs/ directory of a filesystem-format image
 // and streams it directly to the response writer as an uncompressed tar archive.
 // No Content-Length is set — the response is streamed.
+//
+// The tar subprocess is NOT bound to the request context. Binding it caused
+// SIGKILL mid-stream under concurrent load when the http.Server or an upstream
+// component cancelled the context (e.g. write deadline, client-side timeout).
+// Instead, we run tar freely and handle context cancellation manually: on client
+// disconnect we give tar 2 seconds to flush remaining buffered output, then kill.
+// A client disconnect is treated as informational, not a server error.
 func (h *ImagesHandler) streamFilesystemBlob(w http.ResponseWriter, r *http.Request, img api.BaseImage) {
 	rootfsPath := filepath.Join(h.ImageDir, img.ID, "rootfs")
 
@@ -398,13 +407,27 @@ func (h *ImagesHandler) streamFilesystemBlob(w http.ResponseWriter, r *http.Requ
 		Str("image_id", img.ID).
 		Str("format", string(img.Format)).
 		Str("client", r.RemoteAddr).
-		Msg("image blob streamed")
+		Msg("blob stream: starting tar")
 
 	w.Header().Set("Content-Type", "application/x-tar")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.tar"`, img.ID))
 	w.WriteHeader(http.StatusOK)
 
-	cmd := exec.CommandContext(r.Context(), "tar",
+	// Disable the per-request write deadline for this handler — the response is a
+	// large streaming tar archive and a global WriteTimeout would kill it mid-stream
+	// on slow links. http.ResponseController is available since Go 1.20.
+	if rc := http.NewResponseController(w); rc != nil {
+		_ = rc.SetWriteDeadline(time.Time{}) // zero = no deadline
+	}
+
+	// Wrap the response writer to count bytes streamed.
+	cw := &countWriter{w: w}
+
+	// Use exec.Command (no context) so the tar subprocess lifetime is NOT bound
+	// to the HTTP request context. Context cancellation (client disconnect, proxy
+	// timeout) was SIGKILL'ing tar mid-stream under concurrent load, delivering
+	// truncated archives to the deploy agents.
+	cmd := exec.Command("tar", //nolint:gosec
 		"-C", rootfsPath,
 		"--exclude=./proc/*",
 		"--exclude=./sys/*",
@@ -413,29 +436,49 @@ func (h *ImagesHandler) streamFilesystemBlob(w http.ResponseWriter, r *http.Requ
 		"-cf", "-",
 		".",
 	)
-	cmd.Stdout = w
-
-	var bytesWritten int64
-	// Wrap the response writer to count bytes streamed.
-	cw := &countWriter{w: w}
 	cmd.Stdout = cw
+	stderrBuf := &bytes.Buffer{}
+	cmd.Stderr = stderrBuf
 
-	if err := cmd.Run(); err != nil {
-		bytesWritten = cw.n
-		log.Error().
-			Err(err).
-			Str("image_id", img.ID).
-			Int64("bytes_written", bytesWritten).
-			Msg("blob stream: tar exited non-zero — response may be truncated")
+	if err := cmd.Start(); err != nil {
+		log.Error().Err(err).Str("image_id", img.ID).Msg("blob stream: tar start failed")
 		return
 	}
 
-	bytesWritten = cw.n
-	log.Info().
-		Str("image_id", img.ID).
-		Str("client", r.RemoteAddr).
-		Int64("bytes_written", bytesWritten).
-		Msg("blob stream: tar complete")
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	select {
+	case err := <-done:
+		// Tar finished naturally.
+		if err != nil {
+			// Real tar failure (not a client disconnect) — log stderr for diagnosis.
+			log.Error().
+				Err(err).
+				Str("image_id", img.ID).
+				Str("stderr", stderrBuf.String()).
+				Int64("bytes_written", cw.n).
+				Msg("blob stream: tar exited non-zero — response may be truncated")
+			return
+		}
+		log.Info().
+			Str("image_id", img.ID).
+			Str("client", r.RemoteAddr).
+			Int64("bytes_written", cw.n).
+			Msg("blob stream: tar complete")
+
+	case <-r.Context().Done():
+		// Client disconnected mid-stream — this is normal (e.g. agent restart,
+		// network blip). Give tar 2 seconds to flush buffered output, then kill.
+		timer := time.AfterFunc(2*time.Second, func() { _ = cmd.Process.Kill() })
+		defer timer.Stop()
+		<-done
+		log.Info().
+			Str("image_id", img.ID).
+			Str("client", r.RemoteAddr).
+			Int64("bytes_written", cw.n).
+			Msg("blob stream: client disconnected — cleanup complete")
+	}
 }
 
 // countWriter wraps an http.ResponseWriter and counts bytes written.
