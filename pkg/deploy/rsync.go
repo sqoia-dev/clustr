@@ -94,9 +94,10 @@ func (d *FilesystemDeployer) Deploy(ctx context.Context, opts DeployOpts, progre
 	// happen while we are busy with local disk operations. The body is buffered
 	// via an os.Pipe (64KB kernel buffer) so the server can push data ahead of us.
 	type blobResult struct {
-		resp       *http.Response
-		totalBytes int64
-		err        error
+		resp             *http.Response
+		totalBytes       int64
+		serverChecksum   string // X-Clonr-Blob-SHA256 response header, if present
+		err              error
 	}
 	blobCh := make(chan blobResult, 1)
 
@@ -120,7 +121,8 @@ func (d *FilesystemDeployer) Deploy(ctx context.Context, opts DeployOpts, progre
 			blobCh <- blobResult{err: fmt.Errorf("HTTP %d fetching blob from %s", resp.StatusCode, opts.ImageURL)}
 			return
 		}
-		blobCh <- blobResult{resp: resp, totalBytes: resp.ContentLength}
+		serverChecksum := resp.Header.Get("X-Clonr-Blob-SHA256")
+		blobCh <- blobResult{resp: resp, totalBytes: resp.ContentLength, serverChecksum: serverChecksum}
 	}()
 
 	// ── Rollback setup ────────────────────────────────────────────────────────
@@ -240,13 +242,35 @@ func (d *FilesystemDeployer) Deploy(ctx context.Context, opts DeployOpts, progre
 		logger().Info().Msg("image blob connection ready — extracting (unknown size)")
 	}
 
+	// Prefer the server-advertised tar checksum (X-Clonr-Blob-SHA256) over the
+	// image-record checksum (which for filesystem images is a directory-level hash,
+	// not a tar stream hash). If neither is available, skip verification with a warning.
+	expectedChecksum := opts.ExpectedChecksum
+	if blob.serverChecksum != "" {
+		if expectedChecksum != "" && expectedChecksum != blob.serverChecksum {
+			logger().Warn().
+				Str("img_checksum", expectedChecksum).
+				Str("server_header", blob.serverChecksum).
+				Msg("X-Clonr-Blob-SHA256 header differs from image record checksum — using header value (tar stream hash)")
+		}
+		expectedChecksum = blob.serverChecksum
+		logger().Info().Str("sha256", expectedChecksum).
+			Msg("using server-advertised tar checksum for integrity verification")
+	} else if expectedChecksum == "" {
+		logger().Warn().Msg("server did not advertise X-Clonr-Blob-SHA256 and no checksum in image record — skipping integrity verification")
+	}
+
+	// Update opts with the resolved checksum for streamExtract.
+	verifyOpts := opts
+	verifyOpts.ExpectedChecksum = expectedChecksum
+
 	// Signal downloading phase with byte total for real-time UI progress.
 	if opts.Reporter != nil {
 		opts.Reporter.StartPhase("downloading", blob.totalBytes)
 	}
 
-	needsVerify := !opts.SkipVerify && opts.ExpectedChecksum != ""
-	if opts.SkipVerify && opts.ExpectedChecksum != "" {
+	needsVerify := !opts.SkipVerify && expectedChecksum != ""
+	if opts.SkipVerify && expectedChecksum != "" {
 		logger().Warn().Msg("checksum verification skipped for image download (--skip-verify set)")
 	}
 
@@ -298,7 +322,7 @@ func (d *FilesystemDeployer) Deploy(ctx context.Context, opts DeployOpts, progre
 			bodyClose = func() { retryResp.Body.Close() }
 		}
 
-		extractErr = d.streamExtract(ctx, body, blob.totalBytes, opts, needsVerify, progress)
+		extractErr = d.streamExtract(ctx, body, blob.totalBytes, verifyOpts, needsVerify, progress)
 		bodyClose()
 		if extractErr == nil {
 			break

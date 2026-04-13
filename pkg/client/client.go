@@ -88,13 +88,22 @@ func (c *Client) GetNode(ctx context.Context, id string) (*api.NodeConfig, error
 	return &cfg, nil
 }
 
+// DownloadBlobResult holds the result of a blob download including any
+// server-advertised checksum for integrity verification.
+type DownloadBlobResult struct {
+	// ServerChecksum is the sha256 hex string from X-Clonr-Blob-SHA256, or ""
+	// if the server did not advertise one (e.g. first stream of a filesystem image).
+	ServerChecksum string
+}
+
 // DownloadBlob streams the image blob for imageID into w.
 // Uses a dedicated http.Client without a read timeout since blobs can be large.
-func (c *Client) DownloadBlob(ctx context.Context, imageID string, w io.Writer) error {
+// Returns a DownloadBlobResult with the server-advertised checksum (if any).
+func (c *Client) DownloadBlob(ctx context.Context, imageID string, w io.Writer) (*DownloadBlobResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		c.BaseURL+"/api/v1/images/"+imageID+"/blob", nil)
 	if err != nil {
-		return fmt.Errorf("client: build request: %w", err)
+		return nil, fmt.Errorf("client: build request: %w", err)
 	}
 	c.setHeaders(req)
 
@@ -102,18 +111,20 @@ func (c *Client) DownloadBlob(ctx context.Context, imageID string, w io.Writer) 
 	blobClient := &http.Client{}
 	resp, err := blobClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("client: download blob: %w", err)
+		return nil, fmt.Errorf("client: download blob: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return c.decodeError(resp)
+		return nil, c.decodeError(resp)
 	}
 
+	serverChecksum := resp.Header.Get("X-Clonr-Blob-SHA256")
+
 	if _, err := io.Copy(w, resp.Body); err != nil {
-		return fmt.Errorf("client: read blob: %w", err)
+		return nil, fmt.Errorf("client: read blob: %w", err)
 	}
-	return nil
+	return &DownloadBlobResult{ServerChecksum: serverChecksum}, nil
 }
 
 // ImportISOPath instructs the server to import an ISO from a server-local path.

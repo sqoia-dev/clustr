@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -429,8 +432,45 @@ func (h *ImagesHandler) DownloadBlob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// For block images, the DB checksum covers the blob file bytes directly —
+	// safe to advertise to the client for end-to-end integrity verification.
+	if img.Checksum != "" {
+		w.Header().Set("X-Clonr-Blob-SHA256", img.Checksum)
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	http.ServeContent(w, r, filepath.Base(blobPath), stat.ModTime(), f)
+}
+
+// tarChecksumPath returns the path of the tar-checksum sidecar file for a
+// filesystem-format image. The sidecar stores the sha256 of the tar stream
+// produced by streamFilesystemBlob. It is computed on the first successful
+// stream and reused on all subsequent streams.
+//
+// Sprint 1 compromise: the DB `checksum` column for filesystem images holds a
+// directory-level hash (file-by-file sha256 XOR), which does not match the tar
+// stream bytes. Until the image finalization step computes a canonical tar
+// checksum during build, we compute and cache it on first-stream here.
+func tarChecksumPath(imageDir, imageID string) string {
+	return filepath.Join(imageDir, imageID, "tar-sha256")
+}
+
+// loadTarChecksum reads the cached tar sha256 for imageID, returning "" if not
+// yet computed.
+func loadTarChecksum(imageDir, imageID string) string {
+	data, err := os.ReadFile(tarChecksumPath(imageDir, imageID))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// saveTarChecksum persists the tar sha256 to the sidecar file.
+func saveTarChecksum(imageDir, imageID, checksum string) {
+	path := tarChecksumPath(imageDir, imageID)
+	if err := os.WriteFile(path, []byte(checksum+"\n"), 0o644); err != nil {
+		log.Warn().Err(err).Str("image_id", imageID).Str("path", path).
+			Msg("blob stream: failed to persist tar checksum sidecar — next stream will recompute")
+	}
 }
 
 // streamFilesystemBlob tars the rootfs/ directory of a filesystem-format image
@@ -457,14 +497,30 @@ func (h *ImagesHandler) streamFilesystemBlob(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// If we have a cached tar checksum from a prior stream, advertise it so the
+	// deploy agent can verify end-to-end integrity. On the first stream the header
+	// is absent — the client treats a missing header as "no verification possible"
+	// and skips the check (with a warning). The sidecar is written after a
+	// successful stream so subsequent downloads get the header.
+	//
+	// Sprint 1 compromise: for filesystem images the DB `checksum` column is a
+	// directory-level hash (not a tar stream hash), so we maintain a separate
+	// sidecar file. See tarChecksumPath for details.
+	cachedTarChecksum := loadTarChecksum(h.ImageDir, img.ID)
+	computeTarChecksum := cachedTarChecksum == "" // only compute on first stream
+
 	log.Info().
 		Str("image_id", img.ID).
 		Str("format", string(img.Format)).
 		Str("client", r.RemoteAddr).
+		Bool("has_tar_checksum", cachedTarChecksum != "").
 		Msg("blob stream: starting tar")
 
 	w.Header().Set("Content-Type", "application/x-tar")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.tar"`, img.ID))
+	if cachedTarChecksum != "" {
+		w.Header().Set("X-Clonr-Blob-SHA256", cachedTarChecksum)
+	}
 	w.WriteHeader(http.StatusOK)
 
 	// Disable the per-request write deadline for this handler — the response is a
@@ -475,7 +531,16 @@ func (h *ImagesHandler) streamFilesystemBlob(w http.ResponseWriter, r *http.Requ
 	}
 
 	// Wrap the response writer to count bytes streamed.
-	cw := &countWriter{w: w}
+	// If this is the first stream, also tee through a sha256 hasher so we can
+	// cache the tar checksum for all subsequent streams.
+	baseWriter := &countWriter{w: w}
+	var tarHasher = sha256.New() // always created; only used when computeTarChecksum
+	var cw io.Writer
+	if computeTarChecksum {
+		cw = io.MultiWriter(baseWriter, tarHasher)
+	} else {
+		cw = baseWriter
+	}
 
 	// Use exec.Command (no context) so the tar subprocess lifetime is NOT bound
 	// to the HTTP request context. Context cancellation (client disconnect, proxy
@@ -511,15 +576,25 @@ func (h *ImagesHandler) streamFilesystemBlob(w http.ResponseWriter, r *http.Requ
 				Err(err).
 				Str("image_id", img.ID).
 				Str("stderr", stderrBuf.String()).
-				Int64("bytes_written", cw.n).
+				Int64("bytes_written", baseWriter.n).
 				Msg("blob stream: tar exited non-zero — response may be truncated")
 			return
 		}
 		log.Info().
 			Str("image_id", img.ID).
 			Str("client", r.RemoteAddr).
-			Int64("bytes_written", cw.n).
+			Int64("bytes_written", baseWriter.n).
 			Msg("blob stream: tar complete")
+
+		// On the first successful stream, persist the tar checksum sidecar so
+		// subsequent downloads can serve X-Clonr-Blob-SHA256 and clients can
+		// verify end-to-end integrity.
+		if computeTarChecksum {
+			checksum := hex.EncodeToString(tarHasher.Sum(nil))
+			saveTarChecksum(h.ImageDir, img.ID, checksum)
+			log.Info().Str("image_id", img.ID).Str("tar_sha256", checksum).
+				Msg("blob stream: tar checksum computed and cached (sidecar written)")
+		}
 
 	case <-r.Context().Done():
 		// Client disconnected mid-stream — this is normal (e.g. agent restart,
@@ -530,7 +605,7 @@ func (h *ImagesHandler) streamFilesystemBlob(w http.ResponseWriter, r *http.Requ
 		log.Info().
 			Str("image_id", img.ID).
 			Str("client", r.RemoteAddr).
-			Int64("bytes_written", cw.n).
+			Int64("bytes_written", baseWriter.n).
 			Msg("blob stream: client disconnected — cleanup complete")
 	}
 }
