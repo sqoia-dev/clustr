@@ -52,7 +52,18 @@ func apiKeyAuth(database *db.DB, devMode bool) func(http.Handler) http.Handler {
 				return
 			}
 
-			hash := sha256Hex(raw)
+			// Strip the typed prefix (clonr-admin- / clonr-node-) before hashing.
+			// The DB stores sha256(<raw-hex>) where raw-hex is the bare entropy;
+			// the full Bearer token is clonr-<scope>-<raw-hex>, so we strip the
+			// well-known prefixes before computing the lookup hash.
+			hashInput := raw
+			for _, pfx := range []string{"clonr-admin-", "clonr-node-"} {
+				if strings.HasPrefix(raw, pfx) {
+					hashInput = strings.TrimPrefix(raw, pfx)
+					break
+				}
+			}
+			hash := sha256Hex(hashInput)
 			scope, err := database.LookupAPIKey(r.Context(), hash)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
