@@ -1,0 +1,114 @@
+[Unit]
+Description=clonr Server
+After=network.target dev-pts.mount
+Wants=network.target dev-pts.mount
+
+[Service]
+Type=simple
+
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+# Ensure devpts is mounted before starting — required for systemd-nspawn shell sessions.
+ExecStartPre=/bin/bash -c "mountpoint -q /dev/pts || mount -t devpts devpts /dev/pts -o ptmxmode=666,mode=620,gid=5"
+ExecStart=/usr/local/bin/clonr-serverd --pxe
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+Environment=CLONR_LISTEN_ADDR=0.0.0.0:8080
+Environment=CLONR_IMAGE_DIR=/var/lib/clonr/images
+Environment=CLONR_DB_PATH=/var/lib/clonr/db/clonr.db
+Environment=CLONR_BOOT_DIR=/var/lib/clonr/boot
+Environment=CLONR_TFTP_DIR=/var/lib/clonr/tftpboot
+Environment=CLONR_PXE_ENABLED=true
+Environment=CLONR_PXE_INTERFACE=eth1
+Environment=CLONR_PXE_RANGE=10.99.0.100-10.99.0.200
+Environment=CLONR_PXE_SERVER_IP=10.99.0.1
+Environment=TMPDIR=/var/lib/clonr/tmp
+
+# ---------------------------------------------------------------------------
+# Restart policy
+# ---------------------------------------------------------------------------
+Restart=on-failure
+RestartSec=5s
+
+# ---------------------------------------------------------------------------
+# Resource limits
+# ---------------------------------------------------------------------------
+# 2G ceiling: if clonr-serverd is leaking or mishandling blob data it should
+# be killed fast rather than consuming all host memory.
+MemoryMax=2G
+
+# Deprioritise OOM kill — clonr-serverd is the control plane; let other
+# processes be killed first under memory pressure. Range: -1000..1000.
+OOMScoreAdjust=-500
+
+# ---------------------------------------------------------------------------
+# Security hardening
+# ---------------------------------------------------------------------------
+# Prevent the process from gaining new privileges via setuid/setcap binaries.
+NoNewPrivileges=true
+
+# Make / and /usr read-only. Exceptions are listed in ReadWritePaths below.
+ProtectSystem=strict
+
+# Prevent access to /home, /root.
+ProtectHome=true
+
+# Private /tmp and /var/tmp — isolates ISO build artifacts from other services.
+# NOTE: TMPDIR is set to /var/lib/clonr/tmp above, NOT /tmp, so clonr-serverd
+# writes ISO build files to the data volume, not the private /tmp. PrivateTmp
+# is safe here.
+PrivateTmp=true
+
+# Block access to kernel tunables (/proc/sys, /sys).
+ProtectKernelTunables=true
+
+# Prevent loading kernel modules.
+ProtectKernelModules=true
+
+# Block writes to cgroup control files.
+ProtectControlGroups=true
+
+# Explicit read-write paths required by clonr-serverd:
+#   /var/lib/clonr — all runtime data (DB, images, tftpboot, boot, tmp, iso-cache)
+#   /var/log/clonr — log files (may be written by future structured log config)
+#   /tmp           — systemd-nspawn needs a real /tmp in some paths; also Go runtime
+#   /run           — dnsmasq lease files, PID files if any
+#   /dev/pts       — devpts for nspawn pty allocation (ExecStartPre mounts this)
+ReadWritePaths=/var/lib/clonr /var/log/clonr /tmp /run /dev/pts
+
+# ---------------------------------------------------------------------------
+# Capabilities
+# ---------------------------------------------------------------------------
+# CAP_NET_BIND_SERVICE — bind privileged ports (DHCP/67, TFTP/69)
+# CAP_SYS_ADMIN        — required by systemd-nspawn for mount namespace creation
+#                        and by qemu-kvm for /dev/kvm access
+# CAP_MKNOD            — required by systemd-nspawn to create device nodes inside
+#                        the container namespace during shell sessions
+#
+# Note: ProtectKernelModules above implicitly drops CAP_SYS_MODULE which is
+# separate from CAP_SYS_ADMIN. We do not need module loading.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SYS_ADMIN CAP_MKNOD
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_SYS_ADMIN CAP_MKNOD
+
+# ---------------------------------------------------------------------------
+# Namespace policy
+# ---------------------------------------------------------------------------
+# systemd-nspawn (used for image shell sessions) requires the ability to create
+# mount and user namespaces. RestrictNamespaces=true would block it and break
+# the shell feature. We leave namespace creation unrestricted.
+RestrictNamespaces=false
+
+# ---------------------------------------------------------------------------
+# Device access
+# ---------------------------------------------------------------------------
+# ISO build pipeline uses qemu-kvm which requires /dev/kvm.
+# DeviceAllow grants rwm (read, write, mknod) on the character device.
+DevicePolicy=auto
+DeviceAllow=/dev/kvm rwm
+DeviceAllow=/dev/net/tun rwm
+
+[Install]
+WantedBy=multi-user.target
