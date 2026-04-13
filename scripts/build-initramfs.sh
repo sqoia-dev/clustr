@@ -355,6 +355,7 @@ ${transitive}"
         wipefs          # wipe existing filesystem signatures before re-partitioning
         blockdev        # sector count / disk size queries (util-linux)
         mkswap          # swap partition setup (util-linux)
+        blkid           # UUID lookup for fstab generation (util-linux) — finalize.go getUUID()
         grub2-install   # bootloader install into deployed OS MBR/EFI (chroot use)
         grub2-mkconfig  # generate /boot/grub2/grub.cfg inside chroot
         fsfreeze        # force filesystem log commit before unmount (prevents EBUSY on umount)
