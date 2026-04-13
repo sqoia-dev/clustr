@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io/fs"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -732,16 +733,50 @@ func (db *DB) GetActiveReimageForNode(ctx context.Context, nodeID string) (*api.
 
 // ─── ReimageRequest scan helpers ─────────────────────────────────────────────
 
+// scanNullableTimestamp converts a raw SQLite column value to *time.Time.
+// SQLite is dynamically typed: a column declared INTEGER may hold a TEXT value
+// if an older code path stored a formatted string instead of a Unix int64.
+// This helper handles both representations so we don't blow up on legacy rows.
+func scanNullableTimestamp(v any) (*time.Time, error) {
+	switch x := v.(type) {
+	case nil:
+		return nil, nil
+	case int64:
+		if x == 0 {
+			return nil, nil
+		}
+		t := time.Unix(x, 0).UTC()
+		return &t, nil
+	case string:
+		if x == "" {
+			return nil, nil
+		}
+		if n, err := strconv.ParseInt(x, 10, 64); err == nil {
+			t := time.Unix(n, 0).UTC()
+			return &t, nil
+		}
+		for _, layout := range []string{time.RFC3339, time.RFC3339Nano, "2006-01-02 15:04:05"} {
+			if t, err := time.Parse(layout, x); err == nil {
+				t = t.UTC()
+				return &t, nil
+			}
+		}
+		return nil, fmt.Errorf("db: unknown timestamp format: %q", x)
+	default:
+		return nil, fmt.Errorf("db: unexpected timestamp type %T", v)
+	}
+}
+
 func scanReimageRequest(s scanner) (api.ReimageRequest, error) {
 	var (
-		req            api.ReimageRequest
-		status         string
-		scheduledAt    sql.NullInt64
-		triggeredAt    sql.NullInt64
-		startedAt      sql.NullInt64
-		completedAt    sql.NullInt64
-		dryRunInt      int
-		createdAtUnix  int64
+		req           api.ReimageRequest
+		status        string
+		scheduledAt   any
+		triggeredAt   any
+		startedAt     any
+		completedAt   any
+		dryRunInt     int
+		createdAtUnix int64
 	)
 	err := s.Scan(
 		&req.ID, &req.NodeID, &req.ImageID, &status,
@@ -757,21 +792,19 @@ func scanReimageRequest(s scanner) (api.ReimageRequest, error) {
 	req.Status = api.ReimageStatus(status)
 	req.DryRun = dryRunInt != 0
 	req.CreatedAt = time.Unix(createdAtUnix, 0).UTC()
-	if scheduledAt.Valid {
-		t := time.Unix(scheduledAt.Int64, 0).UTC()
-		req.ScheduledAt = &t
+
+	var tsErr error
+	if req.ScheduledAt, tsErr = scanNullableTimestamp(scheduledAt); tsErr != nil {
+		return api.ReimageRequest{}, fmt.Errorf("db: scan reimage request scheduled_at: %w", tsErr)
 	}
-	if triggeredAt.Valid {
-		t := time.Unix(triggeredAt.Int64, 0).UTC()
-		req.TriggeredAt = &t
+	if req.TriggeredAt, tsErr = scanNullableTimestamp(triggeredAt); tsErr != nil {
+		return api.ReimageRequest{}, fmt.Errorf("db: scan reimage request triggered_at: %w", tsErr)
 	}
-	if startedAt.Valid {
-		t := time.Unix(startedAt.Int64, 0).UTC()
-		req.StartedAt = &t
+	if req.StartedAt, tsErr = scanNullableTimestamp(startedAt); tsErr != nil {
+		return api.ReimageRequest{}, fmt.Errorf("db: scan reimage request started_at: %w", tsErr)
 	}
-	if completedAt.Valid {
-		t := time.Unix(completedAt.Int64, 0).UTC()
-		req.CompletedAt = &t
+	if req.CompletedAt, tsErr = scanNullableTimestamp(completedAt); tsErr != nil {
+		return api.ReimageRequest{}, fmt.Errorf("db: scan reimage request completed_at: %w", tsErr)
 	}
 	return req, nil
 }
