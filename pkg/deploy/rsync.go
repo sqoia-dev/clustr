@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -249,13 +250,70 @@ func (d *FilesystemDeployer) Deploy(ctx context.Context, opts DeployOpts, progre
 		logger().Warn().Msg("checksum verification skipped for image download (--skip-verify set)")
 	}
 
-	if err := d.streamExtract(ctx, blob.resp.Body, blob.totalBytes, opts, needsVerify, progress); err != nil {
-		logger().Error().Err(err).Msg("image download/extract failed")
+	// Attempt extraction with retries. On a watchdog-triggered stall or a
+	// truncated stream, close the current response, wait briefly, then re-issue
+	// a fresh HTTP request rather than retrying from the same dead TCP connection.
+	var extractErr error
+	for attempt := 1; attempt <= maxDownloadAttempts; attempt++ {
+		var body io.Reader
+		var bodyClose func()
+		if attempt == 1 {
+			// First attempt uses the pre-fetched connection (TCP already established).
+			body = blob.resp.Body
+			bodyClose = func() {} // closed by the outer defer blob.resp.Body.Close()
+		} else {
+			if ctx.Err() != nil {
+				// Parent context cancelled — do not retry.
+				break
+			}
+			backoff := time.Duration(math.Pow(2, float64(attempt-1))) * time.Second
+			logger().Warn().
+				Int("attempt", attempt).Int("max", maxDownloadAttempts).
+				Dur("backoff", backoff).
+				Msg("blob stream failed — re-issuing HTTP request for retry")
+			select {
+			case <-ctx.Done():
+				break
+			case <-time.After(backoff):
+			}
+			retryReq, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, opts.ImageURL, nil)
+			if reqErr != nil {
+				extractErr = fmt.Errorf("build retry request: %w", reqErr)
+				break
+			}
+			if opts.AuthToken != "" {
+				retryReq.Header.Set("Authorization", "Bearer "+opts.AuthToken)
+			}
+			retryResp, httpErr := http.DefaultClient.Do(retryReq)
+			if httpErr != nil {
+				extractErr = fmt.Errorf("retry HTTP request failed: %w", httpErr)
+				continue
+			}
+			if retryResp.StatusCode != http.StatusOK && retryResp.StatusCode != http.StatusPartialContent {
+				retryResp.Body.Close()
+				extractErr = fmt.Errorf("retry HTTP %d from %s", retryResp.StatusCode, opts.ImageURL)
+				continue
+			}
+			body = retryResp.Body
+			bodyClose = func() { retryResp.Body.Close() }
+		}
+
+		extractErr = d.streamExtract(ctx, body, blob.totalBytes, opts, needsVerify, progress)
+		bodyClose()
+		if extractErr == nil {
+			break
+		}
+		logger().Error().Err(extractErr).Int("attempt", attempt).Int("max", maxDownloadAttempts).
+			Msg("stream-extract attempt failed")
+	}
+
+	if extractErr != nil {
+		logger().Error().Err(extractErr).Msg("image download/extract failed after all attempts")
 		doRollback("image download/extract failed")
 		if opts.Reporter != nil {
-			opts.Reporter.EndPhase(err.Error())
+			opts.Reporter.EndPhase(extractErr.Error())
 		}
-		return fmt.Errorf("deploy: extract: %w", err)
+		return fmt.Errorf("deploy: extract: %w", extractErr)
 	}
 	logger().Info().Msg("extraction complete")
 	if opts.Reporter != nil {
@@ -953,14 +1011,27 @@ func (d *FilesystemDeployer) attemptDownloadAndExtract(ctx context.Context, opts
 func (d *FilesystemDeployer) streamExtract(ctx context.Context, body io.Reader, totalBytes int64, opts DeployOpts, needsVerify bool, progress ProgressFunc) error {
 	log := logger()
 	log.Info().Str("mount_root", opts.MountRoot).Msg("starting stream-extract")
+	startTime := time.Now()
 
-	// Set up the reader chain: body → [hasher tee] → progress → decompressor? → tar stdin.
+	// Wrap the raw body in a throughput watchdog before any other readers.
+	// This cancels the context (killing tar via exec.CommandContext) if the
+	// blob stream delivers less than 1KB/s for 5 consecutive seconds.
+	// The watchdog is stopped when streamExtract returns regardless of outcome.
+	//
+	// minBytesPerSec = 1024 (1 KB/s) — even a 1-Gbps LAN degraded to a crawl
+	// should sustain this; anything slower is a stall or dead connection.
+	// stallTimeout  = 5s — short enough to detect a dead connection quickly
+	// without false-positive triggering on transient scheduler jitter.
+	tw, watchCtx := newThroughputWatchdog(ctx, body, 1024, 5*time.Second)
+	defer tw.stopWatchdog() // always stop the goroutine on return
+
+	// Set up the reader chain: body(watchdog) → [hasher tee] → progress → decompressor? → tar stdin.
 	var hasher hash.Hash
-	var reader io.Reader = body
+	var reader io.Reader = tw
 
 	if needsVerify {
 		hasher = sha256.New()
-		reader = io.TeeReader(body, hasher)
+		reader = io.TeeReader(tw, hasher)
 	}
 
 	pr := &progressReader{r: reader, total: totalBytes, fn: progress, phase: "downloading+extracting", reporter: opts.Reporter}
@@ -1059,7 +1130,11 @@ func (d *FilesystemDeployer) streamExtract(ctx context.Context, body io.Reader, 
 	//                          demote xattr-write and unknown-pax-keyword warnings to info
 	//                          (these cause exit code 2 on some files without being real failures)
 	//   --warning=no-timestamp don't fail on files with timestamps in the future
-	tarCmd := exec.CommandContext(ctx, "tar",
+	// Use watchCtx (derived from ctx + watchdog cancel) so that tar is killed
+	// when either the parent context is cancelled OR the throughput watchdog
+	// fires. Both cases are treated as a stream failure and will trigger a retry
+	// at the caller level.
+	tarCmd := exec.CommandContext(watchCtx, "tar",
 		"--numeric-owner",
 		"--xattrs",
 		"--xattrs-include=*",
@@ -1170,9 +1245,16 @@ func (d *FilesystemDeployer) streamExtract(ctx context.Context, body io.Reader, 
 			pr.written, totalBytes, totalBytes-pr.written)
 	}
 
+	elapsed := time.Since(startTime)
+	var throughputMBps float64
+	if elapsed.Seconds() > 0 {
+		throughputMBps = float64(pr.written) / elapsed.Seconds() / (1 << 20)
+	}
 	log.Info().
-		Str("read", humanReadableBytes(pr.written)).
-		Str("expected", humanReadableBytes(totalBytes)).
+		Str("bytes_received", humanReadableBytes(pr.written)).
+		Str("content_length", humanReadableBytes(totalBytes)).
+		Str("elapsed", elapsed.Round(time.Millisecond).String()).
+		Str("throughput", fmt.Sprintf("%.2f MB/s", throughputMBps)).
 		Msg("stream-extract complete")
 
 	// Post-extraction checksum verification. If this fails the data is on disk
@@ -1214,5 +1296,71 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	if p.reporter != nil {
 		p.reporter.Update(p.written)
 	}
+	return n, err
+}
+
+// throughputWatchdogReader wraps an io.Reader and cancels the provided context
+// if throughput drops below minBytesPerSec for longer than stallTimeout.
+// This lets us detect a stalled TCP connection (server paused, network
+// blip, kernel socket timeout) without killing a healthy slow-but-steady read.
+//
+// The watchdog goroutine samples bytesRead every second. If the delta is below
+// minBytesPerSec for stallTimeout consecutive seconds, it cancels the context
+// and the next Read() call on the underlying reader will fail, propagating the
+// cancel up through io.Copy → tar stdin → tar exit → streamExtract error return.
+//
+// The watchdog goroutine is stopped when stopWatchdog is called or when the
+// context is already cancelled. Call stopWatchdog() in a defer after io.Copy
+// to prevent a goroutine leak.
+type throughputWatchdogReader struct {
+	r             io.Reader
+	bytesRead     atomic.Int64
+	stopWatchdog  context.CancelFunc
+}
+
+// newThroughputWatchdog wraps r with a stall watchdog. minBytesPerSec is the
+// minimum sustained throughput required; stallTimeout is how long below that
+// threshold triggers a cancel. Typical values: 1024 bytes/s, 5s.
+func newThroughputWatchdog(ctx context.Context, r io.Reader, minBytesPerSec int64, stallTimeout time.Duration) (*throughputWatchdogReader, context.Context) {
+	watchCtx, cancelWatch := context.WithCancel(ctx)
+	tw := &throughputWatchdogReader{r: r, stopWatchdog: cancelWatch}
+
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		var stallSecs int
+		var lastBytes int64
+		for {
+			select {
+			case <-watchCtx.Done():
+				return
+			case <-ticker.C:
+				cur := tw.bytesRead.Load()
+				delta := cur - lastBytes
+				lastBytes = cur
+				if delta < minBytesPerSec {
+					stallSecs++
+					if stallSecs >= int(stallTimeout.Seconds()) {
+						logger().Warn().
+							Int64("bytes_per_sec", delta).
+							Int64("min_bytes_per_sec", minBytesPerSec).
+							Int("stall_secs", stallSecs).
+							Msg("throughput watchdog: blob stream stalled — cancelling download context")
+						cancelWatch()
+						return
+					}
+				} else {
+					stallSecs = 0
+				}
+			}
+		}
+	}()
+
+	return tw, watchCtx
+}
+
+func (tw *throughputWatchdogReader) Read(b []byte) (int, error) {
+	n, err := tw.r.Read(b)
+	tw.bytesRead.Add(int64(n))
 	return n, err
 }
