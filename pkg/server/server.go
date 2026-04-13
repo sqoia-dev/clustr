@@ -26,16 +26,41 @@ import (
 
 // Server wraps the HTTP server and all its dependencies.
 type Server struct {
-	cfg                config.ServerConfig
-	db                 *db.DB
-	broker             *LogBroker
-	progress           *ProgressStore
-	shells             *image.ShellManager
-	powerCache         *PowerCache
-	powerRegistry      *power.Registry
+	cfg                 config.ServerConfig
+	db                  *db.DB
+	broker              *LogBroker
+	progress            *ProgressStore
+	buildProgress       *BuildProgressStore
+	shells              *image.ShellManager
+	powerCache          *PowerCache
+	powerRegistry       *power.Registry
 	reimageOrchestrator *reimage.Orchestrator
-	router             chi.Router
-	http               *http.Server
+	router              chi.Router
+	http                *http.Server
+}
+
+// buildProgressAdapter adapts *BuildProgressStore to image.BuildProgressReporter.
+// The image package defines an interface with Start returning a BuildHandle interface;
+// this adapter bridges the concrete server types to that interface.
+type buildProgressAdapter struct {
+	store *BuildProgressStore
+}
+
+// buildHandleAdapter wraps *BuildHandle (server) to satisfy image.BuildHandle.
+type buildHandleAdapter struct {
+	h *BuildHandle
+}
+
+func (a buildHandleAdapter) SetPhase(phase string)      { a.h.SetPhase(phase) }
+func (a buildHandleAdapter) SetProgress(d, t int64)     { a.h.SetProgress(d, t) }
+func (a buildHandleAdapter) AddSerialLine(line string)   { a.h.AddSerialLine(line) }
+func (a buildHandleAdapter) AddStderrLine(line string)   { a.h.AddStderrLine(line) }
+func (a buildHandleAdapter) Fail(msg string)             { a.h.Fail(msg) }
+func (a buildHandleAdapter) Complete()                   { a.h.Complete() }
+
+func (a buildProgressAdapter) Start(imageID string) image.BuildHandle {
+	h := a.store.Start(imageID)
+	return buildHandleAdapter{h: h}
 }
 
 // New creates a Server wired with the given config and database.
@@ -48,11 +73,13 @@ func New(cfg config.ServerConfig, database *db.DB) *Server {
 	reimageOrch := reimage.New(database, registry, log.Logger)
 
 	shells := image.NewShellManager(database, cfg.ImageDir, log.Logger)
+	buildProg := NewBuildProgressStore()
 	s := &Server{
 		cfg:                 cfg,
 		db:                  database,
 		broker:              NewLogBroker(),
 		progress:            NewProgressStore(),
+		buildProgress:       buildProg,
 		shells:              shells,
 		powerCache:          NewPowerCache(15 * time.Second),
 		powerRegistry:       registry,
@@ -110,15 +137,20 @@ func (s *Server) buildRouter() chi.Router {
 	nodeGroups := &handlers.NodeGroupsHandler{DB: s.db}
 	layoutH := &handlers.LayoutHandler{DB: s.db}
 	imgFactory := &image.Factory{
-		Store:    s.db,
-		ImageDir: s.cfg.ImageDir,
-		Logger:   log.Logger,
+		Store:         s.db,
+		ImageDir:      s.cfg.ImageDir,
+		Logger:        log.Logger,
+		BuildProgress: buildProgressAdapter{store: s.buildProgress},
 	}
 	factory := &handlers.FactoryHandler{
 		DB:       s.db,
 		ImageDir: s.cfg.ImageDir,
 		Factory:  imgFactory,
 		Shells:   s.shells,
+	}
+	buildProgressH := &handlers.BuildProgressHandler{
+		Store:    s.buildProgress,
+		ImageDir: s.cfg.ImageDir,
 	}
 	logs := &handlers.LogsHandler{DB: s.db, Broker: s.broker}
 	progress := &handlers.ProgressHandler{Store: s.progress}
@@ -178,6 +210,12 @@ func (s *Server) buildRouter() chi.Router {
 			r.Post("/factory/import-iso", factory.ImportPath) // alias used by the web UI
 			r.Post("/factory/capture", factory.Capture)
 			r.Post("/factory/build-from-iso", factory.BuildFromISO)
+
+			// ISO build observability — stream must come before plain snapshot route.
+			r.Get("/images/{id}/build-progress/stream", buildProgressH.StreamBuildProgress)
+			r.Get("/images/{id}/build-progress", buildProgressH.GetBuildProgress)
+			r.Get("/images/{id}/build-log", buildProgressH.GetBuildLog)
+			r.Get("/images/{id}/build-manifest", buildProgressH.GetBuildManifest)
 
 			// Shell sessions
 			r.Post("/images/{id}/shell-session", factory.OpenShellSession)
