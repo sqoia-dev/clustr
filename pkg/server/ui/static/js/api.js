@@ -4,10 +4,9 @@
 const API = {
     BASE: '/api/v1',
 
-    // Read the auth token from the page meta tag (set by server if CLONR_AUTH_TOKEN is configured).
+    // Read the auth token from localStorage.
     _token() {
-        const meta = document.querySelector('meta[name="clonr-token"]');
-        return meta ? meta.content : '';
+        return localStorage.getItem('clonr_admin_key') || '';
     },
 
     _headers(extra = {}) {
@@ -20,6 +19,18 @@ const API = {
     async _parse(resp) {
         const ct = resp.headers.get('Content-Type') || '';
         if (!resp.ok) {
+            // 401/403 means the stored key is wrong or expired — clear it and
+            // show the key entry modal so the user can re-authenticate.
+            if (resp.status === 401 || resp.status === 403) {
+                let msg = 'API key invalid or expired. Please enter your admin key.';
+                if (ct.includes('application/json')) {
+                    const body = await resp.json().catch(() => null);
+                    if (body && body.error) msg = body.error + ' — please re-enter your admin key.';
+                }
+                localStorage.removeItem('clonr_admin_key');
+                if (typeof Auth !== 'undefined') Auth.showModal(msg);
+                throw new Error(msg);
+            }
             let msg = `HTTP ${resp.status}`;
             if (ct.includes('application/json')) {
                 const body = await resp.json().catch(() => null);

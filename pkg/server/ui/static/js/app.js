@@ -6040,6 +6040,112 @@ class ProgressStream {
     }
 }
 
+// ─── Auth ─────────────────────────────────────────────────────────────────
+//
+// Auth manages the admin API key stored in localStorage.
+// On load: if no key is present → show modal before App.init().
+// On 401/403: api.js calls Auth.showModal(errorMsg) which clears and re-prompts.
+
+const Auth = {
+    _STORAGE_KEY: 'clonr_admin_key',
+
+    key() {
+        return localStorage.getItem(this._STORAGE_KEY) || '';
+    },
+
+    save(key) {
+        localStorage.setItem(this._STORAGE_KEY, key.trim());
+    },
+
+    clear() {
+        localStorage.removeItem(this._STORAGE_KEY);
+    },
+
+    // showModal optionally shows an error message (e.g. after a 401).
+    // When the user saves a key the page reloads so App.init() runs fresh.
+    showModal(errorMsg = '') {
+        // Remove any existing modal first.
+        const existing = document.getElementById('auth-modal-overlay');
+        if (existing) existing.remove();
+
+        const overlay = document.createElement('div');
+        overlay.id = 'auth-modal-overlay';
+        overlay.className = 'modal-overlay';
+        overlay.style.cssText = 'display:flex;align-items:center;justify-content:center;z-index:10000';
+
+        overlay.innerHTML = `
+            <div class="modal" style="max-width:420px;width:100%">
+                <div class="modal-header">
+                    <span class="modal-title">Admin API Key Required</span>
+                </div>
+                <div class="modal-body" style="padding:24px">
+                    ${errorMsg ? `<div class="alert alert-error" style="margin-bottom:16px">${escHtml(errorMsg)}</div>` : ''}
+                    <p style="margin:0 0 16px;color:var(--text-secondary);font-size:14px">
+                        Enter your clonr admin API key to access the dashboard.
+                        The key is stored locally in your browser and never sent to any third party.
+                    </p>
+                    <label style="display:block;margin-bottom:6px;font-size:13px;font-weight:600;color:var(--text-secondary)">Admin API Key</label>
+                    <input id="auth-key-input" type="password" class="form-input"
+                        placeholder="clonr-admin-…"
+                        style="width:100%;box-sizing:border-box;margin-bottom:16px;font-family:monospace"
+                        autocomplete="current-password" spellcheck="false" />
+                    <button id="auth-save-btn" class="btn btn-primary" style="width:100%">Save &amp; Continue</button>
+                </div>
+            </div>`;
+
+        document.body.appendChild(overlay);
+
+        const input = overlay.querySelector('#auth-key-input');
+        const btn   = overlay.querySelector('#auth-save-btn');
+
+        // Focus the input immediately.
+        setTimeout(() => input.focus(), 50);
+
+        const save = () => {
+            const val = input.value.trim();
+            if (!val) { input.focus(); return; }
+            Auth.save(val);
+            window.location.reload();
+        };
+
+        btn.addEventListener('click', save);
+        input.addEventListener('keydown', e => { if (e.key === 'Enter') save(); });
+    },
+
+    // Renders the "Change key" link in the sidebar footer.
+    renderChangeKeyButton() {
+        const footer = document.querySelector('.sidebar-footer');
+        if (!footer) return;
+        if (footer.querySelector('#auth-change-key')) return; // already added
+
+        const link = document.createElement('button');
+        link.id = 'auth-change-key';
+        link.title = 'Change API key / sign out';
+        link.style.cssText = 'background:none;border:none;padding:0;cursor:pointer;color:var(--text-dim);font-size:12px;margin-left:auto;opacity:0.6;transition:opacity 0.15s';
+        link.textContent = 'Change key';
+        link.addEventListener('mouseenter', () => { link.style.opacity = '1'; });
+        link.addEventListener('mouseleave', () => { link.style.opacity = '0.6'; });
+        link.addEventListener('click', () => {
+            Auth.clear();
+            Auth.showModal();
+        });
+        footer.appendChild(link);
+    },
+
+    // boot is called from DOMContentLoaded.
+    // If no key → show the modal and do NOT start the app.
+    // If key present → start the app normally.
+    boot() {
+        if (!this.key()) {
+            this.showModal();
+            return;
+        }
+        App.init();
+        // Defer the button render until DOM is fully painted.
+        requestAnimationFrame(() => this.renderChangeKeyButton());
+    },
+};
+
 // ─── Boot ─────────────────────────────────────────────────────────────────
 
-document.addEventListener('DOMContentLoaded', () => App.init());
+document.addEventListener('DOMContentLoaded', () => Auth.boot());
