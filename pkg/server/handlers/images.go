@@ -556,19 +556,20 @@ func (h *ImagesHandler) streamFilesystemBlob(w http.ResponseWriter, r *http.Requ
 		"--exclude=./etc/gshadow",
 		"--exclude=./etc/gshadow-",
 		"--exclude=./etc/security/opasswd",
-		// sssd / nslcd runtime state — empty directories, rebuilt on boot.
-		"--exclude=./var/lib/sss/*",
-		"--exclude=./var/lib/nslcd/*",
-		"--exclude=./var/log/sssd/*",
-		// chrony log — world-unreadable on hardened installs.
-		"--exclude=./var/log/chrony/*",
-		// sudo binaries and helpers — SUID root, cannot be read by non-root tar
-		// process running under NoNewPrivileges=yes.
+		// sssd / nslcd / chrony runtime state and logs — directories are mode 700
+		// or 750, unreadable by the non-privileged tar process running under
+		// NoNewPrivileges=yes. Exclude the directory itself (no /*) so tar skips
+		// the entire subtree including the directory entry.
+		"--exclude=./var/lib/sss",
+		"--exclude=./var/lib/nslcd",
+		"--exclude=./var/lib/chrony",
+		"--exclude=./var/log/sssd",
+		"--exclude=./var/log/chrony",
+		// sudo binaries and helpers — SUID root (mode 4111/4111), cannot be
+		// read by the non-privileged tar process running under NoNewPrivileges=yes.
 		"--exclude=./usr/bin/sudo",
 		"--exclude=./usr/bin/sudoreplay",
 		"--exclude=./usr/libexec/sudo/sesh",
-		// chrony state — world-unreadable on hardened installs.
-		"--exclude=./var/lib/chrony/*",
 		// Deterministic output flags — required for stable sha256 across repeated
 		// streams of the same image content. Without these, entry order and embedded
 		// timestamps vary between runs (directory readdir order, ctime drift),
