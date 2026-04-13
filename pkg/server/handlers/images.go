@@ -562,9 +562,13 @@ func (h *ImagesHandler) streamFilesystemBlob(w http.ResponseWriter, r *http.Requ
 		"--exclude=./var/log/sssd/*",
 		// chrony log — world-unreadable on hardened installs.
 		"--exclude=./var/log/chrony/*",
-		// sudo helper — SUID root (mode 4511), cannot be read by non-root tar
+		// sudo binaries and helpers — SUID root, cannot be read by non-root tar
 		// process running under NoNewPrivileges=yes.
+		"--exclude=./usr/bin/sudo",
+		"--exclude=./usr/bin/sudoreplay",
 		"--exclude=./usr/libexec/sudo/sesh",
+		// chrony state — world-unreadable on hardened installs.
+		"--exclude=./var/lib/chrony/*",
 		// Deterministic output flags — required for stable sha256 across repeated
 		// streams of the same image content. Without these, entry order and embedded
 		// timestamps vary between runs (directory readdir order, ctime drift),
