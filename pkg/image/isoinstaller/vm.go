@@ -277,13 +277,27 @@ func Build(ctx context.Context, opts BuildOptions) (*BuildResult, error) {
 
 	// Stop the serial tail goroutine now that QEMU has exited.
 	serialTailCancel()
-	_ = procExitErr // already logged above
 
 	elapsed := time.Since(start)
 	log.Info().
 		Dur("elapsed", elapsed.Round(time.Second)).
 		Str("disk", rawDiskPath).
+		Err(procExitErr).
 		Msg("isoinstaller: install VM exited — verifying disk")
+
+	// ── Fail-fast on startup failures ─────────────────────────────────────
+	// If QEMU exited in under 60 seconds with a non-zero status, that's a
+	// startup failure (wrong CPU flag, missing device, bad ISO, etc.), not a
+	// successful install. Anaconda/subiquity installs always take at least
+	// 5+ minutes. Proceeding to extract would produce a blank image or
+	// confusing partition errors. Read the serial log tail so the admin can
+	// see exactly why QEMU failed.
+	if procExitErr != nil && elapsed < 60*time.Second {
+		tail := readSerialLogTail(serialLogPath, 30)
+		return &BuildResult{SerialLogPath: serialLogPath},
+			fmt.Errorf("isoinstaller: QEMU exited after %v with status %v — install failed to start (check serial log at %s)\n%s",
+				elapsed.Round(time.Second), procExitErr, serialLogPath, tail)
+	}
 
 	// ── Verify the disk image was written ─────────────────────────────────
 	fi, err := os.Stat(rawDiskPath)
@@ -354,6 +368,24 @@ func scanPipeLines(r io.Reader, onLine func(string)) {
 	}
 }
 
+// readSerialLogTail reads the last N lines of the serial log file and
+// returns them formatted as a string for embedding in error messages.
+// Returns "(serial log unavailable)" if the file can't be read.
+func readSerialLogTail(path string, lines int) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Sprintf("(serial log unavailable: %v)", err)
+	}
+	if len(data) == 0 {
+		return "(serial log empty — QEMU may have failed before writing any output)"
+	}
+	all := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(all) > lines {
+		all = all[len(all)-lines:]
+	}
+	return "--- last " + fmt.Sprintf("%d", len(all)) + " serial lines ---\n" + strings.Join(all, "\n")
+}
+
 // applyDefaults fills in zero-value BuildOptions fields with sensible defaults.
 func applyDefaults(opts *BuildOptions) {
 	if opts.DiskSizeGB == 0 {
@@ -375,7 +407,14 @@ func buildQEMUArgs(opts BuildOptions, rawDiskPath, seedISOPath, serialLogPath, q
 	args := []string{
 		// Machine and acceleration.
 		"-machine", "pc,accel=kvm:tcg", // prefer KVM, fall back to TCG automatically
-		"-cpu", "host,+vmx",
+		// -cpu host passes through all available host CPU features to the guest.
+		// Previously included +vmx for nested virt, but when clonr-server runs
+		// inside a VM (as in our Proxmox lab), the parent hypervisor doesn't
+		// expose vmx to clonr-server's CPU, so QEMU exits immediately with
+		// "CPU feature vmx not available". Bare -cpu host is correct for all
+		// deployment topologies — the install VM doesn't need nested virt to
+		// run Anaconda or cloud-init.
+		"-cpu", "host",
 	}
 
 	// When KVM is not available, force TCG (software emulation).
