@@ -2469,10 +2469,10 @@ const Pages = {
             const [node, imagesResp, nodeGroupsResp] = await Promise.all([
                 API.nodes.get(id),
                 API.images.list(),
-                API.nodeGroups.list().catch(() => ({ node_groups: [] })),
+                API.nodeGroups.list().catch(() => ({ groups: [] })),
             ]);
             const images     = imagesResp.images || [];
-            const nodeGroups = (nodeGroupsResp && nodeGroupsResp.node_groups) || [];
+            const nodeGroups = (nodeGroupsResp && (nodeGroupsResp.node_groups || nodeGroupsResp.groups)) || [];
             const img        = images.find(i => i.id === node.base_image_id);
 
             let hw = null;
@@ -4549,7 +4549,7 @@ const Pages = {
                 API.nodeGroups.list(),
                 API.nodes.list(),
             ]);
-            const groups = (groupsResp && groupsResp.node_groups) || [];
+            const groups = (groupsResp && (groupsResp.groups || groupsResp.node_groups)) || [];
             const nodes  = (nodesResp  && nodesResp.nodes)        || [];
 
             // Count nodes per group.
