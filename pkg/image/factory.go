@@ -82,6 +82,28 @@ type Factory struct {
 	// ISO builds so the admin can monitor the VM installer in real time.
 	// Wire in *server.BuildProgressStore via an adapter (see server.go).
 	BuildProgress BuildProgressReporter
+	// ISOCacheDir is the directory where downloaded ISOs are cached keyed by
+	// sha256(url). Defaults to /var/lib/clonr/iso-cache if empty.
+	ISOCacheDir string
+}
+
+const defaultISOCacheDir = "/var/lib/clonr/iso-cache"
+
+// isoCachePath returns the deterministic cache path and partial path for the
+// given URL. The directory is created (0o755) if it does not already exist.
+func (f *Factory) isoCachePath(rawURL string) (cachePath, partialPath string, err error) {
+	cacheDir := f.ISOCacheDir
+	if cacheDir == "" {
+		cacheDir = defaultISOCacheDir
+	}
+	if err = os.MkdirAll(cacheDir, 0o755); err != nil {
+		return "", "", fmt.Errorf("create iso cache dir: %w", err)
+	}
+	h := sha256.Sum256([]byte(rawURL))
+	key := hex.EncodeToString(h[:])
+	cachePath = filepath.Join(cacheDir, key+".iso")
+	partialPath = cachePath + ".partial"
+	return cachePath, partialPath, nil
 }
 
 // PullImage downloads a cloud image from a URL, extracts/mounts it, copies
@@ -806,6 +828,78 @@ func downloadURL(ctx context.Context, rawURL string, dst *os.File) error {
 // downloadURLWithProgress streams url into dst, calling onProgress(done,total)
 // periodically during the download. When Content-Length is not available,
 // total is -1. Throttled to at most one callback per second.
+// downloadURLWithResume downloads rawURL into dst, resuming from resumeOffset
+// bytes if the server supports HTTP Range requests. If the server returns 200
+// (instead of 206) in response to a Range request, the existing partial file is
+// truncated and the download starts from the beginning. resumeOffset == 0 means
+// a plain GET with no Range header.
+func downloadURLWithResume(ctx context.Context, rawURL string, dst *os.File, resumeOffset int64, onProgress func(done, total int64)) error {
+	if err := validatePullURL(rawURL); err != nil {
+		return fmt.Errorf("URL validation: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	if resumeOffset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", resumeOffset))
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("http get: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var startBytes int64
+	switch {
+	case resp.StatusCode == http.StatusPartialContent:
+		// Server honoured the Range request; continue appending.
+		startBytes = resumeOffset
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		// Server ignored Range (returned 200); start over.
+		if err := dst.Truncate(0); err != nil {
+			return fmt.Errorf("truncate partial for restart: %w", err)
+		}
+		if _, err := dst.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("seek for restart: %w", err)
+		}
+		startBytes = 0
+	default:
+		return fmt.Errorf("HTTP %d from %s", resp.StatusCode, rawURL)
+	}
+
+	total := resp.ContentLength // -1 when unknown; for 206 this is the remaining bytes
+	var done int64
+	lastReport := time.Now()
+
+	buf := make([]byte, 256*1024)
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+				return fmt.Errorf("write: %w", writeErr)
+			}
+			done += int64(n)
+			if onProgress != nil && time.Since(lastReport) >= time.Second {
+				onProgress(startBytes+done, startBytes+total)
+				lastReport = time.Now()
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("read: %w", readErr)
+		}
+	}
+	if onProgress != nil {
+		onProgress(startBytes+done, startBytes+total)
+	}
+	return nil
+}
+
 func downloadURLWithProgress(ctx context.Context, rawURL string, dst *os.File, onProgress func(done, total int64)) error {
 	if err := validatePullURL(rawURL); err != nil {
 		return fmt.Errorf("URL validation: %w", err)
@@ -1216,39 +1310,69 @@ func (f *Factory) buildISOAsync(imageID string, req api.BuildFromISORequest, dis
 		_ = f.Store.UpdateBaseImageStatus(ctx, imageID, api.ImageStatusError, fullMsg)
 	}
 
-	// ── Download ISO ──────────────────────────────────────────────────────
+	// ── Download ISO (with persistent cache) ─────────────────────────────
 	f.Logger.Info().Str("image_id", imageID).Str("url", req.URL).Msg("factory: downloading installer ISO")
 	ph.SetPhase("downloading_iso")
 
-	tmpISO, err := os.CreateTemp("", "clonr-iso-*.iso")
+	isoPath, partialPath, err := f.isoCachePath(req.URL)
 	if err != nil {
-		f.Logger.Error().Err(err).Str("image_id", imageID).Msg("factory: create temp iso file")
-		failBuild("create temp iso file", err)
+		f.Logger.Error().Err(err).Str("image_id", imageID).Msg("factory: resolve iso cache path")
+		failBuild("resolve iso cache path", err)
 		return
 	}
-	tmpISO.Close()
-	defer os.Remove(tmpISO.Name())
 
-	// Re-open for writing with a counting writer so we can report download progress.
-	isoFile, err := os.OpenFile(tmpISO.Name(), os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		f.Logger.Error().Err(err).Str("image_id", imageID).Msg("factory: open temp iso file")
-		failBuild("open temp iso file", err)
-		return
-	}
-	if err := downloadURLWithProgress(ctx, req.URL, isoFile, func(done, total int64) {
-		ph.SetProgress(done, total)
-	}); err != nil {
+	// Check if a complete cached ISO already exists and is non-zero.
+	if fi, statErr := os.Stat(isoPath); statErr == nil && fi.Size() > 0 {
+		f.Logger.Info().Str("image_id", imageID).Str("path", isoPath).
+			Int64("bytes", fi.Size()).Msg("factory: using cached ISO, skipping download")
+		ph.SetProgress(fi.Size(), fi.Size())
+	} else {
+		// Determine byte offset for resume: use size of any existing .partial file.
+		var resumeOffset int64
+		if pfi, pErr := os.Stat(partialPath); pErr == nil && pfi.Size() > 0 {
+			resumeOffset = pfi.Size()
+			f.Logger.Info().Str("image_id", imageID).Int64("resume_from", resumeOffset).
+				Msg("factory: resuming partial ISO download")
+		}
+
+		isoFile, openErr := os.OpenFile(partialPath, os.O_CREATE|os.O_WRONLY, 0o644)
+		if openErr != nil {
+			f.Logger.Error().Err(openErr).Str("image_id", imageID).Msg("factory: open partial iso file")
+			failBuild("open partial iso file", openErr)
+			return
+		}
+		if resumeOffset > 0 {
+			if _, seekErr := isoFile.Seek(0, io.SeekEnd); seekErr != nil {
+				isoFile.Close()
+				failBuild("seek partial iso file", seekErr)
+				return
+			}
+		}
+
+		dlErr := downloadURLWithResume(ctx, req.URL, isoFile, resumeOffset, func(done, total int64) {
+			ph.SetProgress(done, total)
+		})
 		isoFile.Close()
-		f.Logger.Error().Err(err).Str("image_id", imageID).Msg("factory: download ISO failed")
-		failBuild("download ISO", err)
-		return
-	}
-	isoFile.Close()
+		if dlErr != nil {
+			// Leave .partial in place so the next attempt can resume.
+			f.Logger.Error().Err(dlErr).Str("image_id", imageID).Msg("factory: download ISO failed")
+			failBuild("download ISO", dlErr)
+			return
+		}
 
+		// Atomically promote .partial → final cache path.
+		if renameErr := os.Rename(partialPath, isoPath); renameErr != nil {
+			f.Logger.Error().Err(renameErr).Str("image_id", imageID).Msg("factory: rename partial iso")
+			failBuild("finalize iso cache", renameErr)
+			return
+		}
+		f.Logger.Info().Str("image_id", imageID).Str("path", isoPath).Msg("factory: ISO download complete, cached")
+	}
+
+	// isoPath now points to the complete, cached ISO.
 	// If distro was unknown at request time, try detecting from the file now.
 	if distro == isoinstaller.DistroUnknown {
-		if detected, _ := isoinstaller.DetectDistro(req.URL, tmpISO.Name()); detected != isoinstaller.DistroUnknown {
+		if detected, _ := isoinstaller.DetectDistro(req.URL, isoPath); detected != isoinstaller.DistroUnknown {
 			distro = detected
 			f.Logger.Info().Str("image_id", imageID).Str("distro", string(distro)).
 				Msg("factory: distro detected from ISO volume label")
@@ -1284,7 +1408,7 @@ func (f *Factory) buildISOAsync(imageID string, req api.BuildFromISORequest, dis
 	}
 
 	buildOpts := isoinstaller.BuildOptions{
-		ISOPath:         tmpISO.Name(),
+		ISOPath:         isoPath,
 		Distro:          distro,
 		DiskSizeGB:      req.DiskSizeGB,
 		MemoryMB:        req.MemoryMB,
