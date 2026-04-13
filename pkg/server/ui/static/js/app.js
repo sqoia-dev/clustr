@@ -76,6 +76,33 @@ const App = {
         this._cache[key] = { data, expiresAt: Date.now() + ttlMs };
     },
 
+    // toast shows a transient notification at the bottom-right of the screen.
+    // kind: "success" | "error" | "info" (default info)
+    // Auto-dismisses after 4 seconds.
+    toast(message, kind = 'info') {
+        let container = document.getElementById('toast-container');
+        if (!container) {
+            container = document.createElement('div');
+            container.id = 'toast-container';
+            container.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:8px;pointer-events:none';
+            document.body.appendChild(container);
+        }
+        const toast = document.createElement('div');
+        const colors = {
+            success: { bg: '#10b981', icon: '✓' },
+            error:   { bg: '#ef4444', icon: '✕' },
+            info:    { bg: '#3b82f6', icon: 'ℹ' },
+        };
+        const c = colors[kind] || colors.info;
+        toast.style.cssText = `background:${c.bg};color:white;padding:12px 16px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.15);font-size:14px;font-weight:500;min-width:280px;max-width:420px;display:flex;align-items:center;gap:10px;pointer-events:auto;animation:toastIn 0.2s ease-out`;
+        toast.innerHTML = `<span style="font-size:18px;font-weight:bold">${c.icon}</span><span style="flex:1">${escHtml(message)}</span><span style="cursor:pointer;opacity:0.7;padding:0 4px" onclick="this.parentElement.remove()">×</span>`;
+        container.appendChild(toast);
+        setTimeout(() => {
+            toast.style.animation = 'toastOut 0.2s ease-in forwards';
+            setTimeout(() => toast.remove(), 200);
+        }, 4000);
+    },
+
     init() {
         this._mainEl = document.getElementById('main-content');
         this._initRoutes();
@@ -3800,9 +3827,10 @@ const Pages = {
         if (!confirm('Apply the recommended disk layout as a node-level override? This will override the image/group default for this node only.')) return;
         try {
             await API.request('PUT', `/nodes/${nodeId}/layout-override`, { layout });
+            App.toast('Recommended layout applied as node override', 'success');
             Pages._onDiskLayoutTabOpen(nodeId);
         } catch (e) {
-            alert(`Failed to apply layout: ${e.message}`);
+            App.toast(`Failed to apply layout: ${e.message}`, 'error');
         }
     },
 
@@ -3810,9 +3838,10 @@ const Pages = {
         if (!confirm('Clear the node-level disk layout override? The group or image default will be used instead.')) return;
         try {
             await API.request('PUT', `/nodes/${nodeId}/layout-override`, { clear_layout_override: true });
+            App.toast('Node layout override cleared — using group or image default', 'success');
             Pages._onDiskLayoutTabOpen(nodeId);
         } catch (e) {
-            alert(`Failed to clear override: ${e.message}`);
+            App.toast(`Failed to clear override: ${e.message}`, 'error');
         }
     },
 
