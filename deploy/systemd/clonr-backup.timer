@@ -1,0 +1,15 @@
+[Unit]
+Description=clonr daily backup timer — runs at 02:00 local time
+Requires=clonr-backup.service
+
+[Timer]
+# Fire at 02:00 every day. AccuracySec=1m means systemd can defer up to 1 minute
+# to coalesce timers — fine for a backup job.
+OnCalendar=*-*-* 02:00:00
+AccuracySec=1m
+# If the system was off at 02:00, run immediately on next boot (catch-up).
+Persistent=true
+Unit=clonr-backup.service
+
+[Install]
+WantedBy=timers.target

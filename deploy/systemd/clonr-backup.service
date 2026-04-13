@@ -1,0 +1,18 @@
+[Unit]
+Description=clonr daily backup — SQLite hot backup + ISO cache rsync
+After=local-fs.target
+
+[Service]
+Type=oneshot
+# Run as root — same as clonr-serverd, required to read WAL-locked DB
+User=root
+ExecStart=/opt/clonr/scripts/clonr-backup.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=clonr-backup
+# Environment overrides if non-default paths are used
+Environment=CLONR_DB_PATH=/var/lib/clonr/db/clonr.db
+Environment=CLONR_BACKUP_DIR=/var/lib/clonr/backups
+Environment=CLONR_ISO_CACHE_DIR=/var/lib/clonr/iso-cache
+Environment=CLONR_ISO_BACKUP_DIR=/var/lib/clonr/iso-cache-backup
+Environment=CLONR_IMAGE_DIR=/var/lib/clonr/images
