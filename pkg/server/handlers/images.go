@@ -2,9 +2,11 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 
 	"github.com/go-chi/chi/v5"
@@ -325,10 +327,24 @@ func (h *ImagesHandler) UploadBlob(w http.ResponseWriter, r *http.Request) {
 }
 
 // DownloadBlob handles GET /api/v1/images/:id/blob
-// Streams the blob file to the client, supporting range requests via http.ServeContent.
+//
+// For "block" format images: streams the pre-packed blob file from disk.
+// For "filesystem" format images: streams an uncompressed tar of rootfs/ on the fly.
 func (h *ImagesHandler) DownloadBlob(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
+	img, err := h.DB.GetBaseImage(r.Context(), id)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+
+	if img.Format == api.ImageFormatFilesystem {
+		h.streamFilesystemBlob(w, r, img)
+		return
+	}
+
+	// Default: serve the pre-packed blob file (block images, legacy uploads).
 	blobPath, err := h.DB.GetBlobPath(r.Context(), id)
 	if err != nil {
 		writeError(w, err)
@@ -359,4 +375,77 @@ func (h *ImagesHandler) DownloadBlob(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	http.ServeContent(w, r, filepath.Base(blobPath), stat.ModTime(), f)
+}
+
+// streamFilesystemBlob tars the rootfs/ directory of a filesystem-format image
+// and streams it directly to the response writer as an uncompressed tar archive.
+// No Content-Length is set — the response is streamed.
+func (h *ImagesHandler) streamFilesystemBlob(w http.ResponseWriter, r *http.Request, img api.BaseImage) {
+	rootfsPath := filepath.Join(h.ImageDir, img.ID, "rootfs")
+
+	if _, err := os.Stat(rootfsPath); err != nil {
+		if os.IsNotExist(err) {
+			log.Error().Str("image_id", img.ID).Str("path", rootfsPath).Msg("blob stream: rootfs dir not found")
+			writeError(w, api.ErrNotFound)
+			return
+		}
+		log.Error().Err(err).Str("image_id", img.ID).Str("path", rootfsPath).Msg("blob stream: stat rootfs")
+		writeError(w, err)
+		return
+	}
+
+	log.Info().
+		Str("image_id", img.ID).
+		Str("format", string(img.Format)).
+		Str("client", r.RemoteAddr).
+		Msg("image blob streamed")
+
+	w.Header().Set("Content-Type", "application/x-tar")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.tar"`, img.ID))
+	w.WriteHeader(http.StatusOK)
+
+	cmd := exec.CommandContext(r.Context(), "tar",
+		"-C", rootfsPath,
+		"--exclude=./proc/*",
+		"--exclude=./sys/*",
+		"--exclude=./dev/*",
+		"--exclude=./.clonr-state",
+		"-cf", "-",
+		".",
+	)
+	cmd.Stdout = w
+
+	var bytesWritten int64
+	// Wrap the response writer to count bytes streamed.
+	cw := &countWriter{w: w}
+	cmd.Stdout = cw
+
+	if err := cmd.Run(); err != nil {
+		bytesWritten = cw.n
+		log.Error().
+			Err(err).
+			Str("image_id", img.ID).
+			Int64("bytes_written", bytesWritten).
+			Msg("blob stream: tar exited non-zero — response may be truncated")
+		return
+	}
+
+	bytesWritten = cw.n
+	log.Info().
+		Str("image_id", img.ID).
+		Str("client", r.RemoteAddr).
+		Int64("bytes_written", bytesWritten).
+		Msg("blob stream: tar complete")
+}
+
+// countWriter wraps an http.ResponseWriter and counts bytes written.
+type countWriter struct {
+	w http.ResponseWriter
+	n int64
+}
+
+func (cw *countWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	cw.n += int64(n)
+	return n, err
 }
