@@ -663,6 +663,48 @@ func applyBootConfig(ctx context.Context, mountRoot, targetDisk string, layout a
 		}
 	}()
 
+	// ── BLS machine-id fix ───────────────────────────────────────────────────
+	// Rocky/RHEL 9 uses GRUB_ENABLE_BLSCFG=true by default. grub2-mkconfig
+	// reads BLS entry files from /boot/loader/entries/*.conf. The BLS entry
+	// filenames embed the capture-source machine-id as their prefix, e.g.:
+	//   2f0b9a57183b4804a2d55f7c40e9f409-5.14.0-611.5.1.el9_7.x86_64.conf
+	// grub2-mkconfig (via /etc/grub.d/10_linux_bls) reads /etc/machine-id and
+	// only includes entries whose filename prefix matches the current machine-id.
+	// If machine-id is empty (which step 4 below sets it to), no entries match
+	// and grub.cfg is generated empty — the node boots to a GRUB rescue shell.
+	//
+	// Fix: extract the machine-id from an existing BLS entry filename and write
+	// it to /etc/machine-id temporarily before grub2-mkconfig runs. After
+	// grub2-mkconfig completes, step 4 truncates it so systemd generates a new
+	// unique ID on first boot. The grub.cfg itself does not embed machine-id —
+	// it only references /boot/loader/entries by filename — so the deployed node
+	// gets a fresh identity at first boot while still having a valid GRUB menu.
+	blsEntriesDir := filepath.Join(mountRoot, "boot", "loader", "entries")
+	if blsEntries, blsErr := os.ReadDir(blsEntriesDir); blsErr == nil {
+		for _, blsEntry := range blsEntries {
+			name := blsEntry.Name()
+			if strings.HasSuffix(name, ".conf") {
+				// BLS filename format: <machine-id>-<kernel-version>.conf
+				// Machine-id is always exactly 32 hex characters.
+				dashIdx := strings.Index(name, "-")
+				if dashIdx == 32 {
+					sourceMachineID := name[:32]
+					machineIDPath := filepath.Join(mountRoot, "etc", "machine-id")
+					if writeErr := os.WriteFile(machineIDPath, []byte(sourceMachineID+"\n"), 0o444); writeErr == nil {
+						log.Info().Str("machine_id", sourceMachineID).
+							Msg("finalize/boot: wrote source machine-id temporarily for grub2-mkconfig BLS lookup")
+					} else {
+						log.Warn().Err(writeErr).Msg("finalize/boot: failed to write temp machine-id (grub.cfg may be empty)")
+					}
+					break
+				}
+			}
+		}
+	} else {
+		log.Warn().Err(blsErr).Str("dir", blsEntriesDir).
+			Msg("finalize/boot: could not read BLS entries dir — grub2-mkconfig may produce empty grub.cfg")
+	}
+
 	// grub2-mkconfig writes the grub.cfg to the path passed via -o (inside the
 	// chroot, so the path is relative to the chroot root). At this point /etc/fstab
 	// already has the correct target UUIDs, so grub2-mkconfig will generate the
