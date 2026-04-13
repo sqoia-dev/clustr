@@ -2397,15 +2397,28 @@ const Pages = {
 
     // ── Node Detail ────────────────────────────────────────────────────────
 
+    // _nodeEditorState tracks per-tab dirty state for inline editing.
+    // Structure: { tabId: { dirty: bool, original: {}, current: {} } }
+    _nodeEditorState: {},
+
+    // _nodeEditorNodeId is the node ID currently loaded in nodeDetail.
+    _nodeEditorNodeId: null,
+
     async nodeDetail(id) {
         App.render(loading('Loading node…'));
+        // Reset per-tab dirty state on page load.
+        Pages._nodeEditorState = {};
+        Pages._nodeEditorNodeId = id;
+
         try {
-            const [node, imagesResp] = await Promise.all([
+            const [node, imagesResp, nodeGroupsResp] = await Promise.all([
                 API.nodes.get(id),
                 API.images.list(),
+                API.nodeGroups.list().catch(() => ({ node_groups: [] })),
             ]);
-            const images = imagesResp.images || [];
-            const img    = images.find(i => i.id === node.base_image_id);
+            const images     = imagesResp.images || [];
+            const nodeGroups = (nodeGroupsResp && nodeGroupsResp.node_groups) || [];
+            const img        = images.find(i => i.id === node.base_image_id);
 
             let hw = null;
             try {
@@ -2418,6 +2431,34 @@ const Pages = {
 
             const displayName = node.hostname || node.primary_mac;
 
+            // Build capture-this-node button HTML if node has a configured IP.
+            let captureBtn = '';
+            const iface = (node.interfaces || []).find(i => i.ip_address);
+            if (iface) {
+                const ip = iface.ip_address.split('/')[0];
+                const prefillHost = 'root@' + ip;
+                const prefillName = (node.hostname && node.hostname !== '(none)')
+                    ? node.hostname.toLowerCase().replace(/[^a-z0-9-]/g, '-') + '-capture'
+                    : '';
+                captureBtn = '<button class="btn btn-secondary" onclick="Pages.showCaptureModal(' +
+                    JSON.stringify(prefillHost) + ',' + JSON.stringify(prefillName) + ')">Capture this node</button>';
+            }
+
+            // Ready image options for Overview tab image selector.
+            const imgOptions = images
+                .filter(i => i.status === 'ready')
+                .map(i => `<option value="${escHtml(i.id)}" ${node.base_image_id === i.id ? 'selected' : ''}>${escHtml(i.name)}${i.version ? ' (' + i.version + ')' : ''}</option>`)
+                .join('');
+
+            // Node group options for Overview tab.
+            const groupOptions = nodeGroups
+                .map(g => `<option value="${escHtml(g.id)}" ${node.group_id === g.id ? 'selected' : ''}>${escHtml(g.name)}</option>`)
+                .join('');
+
+            // Discovered NIC MACs for Network tab (for interface editor MAC dropdowns).
+            const discoveredMACs = hw && hw.NICs ? hw.NICs.map(n => n.MAC || n.MACAddress).filter(Boolean) : [];
+            const discoveredMACsJSON = JSON.stringify(discoveredMACs);
+
             App.render(`
                 <div class="breadcrumb">
                     <a href="#/nodes">Nodes</a>
@@ -2426,7 +2467,7 @@ const Pages = {
                 </div>
                 <div class="page-header">
                     <div style="display:flex;align-items:center;gap:12px">
-                        <button class="detail-back-btn" onclick="Router.navigate('/nodes')">
+                        <button class="detail-back-btn" onclick="Pages._nodeDetailBack()">
                             <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
                                 <polyline points="15 18 9 12 15 6"/>
                             </svg>
@@ -2444,120 +2485,145 @@ const Pages = {
                         ${nodeBadge(node)}
                     </div>
                     <div class="flex gap-8">
-                        ${(() => {
-                            // Show "Capture this node" when the node has a reachable IP configured.
-                            const iface = (node.interfaces || []).find(i => i.ip_address);
-                            if (!iface) return '';
-                            const ip = iface.ip_address.split('/')[0]; // strip CIDR suffix
-                            const prefillHost = 'root@' + ip;
-                            const prefillName = (node.hostname && node.hostname !== '(none)')
-                                ? node.hostname.toLowerCase().replace(/[^a-z0-9-]/g, '-') + '-capture'
-                                : '';
-                            return '<button class="btn btn-secondary" onclick="Pages.showCaptureModal(' +
-                                JSON.stringify(prefillHost) + ',' + JSON.stringify(prefillName) + ')">Capture this node</button>';
-                        })()}
-                        <button class="btn btn-secondary" onclick='Pages.showNodeModal(${JSON.stringify(JSON.stringify(node))}, ${JSON.stringify(JSON.stringify(images))})'>Edit</button>
+                        ${captureBtn}
+                        <div class="actions-dropdown" id="node-actions-dropdown">
+                            <button class="btn btn-secondary" onclick="Pages._toggleActionsDropdown()">
+                                Actions
+                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" style="width:13px;height:13px"><polyline points="6 9 12 15 18 9"/></svg>
+                            </button>
+                            <div class="actions-dropdown-menu" id="node-actions-menu">
+                                <button class="actions-dropdown-item" onclick="Pages._nodeActionsRediscover('${node.id}');Pages._toggleActionsDropdown()">Re-discover hardware</button>
+                                <button class="actions-dropdown-item" onclick="Pages._nodeActionsTriggerReimage('${node.id}','${escHtml(displayName)}');Pages._toggleActionsDropdown()">Trigger reimage</button>
+                                ${iface ? `<button class="actions-dropdown-item" onclick="Pages.showCaptureModal(${JSON.stringify('root@' + iface.ip_address.split('/')[0])},${JSON.stringify((node.hostname && node.hostname !== '(none)') ? node.hostname.toLowerCase().replace(/[^a-z0-9-]/g, '-') + '-capture' : '')});Pages._toggleActionsDropdown()">Capture as image</button>` : ''}
+                                <div class="actions-dropdown-sep"></div>
+                                <button class="actions-dropdown-item danger" onclick="Pages.deleteNodeAndGoBack('${node.id}', '${escHtml(displayName)}');Pages._toggleActionsDropdown()">Delete node</button>
+                            </div>
+                        </div>
                         <button class="btn btn-danger btn-sm" onclick="Pages.deleteNodeAndGoBack('${node.id}', '${escHtml(displayName)}')">Delete</button>
                     </div>
                 </div>
 
-                <div class="tab-bar">
-                    <div class="tab active" onclick="Pages._switchTab(this, 'tab-overview')">Overview</div>
-                    <div class="tab" onclick="Pages._switchTab(this, 'tab-hardware')">Hardware</div>
-                    <div class="tab" onclick="Pages._switchTab(this, 'tab-bmc');Pages._onBMCTabOpen('${node.id}', ${!!(node.bmc || node.power_provider)})">Power / IPMI</div>
-                    <div class="tab" onclick="Pages._switchTab(this, 'tab-disklayout');Pages._onDiskLayoutTabOpen('${node.id}')">Disk Layout</div>
-                    <div class="tab" onclick="Pages._switchTab(this, 'tab-mounts');Pages._onMountsTabOpen('${node.id}')">Mounts</div>
-                    <div class="tab" onclick="Pages._switchTab(this, 'tab-config')">Configuration</div>
-                    <div class="tab" onclick="Pages._switchTab(this, 'tab-logs')">Logs</div>
+                <div class="tab-bar" id="node-tab-bar">
+                    <div class="tab active" id="node-tab-btn-overview" onclick="Pages._switchNodeTab(this, 'tab-overview', 'overview')">Overview</div>
+                    <div class="tab" id="node-tab-btn-hardware" onclick="Pages._switchNodeTab(this, 'tab-hardware', 'hardware')">Hardware</div>
+                    <div class="tab" id="node-tab-btn-network" onclick="Pages._switchNodeTab(this, 'tab-network', 'network')">Network</div>
+                    <div class="tab" id="node-tab-btn-bmc" onclick="Pages._switchNodeTab(this, 'tab-bmc', 'bmc');Pages._onBMCTabOpen('${node.id}', ${!!(node.bmc || node.power_provider)})">Power / IPMI</div>
+                    <div class="tab" id="node-tab-btn-disklayout" onclick="Pages._switchNodeTab(this, 'tab-disklayout', 'disklayout');Pages._onDiskLayoutTabOpen('${node.id}')">Disk Layout</div>
+                    <div class="tab" id="node-tab-btn-mounts" onclick="Pages._switchNodeTab(this, 'tab-mounts', 'mounts');Pages._onMountsTabOpen('${node.id}')">Mounts</div>
+                    <div class="tab" id="node-tab-btn-config" onclick="Pages._switchNodeTab(this, 'tab-config', 'config')">Configuration</div>
+                    <div class="tab" id="node-tab-btn-logs" onclick="Pages._switchNodeTab(this, 'tab-logs', 'logs');Pages.loadNodeLogs('${escHtml(node.primary_mac)}')">Logs</div>
                 </div>
 
-                <!-- Overview tab -->
+                <!-- Overview tab — inline editable -->
                 <div id="tab-overview" class="tab-panel active">
+                    <div id="tab-save-bar-overview" class="tab-save-bar" style="display:none">
+                        <span class="save-status modified" id="tab-save-status-overview">Unsaved changes</span>
+                        <button class="btn btn-secondary btn-sm" onclick="Pages._tabRevert('overview')" id="tab-revert-overview">Revert</button>
+                        <button class="btn btn-primary btn-sm" onclick="Pages._tabSaveOverview('${node.id}')" id="tab-save-overview">Save</button>
+                    </div>
                     ${cardWrap('Node Details', `
+                        <div class="card-body">
+                            <div class="form-grid" style="margin-bottom:0">
+                                <div class="form-group">
+                                    <label>Hostname</label>
+                                    <input type="text" id="ov-hostname" value="${escHtml(node.hostname || '')}"
+                                        placeholder="clonr-node" pattern="^[a-zA-Z0-9][a-zA-Z0-9.-]*$"
+                                        oninput="Pages._tabMarkDirty('overview')">
+                                </div>
+                                <div class="form-group">
+                                    <label>FQDN</label>
+                                    <input type="text" id="ov-fqdn" value="${escHtml(node.fqdn || '')}"
+                                        placeholder="node.example.com"
+                                        oninput="Pages._tabMarkDirty('overview')">
+                                </div>
+                                <div class="form-group">
+                                    <label>Base Image</label>
+                                    <select id="ov-base-image" onchange="Pages._tabMarkDirty('overview');Pages._checkRoleMismatchInline(this.value, ${JSON.stringify(node)}, ${JSON.stringify(images)})">
+                                        <option value="">No image assigned</option>
+                                        ${imgOptions}
+                                    </select>
+                                    <div id="ov-role-mismatch-warning" class="alert alert-warning" style="display:none;margin-top:6px;font-size:12px"></div>
+                                </div>
+                                <div class="form-group">
+                                    <label>Node Group</label>
+                                    <select id="ov-group-id" onchange="Pages._tabMarkDirty('overview')">
+                                        <option value="">None</option>
+                                        ${groupOptions}
+                                    </select>
+                                </div>
+                                <div class="form-group" style="grid-column:1/-1">
+                                    <label>Groups / Tags <span style="font-size:11px;color:var(--text-secondary)">(comma-separated)</span></label>
+                                    <input type="text" id="ov-groups" value="${escHtml((node.groups || []).join(', '))}"
+                                        placeholder="compute, gpu, infiniband"
+                                        oninput="Pages._tabMarkDirty('overview')">
+                                </div>
+                                <div class="form-group" style="grid-column:1/-1">
+                                    <label>Reimage Status</label>
+                                    <div style="display:flex;align-items:center;gap:12px;padding:8px 0">
+                                        ${node.reimage_pending
+                                            ? `<span class="badge badge-warning">Reimage pending</span>
+                                               <span class="text-dim" style="font-size:12px">Node will re-deploy on next PXE boot</span>`
+                                            : `<span class="badge badge-neutral">Normal</span>
+                                               <button type="button" class="btn btn-secondary btn-sm" onclick="Pages._nodeActionsTriggerReimage('${node.id}', '${escHtml(displayName)}')">Request Reimage</button>`}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>`)}
+
+                    ${cardWrap('Node Info', `
                         <div class="card-body">
                             <div class="kv-grid">
                                 <div class="kv-item"><div class="kv-key">ID</div><div class="kv-value">${escHtml(node.id)}</div></div>
-                                <div class="kv-item"><div class="kv-key">Hostname</div><div class="kv-value">
-                                    ${(node.hostname && node.hostname !== '(none)')
-                                        ? escHtml(node.hostname) + (node.hostname_auto ? ' <span class="badge badge-neutral badge-sm" title="Auto-generated hostname">auto</span>' : '')
-                                        : '<span class="text-dim" style="font-style:italic">Unassigned</span>'}
-                                </div></div>
-                                <div class="kv-item"><div class="kv-key">FQDN</div><div class="kv-value">${escHtml(node.fqdn || '—')}</div></div>
-                                <div class="kv-item"><div class="kv-key">Primary MAC</div><div class="kv-value">${escHtml(node.primary_mac)}</div></div>
-                                <div class="kv-item"><div class="kv-key">Base Image</div><div class="kv-value">
-                                    ${img
-                                        ? `<a href="#/images/${img.id}">${escHtml(img.name)}</a> ${badge(img.status)}`
-                                        : (node.base_image_id ? escHtml(node.base_image_id) : '—')}
-                                </div></div>
+                                <div class="kv-item"><div class="kv-key">Primary MAC</div><div class="kv-value text-mono">${escHtml(node.primary_mac)}</div></div>
                                 <div class="kv-item"><div class="kv-key">Status</div><div class="kv-value">${nodeBadge(node)}</div></div>
-                                <div class="kv-item"><div class="kv-key">Groups</div><div class="kv-value">
-                                    ${(node.groups || []).map(g => `<span class="badge badge-neutral">${escHtml(g)}</span>`).join(' ') || '—'}
+                                <div class="kv-item"><div class="kv-key">Current Image</div><div class="kv-value">
+                                    ${img ? `<a href="#/images/${img.id}">${escHtml(img.name)}</a> ${badge(img.status)}` : (node.base_image_id ? escHtml(node.base_image_id) : '—')}
                                 </div></div>
-                                <div class="kv-item"><div class="kv-key">Kernel Args</div><div class="kv-value">${escHtml(node.kernel_args || '—')}</div></div>
+                                <div class="kv-item"><div class="kv-key">Last Deploy OK</div><div class="kv-value">${node.last_deploy_succeeded_at ? fmtDate(node.last_deploy_succeeded_at) : '—'}</div></div>
+                                <div class="kv-item"><div class="kv-key">Last Deploy Failed</div><div class="kv-value">${node.last_deploy_failed_at ? fmtDate(node.last_deploy_failed_at) : '—'}</div></div>
                                 <div class="kv-item"><div class="kv-key">Created</div><div class="kv-value">${fmtDate(node.created_at)}</div></div>
                                 <div class="kv-item"><div class="kv-key">Updated</div><div class="kv-value">${fmtDate(node.updated_at)}</div></div>
                             </div>
                         </div>`)}
-
-                    ${node.interfaces && node.interfaces.length ? cardWrap('Network Interfaces', `
-                        <div class="table-wrap"><table>
-                            <thead><tr><th>Name</th><th>MAC</th><th>IP (CIDR)</th><th>Gateway</th><th>DNS</th><th>MTU</th></tr></thead>
-                            <tbody>
-                            ${node.interfaces.map(iface => `<tr>
-                                <td class="mono">${escHtml(iface.name || '—')}</td>
-                                <td class="mono dim">${escHtml(iface.mac_address || '—')}</td>
-                                <td class="mono">${escHtml(iface.ip_address || '—')}</td>
-                                <td class="mono dim">${escHtml(iface.gateway || '—')}</td>
-                                <td class="mono dim">${(iface.dns || []).join(', ') || '—'}</td>
-                                <td class="mono dim">${iface.mtu || '—'}</td>
-                            </tr>`).join('')}
-                            </tbody>
-                        </table></div>`) : ''}
                 </div>
 
-                <!-- Hardware tab -->
+                <!-- Hardware tab — read-only display + re-discover action -->
                 <div id="tab-hardware" class="tab-panel">
+                    <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+                        ${hw && hw.discovered_at ? `<span class="text-dim" style="font-size:12px">Last discovered: ${fmtRelative(hw.discovered_at)}</span>` : ''}
+                        <button class="btn btn-secondary btn-sm" style="margin-left:auto" onclick="Pages._nodeActionsRediscover('${node.id}')">
+                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" style="width:13px;height:13px"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                            Re-discover Hardware
+                        </button>
+                    </div>
                     ${hw ? this._hardwareProfile(hw) : `<div class="card"><div class="card-body">${emptyState('No hardware profile', 'Hardware is discovered when a node registers via PXE boot.')}</div></div>`}
                 </div>
 
-                <!-- Power / IPMI tab — always rendered; content depends on provider config -->
-                <div id="tab-bmc" class="tab-panel">
-                    ${node.power_provider && node.power_provider.type ? `
-                    ${cardWrap('Power Provider', `
+                <!-- Network tab — inline editable interface configs -->
+                <div id="tab-network" class="tab-panel">
+                    <div id="tab-save-bar-network" class="tab-save-bar" style="display:none">
+                        <span class="save-status modified" id="tab-save-status-network">Unsaved changes</span>
+                        <button class="btn btn-secondary btn-sm" onclick="Pages._tabRevert('network')" id="tab-revert-network">Revert</button>
+                        <button class="btn btn-primary btn-sm" onclick="Pages._tabSaveNetwork('${node.id}')" id="tab-save-network">Save</button>
+                    </div>
+                    ${cardWrap('Network Interfaces', `
                         <div class="card-body">
-                            <div class="kv-grid" style="margin-bottom:12px">
-                                <div class="kv-item">
-                                    <div class="kv-key">Type</div>
-                                    <div class="kv-value">
-                                        <span class="badge badge-neutral">${escHtml(node.power_provider.type)}</span>
-                                    </div>
-                                </div>
-                                ${node.power_provider.type === 'proxmox' && node.power_provider.fields ? `
-                                <div class="kv-item"><div class="kv-key">API URL</div><div class="kv-value text-mono">${escHtml(node.power_provider.fields.api_url || '—')}</div></div>
-                                <div class="kv-item"><div class="kv-key">PVE Node</div><div class="kv-value text-mono">${escHtml(node.power_provider.fields.node || '—')}</div></div>
-                                <div class="kv-item"><div class="kv-key">VM ID</div><div class="kv-value text-mono">${escHtml(node.power_provider.fields.vmid || '—')}</div></div>
-                                <div class="kv-item"><div class="kv-key">Username</div><div class="kv-value text-mono">${escHtml(node.power_provider.fields.username || '—')}</div></div>
-                                <div class="kv-item"><div class="kv-key">Skip TLS</div><div class="kv-value">${node.power_provider.fields.insecure === 'true' ? 'Yes' : 'No'}</div></div>
-                                ` : ''}
+                            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+                                <span class="text-dim" style="font-size:12px">Configure logical interfaces. Discovered interfaces are shown read-only on the Hardware tab.</span>
+                                <button type="button" class="btn btn-secondary btn-sm" onclick="Pages._netAddInterface(${JSON.stringify(discoveredMACsJSON)})">+ Add Interface</button>
                             </div>
-                            <div class="flex gap-8">
-                                <button class="btn btn-secondary btn-sm" onclick="Pages._doFlipToDisk('${node.id}')">
-                                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" style="width:13px;height:13px"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
-                                    Flip Next Boot → Disk
-                                </button>
-                                <button class="btn btn-danger btn-sm" onclick="Pages._doFlipToDisk('${node.id}', true)">
-                                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" style="width:13px;height:13px"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-                                    Flip → Disk + Reboot
-                                </button>
-                                <button class="btn btn-secondary btn-sm" style="margin-left:auto" onclick='Pages.showNodeModal(${JSON.stringify(JSON.stringify(node))}, ${JSON.stringify(JSON.stringify([]))})'>Edit Provider</button>
+                            <div id="net-interfaces-list">
+                                ${(node.interfaces || []).length === 0
+                                    ? `<div id="net-empty" style="text-align:center;padding:16px;color:var(--text-dim);font-size:12px">No interfaces configured</div>`
+                                    : (node.interfaces || []).map((iface, i) => Pages._netInterfaceRowHTML(i, iface, discoveredMACs)).join('')}
                             </div>
-                            <div id="power-action-feedback" style="display:none;margin-top:10px" class="alert alert-info"></div>
-                        </div>`,
-                        ''
-                    )}` : ''}
+                        </div>`)}
+                </div>
 
-                    ${node.bmc && node.bmc.ip_address ? `
-                    ${cardWrap('Power Status',
+                <!-- Power / IPMI tab — power controls + inline provider editor -->
+                <div id="tab-bmc" class="tab-panel">
+                    ${(node.bmc && node.bmc.ip_address) || (node.power_provider && node.power_provider.type) ? `
+                    ${node.bmc && node.bmc.ip_address ? cardWrap('Power Status',
                         `<div class="card-body">
                             <div id="power-status-panel" style="display:flex;align-items:center;gap:16px;margin-bottom:16px">
                                 <div id="power-indicator" style="width:18px;height:18px;border-radius:50%;background:var(--border);flex-shrink:0"></div>
@@ -2570,9 +2636,9 @@ const Pages = {
                             <div id="power-error-msg" style="display:none" class="alert alert-error"></div>
                         </div>`,
                         ''
-                    )}
+                    ) : ''}
 
-                    ${cardWrap('Power Controls',
+                    ${node.bmc && node.bmc.ip_address ? cardWrap('Power Controls',
                         `<div class="card-body">
                             <div class="flex gap-8" style="flex-wrap:wrap;margin-bottom:8px">
                                 <button id="btn-power-on"    class="btn btn-secondary btn-sm" onclick="Pages._doPowerAction('${node.id}', 'on')">Power On</button>
@@ -2589,13 +2655,29 @@ const Pages = {
                                     <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" style="width:13px;height:13px"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
                                     Boot to Disk
                                 </button>
+                                <button class="btn btn-secondary btn-sm" onclick="Pages._doFlipToDisk('${node.id}')">
+                                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" style="width:13px;height:13px"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+                                    Flip Next Boot → Disk
+                                </button>
+                                <button class="btn btn-danger btn-sm" onclick="Pages._doFlipToDisk('${node.id}', true)">
+                                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" style="width:13px;height:13px"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                                    Flip → Disk + Reboot
+                                </button>
                             </div>
                             <div id="power-action-feedback" style="display:none;margin-top:10px" class="alert alert-info"></div>
                         </div>`,
                         ''
-                    )}
+                    ) : (node.power_provider && node.power_provider.type ? cardWrap('Power Actions',
+                        `<div class="card-body">
+                            <div class="flex gap-8">
+                                <button class="btn btn-secondary btn-sm" onclick="Pages._doFlipToDisk('${node.id}')">Flip Next Boot → Disk</button>
+                                <button class="btn btn-danger btn-sm" onclick="Pages._doFlipToDisk('${node.id}', true)">Flip → Disk + Reboot</button>
+                            </div>
+                            <div id="power-action-feedback" style="display:none;margin-top:10px" class="alert alert-info"></div>
+                        </div>`, ''
+                    ) : '')}
 
-                    ${cardWrap('BMC Information',
+                    ${node.bmc && node.bmc.ip_address ? cardWrap('BMC Information',
                         `<div class="card-body">
                             <div class="kv-grid">
                                 <div class="kv-item"><div class="kv-key">IP Address</div><div class="kv-value text-mono">${escHtml(node.bmc.ip_address || '—')}</div></div>
@@ -2603,55 +2685,156 @@ const Pages = {
                                 <div class="kv-item"><div class="kv-key">Gateway</div><div class="kv-value text-mono">${escHtml(node.bmc.gateway || '—')}</div></div>
                                 <div class="kv-item"><div class="kv-key">Username</div><div class="kv-value text-mono">${escHtml(node.bmc.username || '—')}</div></div>
                             </div>
-                            <div style="margin-top:12px">
-                                <button class="btn btn-secondary btn-sm" onclick='Pages.showNodeModal(${JSON.stringify(JSON.stringify(node))}, ${JSON.stringify(JSON.stringify([]))})'>Edit BMC Config</button>
-                            </div>
                         </div>`,
                         ''
-                    )}
+                    ) : ''}
 
-                    ${cardWrap('Sensor Readings',
+                    ${node.bmc && node.bmc.ip_address ? cardWrap('Sensor Readings',
                         `<div id="sensor-table-wrap"><div class="loading"><div class="spinner"></div>Loading sensors…</div></div>`,
                         `<button class="btn btn-secondary btn-sm" onclick="Pages._refreshSensors('${node.id}')">Refresh</button>`
-                    )}`
-                    : (!node.power_provider || !node.power_provider.type ? `<div class="card"><div class="card-body">${emptyState(
-                        'No power management configured',
-                        'Configure a power provider (Proxmox VE or IPMI/BMC) to enable remote power controls and auto boot-flip after deployment.',
-                        `<button class="btn btn-primary btn-sm" onclick='Pages.showNodeModal(${JSON.stringify(JSON.stringify(node))}, ${JSON.stringify(JSON.stringify([]))})'>Configure Power</button>`
-                    )}</div></div>` : '')}
+                    ) : ''}
+                    ` : ''}
+
+                    <!-- Power Provider Configuration — always shown, inline editable -->
+                    <div id="tab-save-bar-bmc" class="tab-save-bar" style="display:none">
+                        <span class="save-status modified" id="tab-save-status-bmc">Unsaved changes</span>
+                        <button class="btn btn-secondary btn-sm" onclick="Pages._tabRevert('bmc')" id="tab-revert-bmc">Revert</button>
+                        <button class="btn btn-primary btn-sm" onclick="Pages._tabSavePower('${node.id}')" id="tab-save-bmc">Save</button>
+                    </div>
+                    ${cardWrap('Power Provider Configuration', `
+                        <div class="card-body">
+                            <div class="form-grid">
+                                <div class="form-group" style="grid-column:1/-1">
+                                    <label>Provider Type</label>
+                                    <select id="pp-type" onchange="Pages._onPowerProviderInlineTypeChange(this.value);Pages._tabMarkDirty('bmc')">
+                                        <option value="" ${!node.power_provider || !node.power_provider.type ? 'selected' : ''}>None — no power management</option>
+                                        <option value="ipmi" ${node.power_provider && node.power_provider.type === 'ipmi' ? 'selected' : ''}>IPMI (uses BMC config)</option>
+                                        <option value="proxmox" ${node.power_provider && node.power_provider.type === 'proxmox' ? 'selected' : ''}>Proxmox VE</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div id="pp-inline-ipmi-fields" style="display:${node.power_provider && node.power_provider.type === 'ipmi' ? '' : 'none'}">
+                                <div class="form-grid">
+                                    <div class="form-group">
+                                        <label>BMC IP Address</label>
+                                        <input type="text" id="pp-ipmi-ip"
+                                            value="${escHtml(node.power_provider && node.power_provider.fields ? node.power_provider.fields.ip || '' : '')}"
+                                            placeholder="192.168.1.100" oninput="Pages._tabMarkDirty('bmc')">
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Username</label>
+                                        <input type="text" id="pp-ipmi-username"
+                                            value="${escHtml(node.power_provider && node.power_provider.fields ? node.power_provider.fields.username || '' : '')}"
+                                            placeholder="admin" oninput="Pages._tabMarkDirty('bmc')">
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Password <span style="font-size:11px;color:var(--text-secondary)">(blank = keep existing)</span></label>
+                                        <input type="password" id="pp-ipmi-password" placeholder="••••••••" oninput="Pages._tabMarkDirty('bmc')" autocomplete="new-password">
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Channel</label>
+                                        <input type="number" id="pp-ipmi-channel"
+                                            value="${escHtml(node.power_provider && node.power_provider.fields ? node.power_provider.fields.channel || '1' : '1')}"
+                                            min="1" max="15" oninput="Pages._tabMarkDirty('bmc')">
+                                    </div>
+                                </div>
+                            </div>
+                            <div id="pp-inline-proxmox-fields" style="display:${node.power_provider && node.power_provider.type === 'proxmox' ? '' : 'none'}">
+                                <div class="form-grid">
+                                    <div class="form-group">
+                                        <label>API URL</label>
+                                        <input type="text" id="pp-pve-url"
+                                            value="${escHtml(node.power_provider && node.power_provider.fields ? node.power_provider.fields.api_url || '' : '')}"
+                                            placeholder="https://proxmox.example.com:8006" oninput="Pages._tabMarkDirty('bmc')">
+                                    </div>
+                                    <div class="form-group">
+                                        <label>PVE Node Name</label>
+                                        <input type="text" id="pp-pve-node"
+                                            value="${escHtml(node.power_provider && node.power_provider.fields ? node.power_provider.fields.node || '' : '')}"
+                                            placeholder="pve" oninput="Pages._tabMarkDirty('bmc')">
+                                    </div>
+                                    <div class="form-group">
+                                        <label>VM ID</label>
+                                        <input type="text" id="pp-pve-vmid"
+                                            value="${escHtml(node.power_provider && node.power_provider.fields ? node.power_provider.fields.vmid || '' : '')}"
+                                            placeholder="202" oninput="Pages._tabMarkDirty('bmc')">
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Username</label>
+                                        <input type="text" id="pp-pve-username"
+                                            value="${escHtml(node.power_provider && node.power_provider.fields ? node.power_provider.fields.username || '' : '')}"
+                                            placeholder="root@pam" oninput="Pages._tabMarkDirty('bmc')">
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Password <span style="font-size:11px;color:var(--text-secondary)">(blank = keep existing)</span></label>
+                                        <input type="password" id="pp-pve-password" placeholder="••••••••" oninput="Pages._tabMarkDirty('bmc')" autocomplete="new-password">
+                                    </div>
+                                    <div class="form-group" style="display:flex;align-items:center;gap:8px;padding-top:22px">
+                                        <input type="checkbox" id="pp-pve-insecure" ${node.power_provider && node.power_provider.fields && node.power_provider.fields.insecure === 'true' ? 'checked' : ''}
+                                            onchange="Pages._tabMarkDirty('bmc')">
+                                        <label for="pp-pve-insecure" style="margin:0;font-weight:400;cursor:pointer">Skip TLS verification (self-signed certs)</label>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>`)}
                 </div>
 
-                <!-- Disk Layout tab -->
+                <!-- Disk Layout tab — Richard's existing inline editor, untouched -->
                 <div id="tab-disklayout" class="tab-panel">
                     <div id="disklayout-content">
                         <div class="loading"><div class="spinner"></div>Loading layout…</div>
                     </div>
                 </div>
 
-                <!-- Mounts tab -->
+                <!-- Mounts tab — Richard's existing inline editor, untouched -->
                 <div id="tab-mounts" class="tab-panel">
                     <div id="mounts-content">
                         <div class="loading"><div class="spinner"></div>Loading mounts…</div>
                     </div>
                 </div>
 
-                <!-- Configuration tab -->
+                <!-- Configuration tab — inline editable SSH keys, kernel args, custom vars -->
                 <div id="tab-config" class="tab-panel">
-                    ${node.ssh_keys && node.ssh_keys.length ? cardWrap('SSH Public Keys', `
+                    <div id="tab-save-bar-config" class="tab-save-bar" style="display:none">
+                        <span class="save-status modified" id="tab-save-status-config">Unsaved changes</span>
+                        <button class="btn btn-secondary btn-sm" onclick="Pages._tabRevert('config')" id="tab-revert-config">Revert</button>
+                        <button class="btn btn-primary btn-sm" onclick="Pages._tabSaveConfig('${node.id}')" id="tab-save-config">Save</button>
+                    </div>
+                    ${cardWrap('SSH Authorized Keys', `
                         <div class="card-body">
-                            ${node.ssh_keys.map((k, i) => `
-                                <div style="margin-bottom:${i < node.ssh_keys.length - 1 ? '10px' : '0'}">
-                                    <pre class="json-block" style="font-size:11px;user-select:all">${escHtml(k)}</pre>
-                                </div>`).join('')}
-                        </div>`) : ''}
-
-                    ${Object.keys(node.custom_vars || {}).length ? cardWrap('Custom Variables', `
-                        <div class="card-body">
-                            <div class="kv-grid">
-                            ${Object.entries(node.custom_vars).map(([k, v]) => `
-                                <div class="kv-item"><div class="kv-key">${escHtml(k)}</div><div class="kv-value">${escHtml(v)}</div></div>`).join('')}
+                            <div class="form-group" style="margin-bottom:0">
+                                <label>One key per line</label>
+                                <textarea id="cfg-ssh-keys" rows="6"
+                                    placeholder="ssh-ed25519 AAAA…&#10;ssh-rsa AAAA…"
+                                    oninput="Pages._tabMarkDirty('config')"
+                                    style="font-family:var(--font-mono);font-size:12px">${escHtml((node.ssh_keys || []).join('\n'))}</textarea>
+                                <div id="cfg-ssh-keys-error" style="display:none;color:var(--error);font-size:12px;margin-top:4px"></div>
                             </div>
-                        </div>`) : ''}
+                        </div>`)}
+
+                    ${cardWrap('Kernel Arguments', `
+                        <div class="card-body">
+                            <div class="form-group" style="margin-bottom:0">
+                                <label>Extra kernel cmdline args appended at boot</label>
+                                <input type="text" id="cfg-kernel-args" value="${escHtml(node.kernel_args || '')}"
+                                    placeholder="quiet splash"
+                                    oninput="Pages._tabMarkDirty('config')">
+                                <div id="cfg-kernel-args-error" style="display:none;color:var(--error);font-size:12px;margin-top:4px"></div>
+                            </div>
+                        </div>`)}
+
+                    ${cardWrap('Custom Variables', `
+                        <div class="card-body">
+                            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+                                <span class="text-dim" style="font-size:12px">Key/value pairs available as template variables during deployment</span>
+                                <button type="button" class="btn btn-secondary btn-sm" onclick="Pages._cfgAddVar()">+ Add Variable</button>
+                            </div>
+                            <div id="cfg-vars-list">
+                                ${Object.keys(node.custom_vars || {}).length === 0
+                                    ? `<div id="cfg-vars-empty" style="text-align:center;padding:12px;color:var(--text-dim);font-size:12px">No custom variables</div>`
+                                    : Object.entries(node.custom_vars || {}).map(([k, v], i) => Pages._cfgVarRowHTML(i, k, v)).join('')}
+                            </div>
+                        </div>`)}
 
                     ${cardWrap('Raw JSON', `<div class="card-body"><pre class="json-block">${escHtml(JSON.stringify(node, null, 2))}</pre></div>`)}
                 </div>
@@ -2673,33 +2856,685 @@ const Pages = {
                 </div>
             `);
 
-            // Load static logs for the node logs tab when it becomes active.
-            document.querySelectorAll('.tab').forEach(tab => {
-                tab.addEventListener('click', () => {
-                    if (tab.textContent.trim() === 'Logs') {
-                        Pages.loadNodeLogs(node.primary_mac);
-                    }
-                });
-            });
+            // Store original values for revert on each editable tab.
+            Pages._nodeEditorState['overview'] = {
+                dirty: false,
+                original: {
+                    hostname:      node.hostname || '',
+                    fqdn:          node.fqdn || '',
+                    base_image_id: node.base_image_id || '',
+                    group_id:      node.group_id || '',
+                    groups:        (node.groups || []).join(', '),
+                },
+            };
+            Pages._nodeEditorState['bmc'] = {
+                dirty: false,
+                original: {
+                    pp_type:          (node.power_provider && node.power_provider.type) || '',
+                    pp_ipmi_ip:       (node.power_provider && node.power_provider.fields && node.power_provider.fields.ip) || '',
+                    pp_ipmi_username: (node.power_provider && node.power_provider.fields && node.power_provider.fields.username) || '',
+                    pp_ipmi_channel:  (node.power_provider && node.power_provider.fields && node.power_provider.fields.channel) || '1',
+                    pp_pve_url:       (node.power_provider && node.power_provider.fields && node.power_provider.fields.api_url) || '',
+                    pp_pve_node:      (node.power_provider && node.power_provider.fields && node.power_provider.fields.node) || '',
+                    pp_pve_vmid:      (node.power_provider && node.power_provider.fields && node.power_provider.fields.vmid) || '',
+                    pp_pve_username:  (node.power_provider && node.power_provider.fields && node.power_provider.fields.username) || '',
+                    pp_pve_insecure:  !!(node.power_provider && node.power_provider.fields && node.power_provider.fields.insecure === 'true'),
+                },
+            };
+            Pages._nodeEditorState['config'] = {
+                dirty: false,
+                original: {
+                    ssh_keys:    (node.ssh_keys || []).join('\n'),
+                    kernel_args: node.kernel_args || '',
+                    custom_vars: Object.assign({}, node.custom_vars || {}),
+                },
+            };
+            Pages._nodeEditorState['network'] = {
+                dirty: false,
+                original: {
+                    interfaces: JSON.parse(JSON.stringify(node.interfaces || [])),
+                },
+            };
 
             // Kick off initial power status fetch if any power management is configured.
-            // This runs immediately so status is ready when the user opens the tab.
             if ((node.bmc && node.bmc.ip_address) || (node.power_provider && node.power_provider.type)) {
                 Pages._refreshPowerStatus(node.id);
             }
+
+            // Close actions dropdown when clicking outside.
+            document.addEventListener('click', Pages._closeActionsDropdownOnOutsideClick);
 
         } catch (e) {
             App.render(alertBox(`Failed to load node: ${e.message}`));
         }
     },
 
+    // _closeActionsDropdownOnOutsideClick closes the actions dropdown when the user
+    // clicks anywhere outside it. Bound as a document listener, removed on navigate.
+    _closeActionsDropdownOnOutsideClick(e) {
+        const dropdown = document.getElementById('node-actions-dropdown');
+        if (dropdown && !dropdown.contains(e.target)) {
+            const menu = document.getElementById('node-actions-menu');
+            if (menu) menu.classList.remove('open');
+        }
+    },
+
+    _toggleActionsDropdown() {
+        const menu = document.getElementById('node-actions-menu');
+        if (menu) menu.classList.toggle('open');
+    },
+
+    // _nodeDetailBack navigates back to /nodes, prompting if there are unsaved changes.
+    _nodeDetailBack() {
+        const dirtyTabs = Object.entries(Pages._nodeEditorState)
+            .filter(([, s]) => s.dirty)
+            .map(([tab]) => tab);
+        if (dirtyTabs.length === 0) {
+            Router.navigate('/nodes');
+            return;
+        }
+        if (confirm(`You have unsaved changes on the ${dirtyTabs.join(', ')} tab(s). Leave without saving?`)) {
+            Router.navigate('/nodes');
+        }
+    },
+
+    // _switchNodeTab handles tab switching with unsaved-changes protection.
+    _switchNodeTab(tabEl, panelId, tabKey) {
+        const currentTabKey = Pages._nodeCurrentTab || 'overview';
+
+        // Check if current tab is dirty.
+        const currentState = Pages._nodeEditorState[currentTabKey];
+        if (currentState && currentState.dirty) {
+            // Show unsaved-changes dialog.
+            Pages._showUnsavedChangesDialog(currentTabKey, () => {
+                // Discard and continue.
+                Pages._tabRevert(currentTabKey);
+                Pages._doSwitchNodeTab(tabEl, panelId, tabKey);
+            }, async () => {
+                // Save and continue.
+                const saved = await Pages._tabSaveByKey(currentTabKey, Pages._nodeEditorNodeId);
+                if (saved) Pages._doSwitchNodeTab(tabEl, panelId, tabKey);
+            });
+            return;
+        }
+
+        Pages._doSwitchNodeTab(tabEl, panelId, tabKey);
+    },
+
+    _doSwitchNodeTab(tabEl, panelId, tabKey) {
+        document.querySelectorAll('#node-tab-bar .tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+        tabEl.classList.add('active');
+        const panel = document.getElementById(panelId);
+        if (panel) panel.classList.add('active');
+        Pages._nodeCurrentTab = tabKey;
+    },
+
+    // _switchTab is kept for non-node pages (image detail uses it via tab-bar).
     _switchTab(tabEl, panelId) {
-        // Deactivate all tabs and panels.
         tabEl.closest('.tab-bar').querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
         document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
         tabEl.classList.add('active');
         const panel = document.getElementById(panelId);
         if (panel) panel.classList.add('active');
+    },
+
+    // _showUnsavedChangesDialog shows a confirm dialog for unsaved changes protection.
+    // onDiscard — called when user clicks "Discard and continue"
+    // onSaveAndContinue — called when user clicks "Save and continue"
+    _showUnsavedChangesDialog(tabName, onDiscard, onSaveAndContinue) {
+        const existing = document.getElementById('unsaved-changes-modal');
+        if (existing) existing.remove();
+
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.id = 'unsaved-changes-modal';
+        overlay.innerHTML = `
+            <div class="modal" style="max-width:440px">
+                <div class="modal-header">
+                    <span class="modal-title">Unsaved Changes</span>
+                </div>
+                <div class="modal-body">
+                    <p style="margin:0 0 16px;color:var(--text-secondary);font-size:13px">
+                        You have unsaved changes on the <strong>${escHtml(tabName)}</strong> tab.
+                    </p>
+                    <div class="form-actions" style="margin-top:0">
+                        <button class="btn btn-secondary" id="ucd-cancel">Cancel</button>
+                        <button class="btn btn-secondary" id="ucd-discard">Discard and continue</button>
+                        <button class="btn btn-primary" id="ucd-save">Save and continue</button>
+                    </div>
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+
+        overlay.querySelector('#ucd-cancel').onclick  = () => overlay.remove();
+        overlay.querySelector('#ucd-discard').onclick = () => { overlay.remove(); onDiscard(); };
+        overlay.querySelector('#ucd-save').onclick    = () => { overlay.remove(); onSaveAndContinue(); };
+    },
+
+    // ── Tab dirty state tracking ───────────────────────────────────────────────
+
+    _tabMarkDirty(tabKey) {
+        const state = Pages._nodeEditorState[tabKey];
+        if (!state) return;
+        state.dirty = true;
+
+        const saveBar    = document.getElementById(`tab-save-bar-${tabKey}`);
+        const tabBtnEl   = document.getElementById(`node-tab-btn-${tabKey}`);
+        if (saveBar)  saveBar.style.display = '';
+        if (tabBtnEl) tabBtnEl.classList.add('tab-dirty');
+    },
+
+    _tabMarkClean(tabKey) {
+        const state = Pages._nodeEditorState[tabKey];
+        if (state) state.dirty = false;
+
+        const saveBar    = document.getElementById(`tab-save-bar-${tabKey}`);
+        const statusEl   = document.getElementById(`tab-save-status-${tabKey}`);
+        const tabBtnEl   = document.getElementById(`node-tab-btn-${tabKey}`);
+        if (saveBar)  saveBar.style.display = 'none';
+        if (statusEl) { statusEl.textContent = 'Saved'; statusEl.className = 'save-status saved'; }
+        if (tabBtnEl) tabBtnEl.classList.remove('tab-dirty');
+    },
+
+    _tabMarkSaving(tabKey) {
+        const statusEl = document.getElementById(`tab-save-status-${tabKey}`);
+        const saveBtn  = document.getElementById(`tab-save-${tabKey}`);
+        if (statusEl) { statusEl.textContent = 'Saving…'; statusEl.className = 'save-status'; }
+        if (saveBtn)  saveBtn.disabled = true;
+    },
+
+    _tabMarkError(tabKey, msg) {
+        const statusEl = document.getElementById(`tab-save-status-${tabKey}`);
+        const saveBtn  = document.getElementById(`tab-save-${tabKey}`);
+        if (statusEl) { statusEl.textContent = msg; statusEl.className = 'save-status error'; }
+        if (saveBtn)  { saveBtn.disabled = false; }
+    },
+
+    // _tabRevert resets the tab inputs back to original values without saving.
+    _tabRevert(tabKey) {
+        const state = Pages._nodeEditorState[tabKey];
+        if (!state) return;
+        const orig = state.original;
+
+        if (tabKey === 'overview') {
+            const h   = document.getElementById('ov-hostname');
+            const f   = document.getElementById('ov-fqdn');
+            const img = document.getElementById('ov-base-image');
+            const grp = document.getElementById('ov-group-id');
+            const gs  = document.getElementById('ov-groups');
+            if (h)   h.value   = orig.hostname;
+            if (f)   f.value   = orig.fqdn;
+            if (img) img.value = orig.base_image_id;
+            if (grp) grp.value = orig.group_id;
+            if (gs)  gs.value  = orig.groups;
+        } else if (tabKey === 'bmc') {
+            const pt = document.getElementById('pp-type');
+            if (pt) { pt.value = orig.pp_type; Pages._onPowerProviderInlineTypeChange(orig.pp_type); }
+            const ipIp  = document.getElementById('pp-ipmi-ip');
+            const ipUsr = document.getElementById('pp-ipmi-username');
+            const ipCh  = document.getElementById('pp-ipmi-channel');
+            if (ipIp)  ipIp.value  = orig.pp_ipmi_ip;
+            if (ipUsr) ipUsr.value = orig.pp_ipmi_username;
+            if (ipCh)  ipCh.value  = orig.pp_ipmi_channel;
+            const pveUrl  = document.getElementById('pp-pve-url');
+            const pveNode = document.getElementById('pp-pve-node');
+            const pveVmid = document.getElementById('pp-pve-vmid');
+            const pveUsr  = document.getElementById('pp-pve-username');
+            const pveIns  = document.getElementById('pp-pve-insecure');
+            if (pveUrl)  pveUrl.value   = orig.pp_pve_url;
+            if (pveNode) pveNode.value  = orig.pp_pve_node;
+            if (pveVmid) pveVmid.value  = orig.pp_pve_vmid;
+            if (pveUsr)  pveUsr.value   = orig.pp_pve_username;
+            if (pveIns)  pveIns.checked = orig.pp_pve_insecure;
+        } else if (tabKey === 'config') {
+            const keys = document.getElementById('cfg-ssh-keys');
+            const krnl = document.getElementById('cfg-kernel-args');
+            if (keys) keys.value = orig.ssh_keys;
+            if (krnl) krnl.value = orig.kernel_args;
+            // Re-render the custom vars list.
+            const list = document.getElementById('cfg-vars-list');
+            if (list) {
+                if (Object.keys(orig.custom_vars).length === 0) {
+                    list.innerHTML = `<div id="cfg-vars-empty" style="text-align:center;padding:12px;color:var(--text-dim);font-size:12px">No custom variables</div>`;
+                } else {
+                    list.innerHTML = Object.entries(orig.custom_vars).map(([k, v], i) => Pages._cfgVarRowHTML(i, k, v)).join('');
+                }
+            }
+        } else if (tabKey === 'network') {
+            const list = document.getElementById('net-interfaces-list');
+            if (list) {
+                if (orig.interfaces.length === 0) {
+                    list.innerHTML = `<div id="net-empty" style="text-align:center;padding:16px;color:var(--text-dim);font-size:12px">No interfaces configured</div>`;
+                } else {
+                    list.innerHTML = orig.interfaces.map((iface, i) => Pages._netInterfaceRowHTML(i, iface, [])).join('');
+                }
+            }
+        }
+
+        Pages._tabMarkClean(tabKey);
+    },
+
+    // _tabSaveByKey is a dispatch helper used by the unsaved-changes dialog.
+    // Returns true on success, false on failure.
+    async _tabSaveByKey(tabKey, nodeId) {
+        try {
+            if (tabKey === 'overview') await Pages._tabSaveOverview(nodeId);
+            else if (tabKey === 'bmc')    await Pages._tabSavePower(nodeId);
+            else if (tabKey === 'config') await Pages._tabSaveConfig(nodeId);
+            else if (tabKey === 'network') await Pages._tabSaveNetwork(nodeId);
+            return true;
+        } catch (_) {
+            return false;
+        }
+    },
+
+    // ── Per-tab save handlers ──────────────────────────────────────────────────
+
+    async _tabSaveOverview(nodeId) {
+        Pages._tabMarkSaving('overview');
+        const saveBtn = document.getElementById('tab-save-overview');
+
+        const hostname    = (document.getElementById('ov-hostname')?.value || '').trim();
+        const fqdn        = (document.getElementById('ov-fqdn')?.value || '').trim();
+        const baseImageId = document.getElementById('ov-base-image')?.value || '';
+        const groupId     = document.getElementById('ov-group-id')?.value || '';
+        const groupsRaw   = (document.getElementById('ov-groups')?.value || '');
+
+        // Validate hostname.
+        if (hostname && !/^[a-zA-Z0-9][a-zA-Z0-9.-]*$/.test(hostname)) {
+            Pages._tabMarkError('overview', 'Invalid hostname format');
+            if (saveBtn) saveBtn.disabled = false;
+            return;
+        }
+
+        const groups = groupsRaw.split(',').map(g => g.trim()).filter(Boolean);
+
+        try {
+            // Fetch current node to get all fields we're not changing (the API requires full body).
+            const existing = await API.nodes.get(nodeId);
+            const body = {
+                hostname:        hostname || existing.hostname,
+                fqdn,
+                primary_mac:     existing.primary_mac,
+                base_image_id:   baseImageId,
+                group_id:        groupId,
+                groups,
+                ssh_keys:        existing.ssh_keys || [],
+                kernel_args:     existing.kernel_args || '',
+                custom_vars:     existing.custom_vars || {},
+                interfaces:      existing.interfaces || [],
+                power_provider:  existing.power_provider || null,
+                extra_mounts:    existing.extra_mounts || [],
+                disk_layout_override: existing.disk_layout_override || null,
+            };
+            await API.nodes.update(nodeId, body);
+
+            // Update original state so subsequent reverts work correctly.
+            Pages._nodeEditorState['overview'].original = {
+                hostname, fqdn, base_image_id: baseImageId, group_id: groupId, groups: groupsRaw,
+            };
+            Pages._tabMarkClean('overview');
+
+            // Update the page title if hostname changed.
+            const titleEl = document.querySelector('.page-title');
+            if (titleEl && hostname) titleEl.textContent = hostname;
+        } catch (e) {
+            Pages._tabMarkError('overview', `Save failed: ${e.message}`);
+            if (saveBtn) saveBtn.disabled = false;
+        }
+    },
+
+    async _tabSavePower(nodeId) {
+        Pages._tabMarkSaving('bmc');
+        const saveBtn = document.getElementById('tab-save-bmc');
+
+        const ppType = document.getElementById('pp-type')?.value || '';
+        let powerProvider = null;
+
+        if (ppType === 'ipmi') {
+            const fields = {
+                ip:       (document.getElementById('pp-ipmi-ip')?.value || '').trim(),
+                username: (document.getElementById('pp-ipmi-username')?.value || '').trim(),
+                channel:  (document.getElementById('pp-ipmi-channel')?.value || '1').trim(),
+            };
+            const pw = document.getElementById('pp-ipmi-password')?.value || '';
+            if (pw) fields.password = pw;
+            powerProvider = { type: 'ipmi', fields };
+        } else if (ppType === 'proxmox') {
+            const insecureEl = document.getElementById('pp-pve-insecure');
+            const fields = {
+                api_url:  (document.getElementById('pp-pve-url')?.value || '').trim(),
+                node:     (document.getElementById('pp-pve-node')?.value || '').trim(),
+                vmid:     (document.getElementById('pp-pve-vmid')?.value || '').trim(),
+                username: (document.getElementById('pp-pve-username')?.value || '').trim(),
+                insecure: (insecureEl && insecureEl.checked) ? 'true' : 'false',
+            };
+            const pw = document.getElementById('pp-pve-password')?.value || '';
+            if (pw) fields.password = pw;
+            powerProvider = { type: 'proxmox', fields };
+        }
+
+        try {
+            const existing = await API.nodes.get(nodeId);
+            const body = {
+                hostname:        existing.hostname,
+                primary_mac:     existing.primary_mac,
+                fqdn:            existing.fqdn || '',
+                base_image_id:   existing.base_image_id || '',
+                group_id:        existing.group_id || '',
+                groups:          existing.groups || [],
+                ssh_keys:        existing.ssh_keys || [],
+                kernel_args:     existing.kernel_args || '',
+                custom_vars:     existing.custom_vars || {},
+                interfaces:      existing.interfaces || [],
+                power_provider:  powerProvider,
+                extra_mounts:    existing.extra_mounts || [],
+                disk_layout_override: existing.disk_layout_override || null,
+            };
+            await API.nodes.update(nodeId, body);
+
+            // Clear the password inputs so they don't re-submit old values.
+            const pwEl1 = document.getElementById('pp-ipmi-password');
+            const pwEl2 = document.getElementById('pp-pve-password');
+            if (pwEl1) pwEl1.value = '';
+            if (pwEl2) pwEl2.value = '';
+
+            Pages._nodeEditorState['bmc'].original.pp_type = ppType;
+            Pages._tabMarkClean('bmc');
+
+            // Re-fetch power status after provider change.
+            if (powerProvider) setTimeout(() => Pages._refreshPowerStatus(nodeId), 500);
+        } catch (e) {
+            Pages._tabMarkError('bmc', `Save failed: ${e.message}`);
+            if (saveBtn) saveBtn.disabled = false;
+        }
+    },
+
+    async _tabSaveConfig(nodeId) {
+        Pages._tabMarkSaving('config');
+        const saveBtn = document.getElementById('tab-save-config');
+
+        const sshKeysRaw  = document.getElementById('cfg-ssh-keys')?.value || '';
+        const kernelArgs  = (document.getElementById('cfg-kernel-args')?.value || '').trim();
+        const keysErrEl   = document.getElementById('cfg-ssh-keys-error');
+        const krnlErrEl   = document.getElementById('cfg-kernel-args-error');
+
+        if (keysErrEl) keysErrEl.style.display = 'none';
+        if (krnlErrEl) krnlErrEl.style.display = 'none';
+
+        // Validate SSH keys.
+        const sshKeys = sshKeysRaw.split('\n').map(k => k.trim()).filter(Boolean);
+        const invalidKeys = sshKeys.filter(k => !/^(ssh-rsa|ssh-ed25519|ecdsa-sha2-)/.test(k));
+        if (invalidKeys.length) {
+            if (keysErrEl) { keysErrEl.textContent = `Invalid key format: ${invalidKeys[0].substring(0, 40)}…`; keysErrEl.style.display = ''; }
+            Pages._tabMarkError('config', 'Validation error');
+            if (saveBtn) saveBtn.disabled = false;
+            return;
+        }
+
+        // Validate kernel args — no shell metacharacters.
+        if (/[;|`$()]/.test(kernelArgs)) {
+            if (krnlErrEl) { krnlErrEl.textContent = 'Kernel args must not contain shell metacharacters (; | ` $ ())'; krnlErrEl.style.display = ''; }
+            Pages._tabMarkError('config', 'Validation error');
+            if (saveBtn) saveBtn.disabled = false;
+            return;
+        }
+
+        // Collect custom vars from the editor rows.
+        const customVars = {};
+        document.querySelectorAll('#cfg-vars-list .cfg-var-row').forEach(row => {
+            const k = (row.querySelector('.cfg-var-key')?.value || '').trim();
+            const v = (row.querySelector('.cfg-var-val')?.value || '').trim();
+            if (k) customVars[k] = v;
+        });
+
+        try {
+            const existing = await API.nodes.get(nodeId);
+            const body = {
+                hostname:        existing.hostname,
+                primary_mac:     existing.primary_mac,
+                fqdn:            existing.fqdn || '',
+                base_image_id:   existing.base_image_id || '',
+                group_id:        existing.group_id || '',
+                groups:          existing.groups || [],
+                ssh_keys:        sshKeys,
+                kernel_args:     kernelArgs,
+                custom_vars:     customVars,
+                interfaces:      existing.interfaces || [],
+                power_provider:  existing.power_provider || null,
+                extra_mounts:    existing.extra_mounts || [],
+                disk_layout_override: existing.disk_layout_override || null,
+            };
+            await API.nodes.update(nodeId, body);
+
+            Pages._nodeEditorState['config'].original = {
+                ssh_keys:    sshKeys.join('\n'),
+                kernel_args: kernelArgs,
+                custom_vars: Object.assign({}, customVars),
+            };
+            Pages._tabMarkClean('config');
+        } catch (e) {
+            Pages._tabMarkError('config', `Save failed: ${e.message}`);
+            if (saveBtn) saveBtn.disabled = false;
+        }
+    },
+
+    async _tabSaveNetwork(nodeId) {
+        Pages._tabMarkSaving('network');
+        const saveBtn = document.getElementById('tab-save-network');
+
+        // Collect interface rows.
+        const interfaces = [];
+        document.querySelectorAll('#net-interfaces-list .net-iface-row').forEach(row => {
+            const mac  = row.querySelector('.net-iface-mac')?.value.trim() || '';
+            const name = row.querySelector('.net-iface-name')?.value.trim() || '';
+            const ip   = row.querySelector('.net-iface-ip')?.value.trim() || '';
+            const gw   = row.querySelector('.net-iface-gw')?.value.trim() || '';
+            const dns  = (row.querySelector('.net-iface-dns')?.value || '').split(',').map(s => s.trim()).filter(Boolean);
+            const mtu  = parseInt(row.querySelector('.net-iface-mtu')?.value || '0', 10) || 0;
+            const bond = row.querySelector('.net-iface-bond')?.value.trim() || '';
+            if (mac || name || ip) {
+                interfaces.push({ mac_address: mac, name, ip_address: ip, gateway: gw, dns, mtu: mtu || undefined, bond: bond || undefined });
+            }
+        });
+
+        try {
+            const existing = await API.nodes.get(nodeId);
+            const body = {
+                hostname:        existing.hostname,
+                primary_mac:     existing.primary_mac,
+                fqdn:            existing.fqdn || '',
+                base_image_id:   existing.base_image_id || '',
+                group_id:        existing.group_id || '',
+                groups:          existing.groups || [],
+                ssh_keys:        existing.ssh_keys || [],
+                kernel_args:     existing.kernel_args || '',
+                custom_vars:     existing.custom_vars || {},
+                interfaces,
+                power_provider:  existing.power_provider || null,
+                extra_mounts:    existing.extra_mounts || [],
+                disk_layout_override: existing.disk_layout_override || null,
+            };
+            await API.nodes.update(nodeId, body);
+
+            Pages._nodeEditorState['network'].original = {
+                interfaces: JSON.parse(JSON.stringify(interfaces)),
+            };
+            Pages._tabMarkClean('network');
+        } catch (e) {
+            Pages._tabMarkError('network', `Save failed: ${e.message}`);
+            if (saveBtn) saveBtn.disabled = false;
+        }
+    },
+
+    // ── Network tab helpers ───────────────────────────────────────────────────
+
+    _netInterfaceRowHTML(idx, iface, discoveredMACs) {
+        iface = iface || {};
+        const macOptions = (discoveredMACs || [])
+            .map(m => `<option value="${escHtml(m)}" ${iface.mac_address === m ? 'selected' : ''}>${escHtml(m)}</option>`)
+            .join('');
+        return `<div class="net-iface-row" data-idx="${idx}" style="border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:10px">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+                <span style="font-size:12px;font-weight:600;color:var(--text-secondary)">Interface ${idx + 1}</span>
+                <button type="button" class="btn btn-danger btn-sm" style="padding:2px 8px;font-size:11px"
+                    onclick="Pages._netRemoveInterface(this);Pages._tabMarkDirty('network')">Remove</button>
+            </div>
+            <div class="form-grid" style="margin-bottom:0">
+                <div class="form-group">
+                    <label>MAC Address</label>
+                    ${discoveredMACs && discoveredMACs.length
+                        ? `<select class="net-iface-mac" onchange="Pages._tabMarkDirty('network')">
+                                <option value="">Custom / none</option>
+                                ${macOptions}
+                            </select>`
+                        : `<input type="text" class="net-iface-mac" value="${escHtml(iface.mac_address || '')}"
+                                placeholder="aa:bb:cc:dd:ee:ff" oninput="Pages._tabMarkDirty('network')">`
+                    }
+                </div>
+                <div class="form-group">
+                    <label>Interface Name</label>
+                    <input type="text" class="net-iface-name" value="${escHtml(iface.name || '')}"
+                        placeholder="eth0" oninput="Pages._tabMarkDirty('network')">
+                </div>
+                <div class="form-group">
+                    <label>IP Address (CIDR)</label>
+                    <input type="text" class="net-iface-ip" value="${escHtml(iface.ip_address || '')}"
+                        placeholder="192.168.1.50/24" oninput="Pages._tabMarkDirty('network')">
+                </div>
+                <div class="form-group">
+                    <label>Gateway</label>
+                    <input type="text" class="net-iface-gw" value="${escHtml(iface.gateway || '')}"
+                        placeholder="192.168.1.1" oninput="Pages._tabMarkDirty('network')">
+                </div>
+                <div class="form-group">
+                    <label>DNS <span style="font-size:11px;color:var(--text-secondary)">(comma-separated)</span></label>
+                    <input type="text" class="net-iface-dns" value="${escHtml((iface.dns || []).join(', '))}"
+                        placeholder="8.8.8.8, 8.8.4.4" oninput="Pages._tabMarkDirty('network')">
+                </div>
+                <div class="form-group">
+                    <label>MTU</label>
+                    <input type="number" class="net-iface-mtu" value="${iface.mtu || ''}"
+                        placeholder="1500" oninput="Pages._tabMarkDirty('network')">
+                </div>
+                <div class="form-group">
+                    <label>Bond</label>
+                    <input type="text" class="net-iface-bond" value="${escHtml(iface.bond || '')}"
+                        placeholder="bond0" oninput="Pages._tabMarkDirty('network')">
+                </div>
+            </div>
+        </div>`;
+    },
+
+    _netAddInterface(discoveredMACsJSON) {
+        const list = document.getElementById('net-interfaces-list');
+        if (!list) return;
+        const emptyEl = document.getElementById('net-empty');
+        if (emptyEl) emptyEl.remove();
+
+        let discoveredMACs = [];
+        try { discoveredMACs = JSON.parse(discoveredMACsJSON); } catch (_) {}
+
+        const idx = list.querySelectorAll('.net-iface-row').length;
+        list.insertAdjacentHTML('beforeend', Pages._netInterfaceRowHTML(idx, {}, discoveredMACs));
+        Pages._tabMarkDirty('network');
+    },
+
+    _netRemoveInterface(btn) {
+        const row = btn.closest('.net-iface-row');
+        if (row) row.remove();
+        const list = document.getElementById('net-interfaces-list');
+        if (list && list.querySelectorAll('.net-iface-row').length === 0) {
+            list.innerHTML = `<div id="net-empty" style="text-align:center;padding:16px;color:var(--text-dim);font-size:12px">No interfaces configured</div>`;
+        }
+    },
+
+    // ── Configuration tab helpers ─────────────────────────────────────────────
+
+    _cfgVarRowHTML(idx, key, value) {
+        return `<div class="cfg-var-row" data-idx="${idx}" style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+            <input type="text" class="cfg-var-key" value="${escHtml(key)}"
+                placeholder="variable_name" style="flex:1" oninput="Pages._tabMarkDirty('config')">
+            <input type="text" class="cfg-var-val" value="${escHtml(value)}"
+                placeholder="value" style="flex:2" oninput="Pages._tabMarkDirty('config')">
+            <button type="button" class="btn btn-danger btn-sm" style="padding:2px 8px;font-size:11px;flex-shrink:0"
+                onclick="Pages._cfgRemoveVar(this);Pages._tabMarkDirty('config')">✕</button>
+        </div>`;
+    },
+
+    _cfgAddVar() {
+        const list = document.getElementById('cfg-vars-list');
+        if (!list) return;
+        const emptyEl = document.getElementById('cfg-vars-empty');
+        if (emptyEl) emptyEl.remove();
+        const idx = list.querySelectorAll('.cfg-var-row').length;
+        list.insertAdjacentHTML('beforeend', Pages._cfgVarRowHTML(idx, '', ''));
+        Pages._tabMarkDirty('config');
+    },
+
+    _cfgRemoveVar(btn) {
+        const row = btn.closest('.cfg-var-row');
+        if (row) row.remove();
+        const list = document.getElementById('cfg-vars-list');
+        if (list && list.querySelectorAll('.cfg-var-row').length === 0) {
+            list.innerHTML = `<div id="cfg-vars-empty" style="text-align:center;padding:12px;color:var(--text-dim);font-size:12px">No custom variables</div>`;
+        }
+    },
+
+    // ── Power Provider inline type change ─────────────────────────────────────
+
+    _onPowerProviderInlineTypeChange(type) {
+        const ipmiFields   = document.getElementById('pp-inline-ipmi-fields');
+        const proxmoxFields = document.getElementById('pp-inline-proxmox-fields');
+        if (ipmiFields)    ipmiFields.style.display    = (type === 'ipmi')    ? '' : 'none';
+        if (proxmoxFields) proxmoxFields.style.display = (type === 'proxmox') ? '' : 'none';
+    },
+
+    // _checkRoleMismatchInline is the inline-editing version of _checkRoleMismatch.
+    // Uses the #ov-role-mismatch-warning element in the overview tab form.
+    _checkRoleMismatchInline(imageId, node, images) {
+        const warnEl = document.getElementById('ov-role-mismatch-warning');
+        if (!warnEl) return;
+        if (!imageId) { warnEl.style.display = 'none'; return; }
+        const img = (images || []).find(i => i.id === imageId);
+        if (!img) { warnEl.style.display = 'none'; return; }
+        const builtFor = img.built_for_roles || [];
+        if (!builtFor.length) { warnEl.style.display = 'none'; return; }
+        const roleKeywords = ['compute', 'gpu-compute', 'gpu', 'storage', 'head-node', 'management', 'minimal'];
+        const nodeRoles = (node.groups || []).filter(g => roleKeywords.some(k => g.toLowerCase().includes(k)));
+        const mismatched = nodeRoles.filter(g => !builtFor.some(r => g.toLowerCase().includes(r) || r.toLowerCase().includes(g)));
+        if (mismatched.length) {
+            warnEl.innerHTML = `Role mismatch: node has <strong>${escHtml(mismatched.join(', '))}</strong> but image built for <strong>${escHtml(builtFor.join(', '))}</strong>`;
+            warnEl.style.display = '';
+        } else {
+            warnEl.style.display = 'none';
+        }
+    },
+
+    // ── Node Actions dropdown ─────────────────────────────────────────────────
+
+    async _nodeActionsRediscover(nodeId) {
+        if (!confirm('Mark node for hardware re-discovery?\n\nThe node will need to PXE boot to re-register its hardware profile.\nThis does NOT wipe the disk.')) return;
+        try {
+            // Trigger a reimage so the node PXE-boots and re-registers its hardware profile.
+            await API.request('POST', `/nodes/${nodeId}/reimage`, {});
+            alert('Reimage requested. PXE-boot the node to re-discover hardware. After registration, cancel or skip deployment if you only want hardware discovery.');
+        } catch (e) {
+            alert(`Re-discover failed: ${e.message}`);
+        }
+    },
+
+    async _nodeActionsTriggerReimage(nodeId, displayName) {
+        if (!confirm(`Trigger reimage of "${displayName}"?\n\nThe node will re-deploy on next PXE boot.`)) return;
+        try {
+            await API.request('POST', `/nodes/${nodeId}/reimage`, {});
+            alert('Reimage requested. The node will re-deploy on next PXE boot.');
+            // Reload the page to show updated reimage_pending state.
+            Pages.nodeDetail(nodeId);
+        } catch (e) {
+            alert(`Trigger reimage failed: ${e.message}`);
+        }
     },
 
     async loadNodeLogs(mac) {

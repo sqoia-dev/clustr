@@ -975,6 +975,106 @@ td.dim {
     display: block;
 }
 
+/* ─── Tab dirty indicator ────────────────────────────────────────────────── */
+
+.tab.tab-dirty::after {
+    content: ' *';
+    color: var(--accent);
+    font-weight: 700;
+}
+
+/* ─── Inline tab save bar ─────────────────────────────────────────────────── */
+
+.tab-save-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    margin-bottom: 16px;
+}
+
+.tab-save-bar .save-status {
+    font-size: 12px;
+    color: var(--text-secondary);
+    flex: 1;
+}
+
+.tab-save-bar .save-status.modified {
+    color: var(--accent);
+    font-weight: 600;
+}
+
+.tab-save-bar .save-status.saved {
+    color: var(--success);
+}
+
+.tab-save-bar .save-status.error {
+    color: var(--error);
+}
+
+/* ─── Actions dropdown ───────────────────────────────────────────────────── */
+
+.actions-dropdown {
+    position: relative;
+    display: inline-block;
+}
+
+.actions-dropdown-menu {
+    display: none;
+    position: absolute;
+    right: 0;
+    top: calc(100% + 4px);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.12);
+    z-index: 200;
+    min-width: 200px;
+    padding: 4px 0;
+}
+
+.actions-dropdown-menu.open {
+    display: block;
+}
+
+.actions-dropdown-item {
+    display: block;
+    width: 100%;
+    padding: 9px 16px;
+    font-size: 13px;
+    font-weight: 400;
+    color: var(--text-primary);
+    background: none;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+    font-family: var(--font-ui);
+    white-space: nowrap;
+    transition: background var(--transition);
+}
+
+.actions-dropdown-item:hover {
+    background: var(--bg-primary);
+}
+
+.actions-dropdown-item.danger {
+    color: var(--error);
+}
+
+.actions-dropdown-item:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.actions-dropdown-sep {
+    height: 1px;
+    background: var(--border);
+    margin: 4px 0;
+}
+
 /* ─── Empty state ────────────────────────────────────────────────────────── */
 
 .empty-state {
