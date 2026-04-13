@@ -73,7 +73,7 @@ func New(cfg config.ServerConfig, database *db.DB) *Server {
 	reimageOrch := reimage.New(database, registry, log.Logger)
 
 	shells := image.NewShellManager(database, cfg.ImageDir, log.Logger)
-	buildProg := NewBuildProgressStore()
+	buildProg := NewBuildProgressStore(cfg.ImageDir)
 	s := &Server{
 		cfg:                 cfg,
 		db:                  database,
@@ -317,7 +317,21 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+
+		// Give in-flight builds up to 25 seconds to finish naturally before
+		// we force-cancel them. HTTP shutdown gets its own 5-second window on
+		// top of that. Total wall-clock budget: 30 seconds.
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer drainCancel()
+
+		log.Info().Msg("shutdown: waiting for in-flight builds to complete (up to 25s)")
+		s.buildProgress.WaitForActive(drainCtx)
+
+		// Any builds still active after the drain window are stuck — cancel them
+		// so the DB record gets updated and the UI doesn't spin forever.
+		s.buildProgress.CancelAllActive("server shutting down")
+
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer shutdownCancel()
 		if err := s.http.Shutdown(shutdownCtx); err != nil {
 			log.Error().Err(err).Msg("graceful shutdown error")

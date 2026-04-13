@@ -1,10 +1,15 @@
 package server
 
 import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
 	"github.com/sqoia-dev/clonr/pkg/api"
 )
 
@@ -77,13 +82,21 @@ type BuildProgressStore struct {
 
 	subsMu      sync.RWMutex
 	subscribers map[string]chan api.BuildEvent
+
+	// imageDir is used to persist build-state.json alongside image files.
+	// It may be empty (tests, non-ISO flows); persistence is skipped when empty.
+	imageDir string
 }
 
 // NewBuildProgressStore creates a store and starts the background cleanup goroutine.
-func NewBuildProgressStore() *BuildProgressStore {
+// imageDir is the base directory for image files; build-state.json is written
+// into <imageDir>/<imageID>/build-state.json on every state update.
+// Pass an empty string to disable on-disk persistence (e.g. in tests).
+func NewBuildProgressStore(imageDir string) *BuildProgressStore {
 	s := &BuildProgressStore{
 		states:      make(map[string]*buildStateInternal),
 		subscribers: make(map[string]chan api.BuildEvent),
+		imageDir:    imageDir,
 	}
 	go s.cleanupLoop()
 	return s
@@ -158,26 +171,30 @@ func (s *BuildProgressStore) publish(ev api.BuildEvent) {
 
 // setPhase updates the phase and publishes an event.
 func (s *BuildProgressStore) setPhase(imageID, phase string) {
+	var snap api.BuildState
 	s.mu.Lock()
 	internal, ok := s.states[imageID]
 	if ok {
 		internal.state.Phase = phase
 		internal.state.UpdatedAt = time.Now()
 		internal.state.ElapsedMS = time.Since(internal.state.StartedAt).Milliseconds()
+		snap = internal.state
 	}
 	s.mu.Unlock()
 
 	if ok {
+		s.persistState(imageID, snap)
 		s.publish(api.BuildEvent{
 			ImageID:   imageID,
 			Phase:     phase,
-			ElapsedMS: internal.state.ElapsedMS,
+			ElapsedMS: snap.ElapsedMS,
 		})
 	}
 }
 
 // setProgress updates byte-level progress and publishes an event.
 func (s *BuildProgressStore) setProgress(imageID string, done, total int64) {
+	var snap api.BuildState
 	s.mu.Lock()
 	internal, ok := s.states[imageID]
 	if ok {
@@ -185,16 +202,18 @@ func (s *BuildProgressStore) setProgress(imageID string, done, total int64) {
 		internal.state.BytesTotal = total
 		internal.state.UpdatedAt = time.Now()
 		internal.state.ElapsedMS = time.Since(internal.state.StartedAt).Milliseconds()
+		snap = internal.state
 	}
 	s.mu.Unlock()
 
 	if ok {
+		s.persistState(imageID, snap)
 		s.publish(api.BuildEvent{
 			ImageID:    imageID,
-			Phase:      internal.state.Phase,
+			Phase:      snap.Phase,
 			BytesDone:  done,
 			BytesTotal: total,
-			ElapsedMS:  internal.state.ElapsedMS,
+			ElapsedMS:  snap.ElapsedMS,
 		})
 	}
 }
@@ -230,6 +249,7 @@ func (s *BuildProgressStore) addStderrLine(imageID, line string) {
 
 // fail marks the build as failed with an error message.
 func (s *BuildProgressStore) fail(imageID, msg string) {
+	var snap api.BuildState
 	s.mu.Lock()
 	internal, ok := s.states[imageID]
 	if ok {
@@ -237,27 +257,117 @@ func (s *BuildProgressStore) fail(imageID, msg string) {
 		internal.state.ErrorMessage = msg
 		internal.state.UpdatedAt = time.Now()
 		internal.state.ElapsedMS = time.Since(internal.state.StartedAt).Milliseconds()
+		snap = internal.state
 	}
 	s.mu.Unlock()
 
 	if ok {
+		s.persistState(imageID, snap)
 		s.publish(api.BuildEvent{ImageID: imageID, Phase: PhaseFailed, Error: msg})
 	}
 }
 
 // complete marks the build as done.
 func (s *BuildProgressStore) complete(imageID string) {
+	var snap api.BuildState
 	s.mu.Lock()
 	internal, ok := s.states[imageID]
 	if ok {
 		internal.state.Phase = PhaseComplete
 		internal.state.UpdatedAt = time.Now()
 		internal.state.ElapsedMS = time.Since(internal.state.StartedAt).Milliseconds()
+		snap = internal.state
 	}
 	s.mu.Unlock()
 
 	if ok {
-		s.publish(api.BuildEvent{ImageID: imageID, Phase: PhaseComplete, ElapsedMS: internal.state.ElapsedMS})
+		s.persistState(imageID, snap)
+		s.publish(api.BuildEvent{ImageID: imageID, Phase: PhaseComplete, ElapsedMS: snap.ElapsedMS})
+	}
+}
+
+// persistState writes the current BuildState snapshot to
+// <imageDir>/<imageID>/build-state.json for post-mortem inspection and startup
+// reconciliation. Errors are logged but never fatal — a missing file just means
+// reconciliation falls back to filesystem heuristics.
+func (s *BuildProgressStore) persistState(imageID string, state api.BuildState) {
+	if s.imageDir == "" {
+		return
+	}
+	dir := filepath.Join(s.imageDir, imageID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	snap := buildStateOnDisk{
+		ImageID:      state.ImageID,
+		Phase:        state.Phase,
+		BytesDone:    state.BytesDone,
+		BytesTotal:   state.BytesTotal,
+		ErrorMessage: state.ErrorMessage,
+		StartedAt:    state.StartedAt,
+		UpdatedAt:    state.UpdatedAt,
+		ElapsedMS:    state.ElapsedMS,
+	}
+	data, err := json.Marshal(snap)
+	if err != nil {
+		return
+	}
+	tmpPath := filepath.Join(dir, "build-state.json.tmp")
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		log.Warn().Err(err).Str("image_id", imageID).Msg("build progress: persist state write failed")
+		return
+	}
+	if err := os.Rename(tmpPath, filepath.Join(dir, "build-state.json")); err != nil {
+		log.Warn().Err(err).Str("image_id", imageID).Msg("build progress: persist state rename failed")
+	}
+}
+
+// WaitForActive blocks until all builds currently in a non-terminal phase have
+// reached a terminal state (complete, failed, or canceled), or until ctx is done.
+func (s *BuildProgressStore) WaitForActive(ctx context.Context) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		s.mu.RLock()
+		active := 0
+		for _, internal := range s.states {
+			p := internal.state.Phase
+			if p != PhaseComplete && p != PhaseFailed && p != PhaseCanceled {
+				active++
+			}
+		}
+		s.mu.RUnlock()
+
+		if active == 0 {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// CancelAllActive marks any builds still in a non-terminal phase as failed with
+// the given reason. Used during graceful shutdown after the drain deadline expires.
+func (s *BuildProgressStore) CancelAllActive(reason string) {
+	s.mu.Lock()
+	var toCancel []string
+	for id, internal := range s.states {
+		p := internal.state.Phase
+		if p != PhaseComplete && p != PhaseFailed && p != PhaseCanceled {
+			internal.state.Phase = PhaseFailed
+			internal.state.ErrorMessage = reason
+			internal.state.UpdatedAt = time.Now()
+			toCancel = append(toCancel, id)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, id := range toCancel {
+		s.publish(api.BuildEvent{ImageID: id, Phase: PhaseFailed, Error: reason})
 	}
 }
 

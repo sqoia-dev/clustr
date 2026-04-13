@@ -2823,8 +2823,13 @@ const Pages = {
                     </div>
                 </div>
 
-                <!-- Mounts tab — Richard's existing inline editor, untouched -->
+                <!-- Mounts tab — inline editable node-level mounts -->
                 <div id="tab-mounts" class="tab-panel">
+                    <div id="tab-save-bar-mounts" class="tab-save-bar" style="display:none">
+                        <span class="save-status modified" id="tab-save-status-mounts">Unsaved changes</span>
+                        <button class="btn btn-secondary btn-sm" onclick="Pages._tabRevert('mounts')" id="tab-revert-mounts">Revert</button>
+                        <button class="btn btn-primary btn-sm" onclick="Pages._tabSaveMounts('${node.id}')" id="tab-save-mounts">Save</button>
+                    </div>
                     <div id="mounts-content">
                         <div class="loading"><div class="spinner"></div>Loading mounts…</div>
                     </div>
@@ -2930,6 +2935,12 @@ const Pages = {
                 dirty: false,
                 original: {
                     interfaces: JSON.parse(JSON.stringify(node.interfaces || [])),
+                },
+            };
+            Pages._nodeEditorState['mounts'] = {
+                dirty: false,
+                original: {
+                    extra_mounts: JSON.parse(JSON.stringify(node.extra_mounts || [])),
                 },
             };
 
@@ -3147,6 +3158,12 @@ const Pages = {
                     list.innerHTML = orig.interfaces.map((iface, i) => Pages._netInterfaceRowHTML(i, iface, [])).join('');
                 }
             }
+        } else if (tabKey === 'mounts') {
+            const tbody = document.getElementById('mounts-node-tbody');
+            if (tbody) {
+                tbody.innerHTML = orig.extra_mounts.map((m, i) => Pages._mountsNodeRowHTML(i, m)).join('');
+                Pages._mountsUpdateEmpty();
+            }
         }
 
         Pages._tabMarkClean(tabKey);
@@ -3160,6 +3177,7 @@ const Pages = {
             else if (tabKey === 'bmc')    await Pages._tabSavePower(nodeId);
             else if (tabKey === 'config') await Pages._tabSaveConfig(nodeId);
             else if (tabKey === 'network') await Pages._tabSaveNetwork(nodeId);
+            else if (tabKey === 'mounts') await Pages._tabSaveMounts(nodeId);
             return true;
         } catch (_) {
             return false;
@@ -4337,7 +4355,7 @@ const Pages = {
         return total;
     },
 
-    async showBuildFromISOModal() {
+    async showBuildFromISOModal(prefillUrl) {
         // Load roles in parallel with modal render.
         let roles = [];
         try {
@@ -4468,6 +4486,16 @@ const Pages = {
 
         document.body.appendChild(overlay);
         overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+
+        // Prefill the URL field if provided (e.g. retrying an interrupted build).
+        if (prefillUrl) {
+            const urlInput = overlay.querySelector('#build-iso-url');
+            if (urlInput) {
+                urlInput.value = prefillUrl;
+                Pages._onISOUrlChange(prefillUrl);
+            }
+        }
+
         overlay.querySelector('#build-iso-url').focus();
 
         // Initial role preview state.
@@ -4590,6 +4618,14 @@ const Pages = {
                     <span class="badge badge-building" id="iso-build-badge">building</span>
                 </div>
                 <div class="card-body">
+                    <div id="iso-build-interrupted-banner" style="display:none;background:var(--bg-warning,#fff3cd);border:1px solid var(--border-warning,#ffc107);border-radius:4px;padding:12px 14px;margin-bottom:14px;font-size:13px">
+                        <strong>Build state not available</strong> — the build may have been interrupted by a server restart.
+                        Check the build log for details, or delete this image and retry.
+                        <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+                            <a class="btn btn-secondary btn-sm" href="${escHtml(API.buildProgress.buildLogUrl(img.id))}" target="_blank" rel="noreferrer">View Build Log</a>
+                            <button class="btn btn-danger btn-sm" onclick="Pages._deleteAndRetryBuild('${escHtml(img.id)}', ${JSON.stringify(img.source_url || '')})">Delete and Retry</button>
+                        </div>
+                    </div>
                     <div id="iso-build-phase" style="font-size:13px;margin-bottom:12px;color:var(--text-secondary)">
                         Phase: <span id="iso-build-phase-value" style="font-weight:600;color:var(--text-primary)">Connecting…</span>
                     </div>
@@ -4709,7 +4745,33 @@ const Pages = {
             } catch (_) {}
         };
 
-        es.onerror = () => { clearInterval(_elapsedTimer); };
+        // Track consecutive SSE errors to detect a dead build-progress endpoint.
+        // EventSource auto-reconnects; after 3 failed attempts with no snapshot
+        // received we surface the "interrupted" banner rather than spinning forever.
+        let _sseErrorCount = 0;
+        let _snapshotReceived = false;
+        es.addEventListener('snapshot', () => { _snapshotReceived = true; _sseErrorCount = 0; });
+
+        es.onerror = () => {
+            clearInterval(_elapsedTimer);
+            if (!_snapshotReceived) {
+                _sseErrorCount++;
+                if (_sseErrorCount >= 3) {
+                    // The build-progress endpoint returned 404 or is unreachable.
+                    // The image is still in "building" state but has no live goroutine.
+                    es.close();
+                    const banner = document.getElementById('iso-build-interrupted-banner');
+                    const phaseDiv = document.getElementById('iso-build-phase');
+                    if (banner) banner.style.display = '';
+                    if (phaseDiv) phaseDiv.style.display = 'none';
+                    const badgeEl2 = document.getElementById('iso-build-badge');
+                    if (badgeEl2) {
+                        badgeEl2.className = 'badge badge-error';
+                        badgeEl2.textContent = 'interrupted';
+                    }
+                }
+            }
+        };
 
         Pages._isoBuildSSE = es;
         Pages._isoBuildElapsedTimer = _elapsedTimer;
@@ -4767,6 +4829,23 @@ const Pages = {
             Router.navigate('/images');
         } catch (e) {
             alert('Cancel failed: ' + e.message);
+        }
+    },
+
+    // _deleteAndRetryBuild deletes an interrupted image and reopens the Build from
+    // ISO modal prefilled with the original source URL so the admin can retry
+    // without having to retype anything.
+    async _deleteAndRetryBuild(imageId, sourceUrl) {
+        if (!confirm('Delete this image and open the Build from ISO modal to retry?')) return;
+        try {
+            if (Pages._isoBuildSSE) { Pages._isoBuildSSE.close(); Pages._isoBuildSSE = null; }
+            clearInterval(Pages._isoBuildElapsedTimer);
+            await API.images.delete(imageId);
+            Router.navigate('/images');
+            // Brief delay so the images page renders before opening the modal.
+            setTimeout(() => Pages.showBuildFromISOModal(sourceUrl), 300);
+        } catch (e) {
+            alert('Delete failed: ' + e.message);
         }
     },
 

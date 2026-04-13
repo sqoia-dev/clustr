@@ -108,6 +108,12 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// Wire up and start the HTTP server.
 	srv := server.New(cfg, database)
 
+	// Reconcile any images stuck in "building" state from before the restart.
+	// These have no live goroutine behind them and will never progress on their own.
+	if err := srv.ReconcileStuckBuilds(ctx); err != nil {
+		log.Error().Err(err).Msg("reconcile stuck builds failed (non-fatal)")
+	}
+
 	// Start background workers (reimage scheduler, etc.) before accepting traffic.
 	srv.StartBackgroundWorkers(ctx)
 
