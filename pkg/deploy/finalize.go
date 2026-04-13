@@ -583,7 +583,36 @@ func applyBootConfig(ctx context.Context, mountRoot, targetDisk string, layout a
 		}
 	}
 
+	// ── 2. /etc/fstab UUID update (BEFORE grub2-mkconfig) ───────────────────
+	// CRITICAL: writeFstab must run BEFORE grub2-mkconfig. grub2-mkconfig reads
+	// /etc/fstab inside the chroot to determine the root filesystem UUID for the
+	// kernel cmdline (root=UUID=...). If fstab still carries the capture source's
+	// UUIDs when grub2-mkconfig runs, the generated grub.cfg will have wrong UUIDs
+	// and the deployed node will fail to find its root filesystem on boot.
+	//
+	// writeFstab uses blkid on the HOST (outside the chroot) against the actual
+	// target partition devices — it does not need the chroot session to be active.
+	log.Info().Msg("finalize/boot: regenerating /etc/fstab with target disk UUIDs (before grub2-mkconfig)")
+	if err := writeFstab(ctx, mountRoot, layout, partDevs); err != nil {
+		// Fatal: a missing or incorrect fstab means the root filesystem won't
+		// mount and the OS will drop to emergency mode on every boot.
+		return fmt.Errorf("finalize/boot: fstab regen: %w", err)
+	}
+	log.Info().Msg("finalize/boot: /etc/fstab written with target UUIDs")
+
 	log.Info().Str("grub_cfg", grubCfgPath).Msg("finalize/boot: regenerating GRUB config via grub2-mkconfig")
+
+	// Ensure the standard virtual filesystem mount points exist in the deployed
+	// root before calling cs.Enter(). These directories are NOT present in tar
+	// archives captured via rsync (rsync skips empty stub directories for virtual
+	// mounts like /proc, /sys, /dev). Without them, MountAll fails with ENOENT.
+	for _, dir := range []string{"proc", "sys", "dev", "dev/pts", "run"} {
+		target := filepath.Join(mountRoot, dir)
+		if err := os.MkdirAll(target, 0o755); err != nil {
+			log.Warn().Err(err).Str("dir", target).Msg("finalize/boot: could not create chroot mount dir (non-fatal)")
+		}
+	}
+
 	cs, err := chroot.NewSession(mountRoot)
 	if err != nil {
 		return fmt.Errorf("finalize/boot: chroot session: %w", err)
@@ -598,7 +627,9 @@ func applyBootConfig(ctx context.Context, mountRoot, targetDisk string, layout a
 	}()
 
 	// grub2-mkconfig writes the grub.cfg to the path passed via -o (inside the
-	// chroot, so the path is relative to the chroot root).
+	// chroot, so the path is relative to the chroot root). At this point /etc/fstab
+	// already has the correct target UUIDs, so grub2-mkconfig will generate the
+	// correct root=UUID=... kernel cmdline.
 	mkcfgCmd := exec.CommandContext(ctx, "chroot", mountRoot, "grub2-mkconfig", "-o", grubCfgPath)
 	if err := runAndLog(ctx, "grub2-mkconfig", mkcfgCmd); err != nil {
 		// Fatal: without a valid grub.cfg the node cannot boot.
@@ -606,11 +637,18 @@ func applyBootConfig(ctx context.Context, mountRoot, targetDisk string, layout a
 	}
 	log.Info().Str("grub_cfg", grubCfgPath).Msg("finalize/boot: grub2-mkconfig complete")
 
-	// ── 2. dracut --regenerate-all ───────────────────────────────────────────
+	// ── 3. dracut --regenerate-all ───────────────────────────────────────────
 	// --no-hostonly is critical: the capture source may be bare metal with a
 	// specific set of drivers. We need a generic initramfs that includes virtio_blk,
 	// virtio_net, and xfs so the image boots on any target (VM or physical).
 	// --force overwrites any existing initramfs images without prompting.
+
+	// Ensure /var/tmp exists in the chroot — dracut requires it as a scratch
+	// directory. Images captured via rsync may not include empty tmpdir stubs.
+	if err := os.MkdirAll(filepath.Join(mountRoot, "var", "tmp"), 0o1777); err != nil {
+		log.Warn().Err(err).Msg("finalize/boot: could not create /var/tmp in chroot (non-fatal)")
+	}
+
 	log.Info().Msg("finalize/boot: regenerating initramfs via dracut --no-hostonly --regenerate-all")
 	dracutCmd := exec.CommandContext(ctx, "chroot", mountRoot,
 		"dracut", "--force", "--no-hostonly", "--regenerate-all")
@@ -623,18 +661,6 @@ func applyBootConfig(ctx context.Context, mountRoot, targetDisk string, layout a
 	} else {
 		log.Info().Msg("finalize/boot: dracut complete")
 	}
-
-	// ── 3. /etc/fstab UUID update ────────────────────────────────────────────
-	// The image carries the capture source's UUIDs. After partitioning a new disk
-	// the target has fresh UUIDs. Build fstab from blkid output on the actual
-	// target partition devices.
-	log.Info().Msg("finalize/boot: regenerating /etc/fstab with target disk UUIDs")
-	if err := writeFstab(ctx, mountRoot, layout, partDevs); err != nil {
-		// Fatal: a missing or incorrect fstab means the root filesystem won't
-		// mount and the OS will drop to emergency mode on every boot.
-		return fmt.Errorf("finalize/boot: fstab regen: %w", err)
-	}
-	log.Info().Msg("finalize/boot: /etc/fstab written")
 
 	// ── 4. machine-id scrub ──────────────────────────────────────────────────
 	// systemd uses /etc/machine-id as a stable unique identifier for the host.
