@@ -813,11 +813,20 @@ func runAutoDeployImage(ctx context.Context, c *client.Client, nodeCfg api.NodeC
 			Message:  retErr.Error(),
 		}
 		var de *DeployError
+		var be *deploy.BootloaderError
 		if errors.As(retErr, &de) {
 			payload.ExitCode = int(de.Code)
 			payload.ExitName = de.Code.Name()
 			payload.Phase = de.Phase
 			payload.Message = de.Error()
+		} else if errors.As(retErr, &be) {
+			// BootloaderError from pkg/deploy: grub2-install failed on all target
+			// disks. Map to ExitBootloader so the operator sees the correct exit
+			// code without having to dig through logs.
+			payload.ExitCode = int(ExitBootloader)
+			payload.ExitName = ExitBootloader.Name()
+			payload.Phase = "finalize/bootloader"
+			payload.Message = be.Error()
 		}
 
 		deployLog.Error().

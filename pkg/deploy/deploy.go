@@ -114,6 +114,26 @@ var ErrNotImplemented = errors.New("not implemented")
 // ErrPreflightFailed is returned when preconditions for deployment are not met.
 var ErrPreflightFailed = errors.New("preflight failed")
 
+// BootloaderError is returned by Finalize when grub2-install fails on ALL
+// target disks for a BIOS deployment. A partial failure (at least one raw
+// disk succeeded) is survivable for RAID1 and is only logged as a warning.
+//
+// The caller (cmd/clonr/main.go) maps this to ExitBootloader so the
+// deploy-failed callback carries the correct exit code and phase, and the
+// deploy-complete callback is never fired.
+type BootloaderError struct {
+	// Targets is the list of raw disk devices that were attempted.
+	Targets []string
+	// Cause is the last non-nil error from a grub2-install invocation.
+	Cause error
+}
+
+func (e *BootloaderError) Error() string {
+	return fmt.Sprintf("grub2-install failed on all target disks %v: %v", e.Targets, e.Cause)
+}
+
+func (e *BootloaderError) Unwrap() error { return e.Cause }
+
 // ProgressFunc is called periodically during a Deploy operation to report progress.
 // phase is a human-readable label such as "downloading", "partitioning", "writing".
 type ProgressFunc func(bytesWritten, totalBytes int64, phase string)

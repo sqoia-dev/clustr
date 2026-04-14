@@ -169,3 +169,132 @@ func TestRecommend_NoDisk(t *testing.T) {
 		t.Error("expected error when no disks are present, got nil")
 	}
 }
+
+// twoIdenticalDisksHW returns hardware with two identically-sized 500 GB SATA
+// disks, suitable for exercising the RAID1 layout recommendation path.
+func twoIdenticalDisksHW() hardware.SystemInfo {
+	return hardware.SystemInfo{
+		Disks: []hardware.Disk{
+			{Name: "sda", Size: 500 * 1024 * 1024 * 1024, Transport: "sata"},
+			{Name: "sdb", Size: 500 * 1024 * 1024 * 1024, Transport: "sata"},
+		},
+		Memory: hardware.MemoryInfo{TotalKB: 8 * 1024 * 1024},
+	}
+}
+
+// TestRecommend_BIOSRAIDLayout verifies that a BIOS+RAID1 recommendation:
+//  1. Places exactly ONE biosboot partition per physical disk (on each raw disk,
+//     not inside any md array).
+//  2. The biosboot partitions have NO Device field (they land on raw disks, not md).
+//  3. All other data partitions (/boot, swap, /) have a Device field pointing to
+//     an md array.
+//  4. The RAIDSpec members are partition-sliced devices (e.g. "sda2", "sdb2"),
+//     confirming the md-on-partitions topology.
+//  5. No md array has a biosboot partition as a member.
+//  6. The bootloader target is i386-pc (BIOS).
+func TestRecommend_BIOSRAIDLayout(t *testing.T) {
+	hw := twoIdenticalDisksHW()
+	rec, err := Recommend(hw, "filesystem", "bios")
+	if err != nil {
+		t.Fatalf("Recommend returned error: %v", err)
+	}
+
+	// --- 1. Exactly one biosboot partition, no Device field ---
+	biosbootCount := 0
+	for _, p := range rec.Layout.Partitions {
+		isBiosBoot := false
+		for _, f := range p.Flags {
+			if f == "bios_grub" || f == "biosboot" {
+				isBiosBoot = true
+			}
+		}
+		if p.Filesystem == "biosboot" {
+			isBiosBoot = true
+		}
+		if !isBiosBoot {
+			continue
+		}
+		biosbootCount++
+		// --- 2. biosboot must NOT have a Device field (must land on raw disks) ---
+		if p.Device != "" {
+			t.Errorf("biosboot partition has Device=%q — it must NOT be inside an md array (GRUB cannot write through diskfilter)", p.Device)
+		}
+	}
+	if biosbootCount == 0 {
+		t.Error("BIOS+RAID1 layout must include at least one biosboot partition")
+	}
+
+	// --- 3. Data partitions must have Device pointing to an md array ---
+	for _, p := range rec.Layout.Partitions {
+		isBiosBoot := false
+		for _, f := range p.Flags {
+			if f == "bios_grub" || f == "biosboot" {
+				isBiosBoot = true
+			}
+		}
+		if p.Filesystem == "biosboot" {
+			isBiosBoot = true
+		}
+		if isBiosBoot {
+			continue
+		}
+		if p.MountPoint == "" && p.Filesystem == "biosboot" {
+			continue
+		}
+		if p.Device == "" {
+			t.Errorf("data partition %q (mp=%q) has no Device field in BIOS RAID layout — expected an md array assignment", p.Label, p.MountPoint)
+		}
+	}
+
+	// --- 4. RAIDSpec members are partition devices (md-on-partitions topology) ---
+	if len(rec.Layout.RAIDArrays) == 0 {
+		t.Fatal("BIOS+RAID1 layout must include at least one RAIDSpec")
+	}
+	for _, raid := range rec.Layout.RAIDArrays {
+		for _, member := range raid.Members {
+			// Members should be partition-sliced: e.g. "sda2", not "sda".
+			// They must NOT be md device names.
+			if strings.HasPrefix(member, "md") {
+				t.Errorf("RAIDSpec %q has member %q — md devices cannot be RAID members of themselves", raid.Name, member)
+			}
+		}
+	}
+
+	// --- 5. No md array has biosboot as a member ---
+	// Biosboot partitions are p1 on each disk. For the md-on-partitions topology
+	// with /boot as p2, /swap as p3, / as p4, members should be [sda2,sdb2] etc.
+	// If biosboot (p1) ended up as a RAID member, grub2-install on the md device
+	// would fail with "diskfilter writes are not supported".
+	biosbootPartNums := map[string]bool{}
+	// Biosboot is partition 1 on each raw disk in this layout.
+	for _, p := range rec.Layout.Partitions {
+		isBiosBoot := false
+		for _, f := range p.Flags {
+			if f == "bios_grub" || f == "biosboot" {
+				isBiosBoot = true
+			}
+		}
+		if p.Filesystem == "biosboot" {
+			isBiosBoot = true
+		}
+		if isBiosBoot {
+			// p1 on sda and sdb
+			biosbootPartNums["sda1"] = true
+			biosbootPartNums["sdb1"] = true
+			biosbootPartNums["/dev/sda1"] = true
+			biosbootPartNums["/dev/sdb1"] = true
+		}
+	}
+	for _, raid := range rec.Layout.RAIDArrays {
+		for _, member := range raid.Members {
+			if biosbootPartNums[member] {
+				t.Errorf("RAIDSpec %q includes biosboot partition %q as a member — biosboot must NOT be inside any md array", raid.Name, member)
+			}
+		}
+	}
+
+	// --- 6. Bootloader target must be i386-pc ---
+	if rec.Layout.Bootloader.Target != "i386-pc" {
+		t.Errorf("expected bootloader target=i386-pc for BIOS+RAID1 layout, got %q", rec.Layout.Bootloader.Target)
+	}
+}

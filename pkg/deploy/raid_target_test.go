@@ -291,6 +291,65 @@ func TestGrubInstallTargets(t *testing.T) {
 		}
 	})
 
+	t.Run("md-on-partitions with partition-number suffixed members (VM206/VM207 topology)", func(t *testing.T) {
+		// The layout recommender for BIOS+RAID1 generates RAIDSpec members as
+		// partition device names (e.g. "sda2", "sdb2") because each md array is
+		// assembled from specific partition slices. grubInstallTargets must strip
+		// the trailing partition number to recover the raw parent disk so that
+		// grub2-install targets /dev/sda and /dev/sdb (not /dev/sda2 and /dev/sdb2).
+		// grub2-install on a partition device fails with:
+		//   "Attempting to install GRUB to a partition. This is a BAD idea."
+		//   "embedding is not possible, but this is required for RAID and LVM install."
+		layout := api.DiskLayout{
+			RAIDArrays: []api.RAIDSpec{
+				{Name: "md0", Level: "raid1", Members: []string{"sda2", "sdb2"}}, // /boot slices
+				{Name: "md1", Level: "raid1", Members: []string{"sda3", "sdb3"}}, // swap slices
+				{Name: "md2", Level: "raid1", Members: []string{"sda4", "sdb4"}}, // / slices
+			},
+			Partitions: []api.PartitionSpec{
+				{Label: "biosboot", Flags: []string{"bios_grub"}}, // sda1/sdb1 — no Device
+				{Label: "boot", MountPoint: "/boot", Device: "md0"},
+				{Label: "swap", MountPoint: "swap", Device: "md1"},
+				{Label: "root", MountPoint: "/", Device: "md2"},
+			},
+		}
+		got := grubInstallTargets("/dev/sda", layout)
+		// Must return raw disks /dev/sda and /dev/sdb — NOT the partition devices.
+		want := map[string]bool{"/dev/sda": true, "/dev/sdb": true}
+		if len(got) != 2 {
+			t.Fatalf("got %v (len=%d), want raw member disks [/dev/sda /dev/sdb]", got, len(got))
+		}
+		for _, d := range got {
+			if !want[d] {
+				t.Errorf("unexpected target %q in grub targets %v — expected raw disk, not partition", d, got)
+			}
+		}
+	})
+
+	t.Run("md-on-partitions with NVMe partition members", func(t *testing.T) {
+		// NVMe partition devices use the 'p' separator (nvme0n1p2). Ensure
+		// rawDiskFromDevice correctly strips it to return nvme0n1.
+		layout := api.DiskLayout{
+			RAIDArrays: []api.RAIDSpec{
+				{Name: "md0", Level: "raid1", Members: []string{"nvme0n1p2", "nvme1n1p2"}},
+			},
+			Partitions: []api.PartitionSpec{
+				{Label: "biosboot", Flags: []string{"bios_grub"}},
+				{Label: "root", MountPoint: "/", Device: "md0"},
+			},
+		}
+		got := grubInstallTargets("/dev/nvme0n1", layout)
+		want := map[string]bool{"/dev/nvme0n1": true, "/dev/nvme1n1": true}
+		if len(got) != 2 {
+			t.Fatalf("got %v (len=%d), want [/dev/nvme0n1 /dev/nvme1n1]", got, len(got))
+		}
+		for _, d := range got {
+			if !want[d] {
+				t.Errorf("unexpected target %q — expected raw NVMe disk without partition suffix", d)
+			}
+		}
+	})
+
 	t.Run("RAID with smallest-N selector only — falls back to defaultDisk", func(t *testing.T) {
 		layout := api.DiskLayout{
 			RAIDArrays: []api.RAIDSpec{

@@ -465,6 +465,8 @@ func (d *FilesystemDeployer) Finalize(ctx context.Context, cfg api.NodeConfig, m
 		log.Info().Strs("disks", grubTargets).Bool("raid_on_whole_disk", raidOnWholeDisk).
 			Msg("finalize: installing GRUB bootloader on all RAID member disks (BIOS/GPT)")
 
+		var grubSucceeded int
+		var grubLastErr error
 		for _, grubDisk := range grubTargets {
 			log.Info().Str("disk", grubDisk).Str("bootDir", bootDir).
 				Msg("finalize: running grub2-install")
@@ -473,38 +475,55 @@ func (d *FilesystemDeployer) Finalize(ctx context.Context, cfg api.NodeConfig, m
 				"--boot-directory=" + bootDir,
 				"--recheck",
 			}
+			if len(d.layout.RAIDArrays) > 0 {
+				// For any RAID topology, grub2-install detects md superblock metadata
+				// on the target disk's partitions and refuses to embed without --force.
+				// --force bypasses the "embedding is not possible, but this is required
+				// for RAID and LVM install" error that grub2-install emits when it
+				// detects RAID membership on the disk.
+				grubArgs = append(grubArgs, "--force")
+			}
 			if raidOnWholeDisk {
-				// The biosboot partition lives on the md device (md0p1), not on the
-				// raw member disk. grub2-install on the raw disk needs three flags:
+				// RAID-on-whole-disk additionally requires:
 				//
-				// --force: bypass "no BIOS boot partition found" safety check.
-				//   Required because the GPT biosboot partition is on /dev/md0p1,
-				//   not on the raw disk partition table.
-				//
-				// --skip-fs-probe: bypass "unable to identify a filesystem" check.
-				//   The raw member disk has no partition table of its own (it was
-				//   handed directly to mdadm), so grub2-probe cannot find any
-				//   filesystem. This flag tells GRUB to write directly to the raw
+				// --skip-fs-probe: The raw member disk has no partition table of its
+				//   own (it was handed directly to mdadm), so grub2-probe cannot find
+				//   any filesystem. This flag tells GRUB to write directly to the raw
 				//   disk's MBR boot sector without probing.
 				//
 				// --modules: bake mdraid1x and diskfilter into core.img so GRUB can
 				//   locate /boot on the md array at runtime before loading its own
 				//   module files from any partition.
 				grubArgs = append(grubArgs,
-					"--force",
 					"--skip-fs-probe",
 					"--modules=mdraid1x diskfilter",
 				)
 			}
 			grubArgs = append(grubArgs, grubDisk)
 			if err := runAndLog(ctx, "grub2-install", exec.CommandContext(ctx, "grub2-install", grubArgs...)); err != nil {
-				// Non-fatal: log prominently. The node may still boot if the image
-				// already had a working bootloader or if another member disk succeeded.
+				grubLastErr = err
 				log.Warn().Err(err).Str("disk", grubDisk).
-					Msg("WARNING: finalize: grub2-install failed (non-fatal) — node may not boot from this disk; run grub2-install manually")
+					Msg("WARNING: finalize: grub2-install failed on this disk — will continue if other member disks succeed")
 			} else {
+				grubSucceeded++
 				log.Info().Str("disk", grubDisk).Msg("finalize: GRUB bootloader installed")
 			}
+		}
+
+		// For BIOS deploys, a failed grub2-install means the node cannot boot.
+		// If ALL target disks failed, the deployment is fatal — return an error so
+		// the deploy-complete callback is never fired and deploy-failed is sent instead.
+		// If at least one raw RAID member disk succeeded, the node is bootable (RAID1
+		// redundancy means one good disk is enough), so log a warning and continue.
+		if grubSucceeded == 0 && len(grubTargets) > 0 {
+			return &BootloaderError{
+				Targets: grubTargets,
+				Cause:   grubLastErr,
+			}
+		}
+		if grubLastErr != nil {
+			log.Warn().Int("succeeded", grubSucceeded).Int("total", len(grubTargets)).
+				Msg("WARNING: finalize: grub2-install failed on some disks but at least one succeeded — node is bootable (degraded RAID)")
 		}
 	}
 
@@ -645,6 +664,14 @@ func grubInstallTargets(defaultDisk string, layout api.DiskLayout) []string {
 			} else {
 				dev = "/dev/" + member
 			}
+			// For md-on-partitions BIOS RAID, members are partition devices
+			// (e.g. "sda2", "sdb2"). grub2-install must target the raw parent
+			// disk ("/dev/sda", "/dev/sdb") — not the partition — so that GRUB
+			// can write core.img into the biosboot partition (sda1/sdb1).
+			// Strip trailing partition number digits to recover the disk path.
+			// This is safe for whole-disk members ("sda", "sdb") because they
+			// have no trailing digits to strip.
+			dev = rawDiskFromDevice(dev)
 			add(dev)
 		}
 	}
@@ -654,6 +681,69 @@ func grubInstallTargets(defaultDisk string, layout api.DiskLayout) []string {
 		return []string{defaultDisk}
 	}
 	return targets
+}
+
+// rawDiskFromDevice strips trailing partition number digits from a block device
+// path to recover the parent disk. For example:
+//
+//	/dev/sda2      → /dev/sda
+//	/dev/sdb3      → /dev/sdb
+//	/dev/nvme0n1p2 → /dev/nvme0n1
+//	/dev/sda       → /dev/sda    (whole disk — no change)
+//	/dev/nvme0n1   → /dev/nvme0n1 (whole NVMe disk — no change)
+//
+// Two partition naming conventions are handled:
+//   - NVMe: "p" separator before the partition number (nvme0n1p2 → nvme0n1).
+//     NVMe whole-disk names end in a digit (nvme0n1) so the "p" separator is
+//     the only safe way to detect partition devices for this class.
+//   - Traditional (sd/hd/vd etc.): partition number appended directly (sda2 →
+//     sda). These whole-disk names end in a letter, so stripping trailing
+//     digits is safe.
+func rawDiskFromDevice(dev string) string {
+	base := filepath.Base(dev)
+	dir := filepath.Dir(dev)
+
+	// NVMe devices: only use the "p"-separator method. NVMe whole-disk names
+	// end in a digit (e.g. nvme0n1) so we must NOT fall through to the generic
+	// digit-strip below — that would wrongly turn "nvme0n1" into "nvme0n".
+	if strings.HasPrefix(base, "nvme") {
+		// Partition devices look like nvme0n1p2. Find the last "p" preceded by
+		// a digit (the namespace-to-partition separator) and everything after
+		// it must be digits.
+		for i := len(base) - 1; i > 0; i-- {
+			if base[i] == 'p' && base[i-1] >= '0' && base[i-1] <= '9' {
+				suffix := base[i+1:]
+				allDigits := len(suffix) > 0
+				for _, c := range suffix {
+					if c < '0' || c > '9' {
+						allDigits = false
+						break
+					}
+				}
+				if allDigits {
+					return filepath.Join(dir, base[:i])
+				}
+				break
+			}
+		}
+		// No partition suffix found — already a whole-disk name; return as-is.
+		return dev
+	}
+
+	// Traditional devices (sda, sdb, hda, vda, …): partition numbers are
+	// appended as trailing digits. Whole-disk names end in a letter, so
+	// stripping trailing digits is safe.
+	i := len(base)
+	for i > 0 && base[i-1] >= '0' && base[i-1] <= '9' {
+		i--
+	}
+	if i < len(base) {
+		// Only strip if the non-digit prefix is non-empty (safety check).
+		if i > 0 {
+			return filepath.Join(dir, base[:i])
+		}
+	}
+	return dev
 }
 
 // partitionDisk wipes and repartitions the target disk(s) according to the layout.
