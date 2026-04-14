@@ -21,10 +21,14 @@ IOWeight=100
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_MKNOD CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN CAP_NET_BIND_SERVICE
 
 # Allow access to loop devices so losetup --find --partscan works.
-# block-loop covers major-7 block nodes (/dev/loop0, /dev/loop0p1, etc.).
-# /dev/loop-control is a char device (major 10, minor 237) — NOT covered by
-# block-loop — required by losetup -f to find a free device via ioctl.
+# block-loop   = major 7: the raw /dev/loop<N> block devices.
+# block-blkext = major 259: the "extended" major used for partition devices
+#                created by --partscan (e.g. /dev/loop0p1, /dev/loop0p2).
+#                These are NOT covered by block-loop and mount(2) will return
+#                EPERM without this entry even with CAP_SYS_ADMIN.
+# /dev/loop-control = char device (major 10, minor 237), needed by losetup -f.
 DeviceAllow=block-loop rw
+DeviceAllow=block-blkext rw
 DeviceAllow=/dev/loop-control rw
 
 # QEMU (KVM-accelerated installer VM) requires /dev/kvm.
