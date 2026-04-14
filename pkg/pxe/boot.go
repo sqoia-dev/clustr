@@ -56,17 +56,19 @@ func GenerateBootScript(serverURL, token string) ([]byte, error) {
 
 // diskBootScriptTemplate is the iPXE response returned for nodes in NodeStateDeployed.
 //
-// iPXE's "exit" command surrenders control back to the BIOS/UEFI firmware, which
-// then falls through to the next entry in the boot order — local disk. This
-// requires PXE to be first in the BIOS boot order (set once during rack/stack)
-// and is the canonical PXE-server-as-source-of-truth pattern (xCAT, Warewulf,
-// Cobbler all work this way).
+// We use `sanboot --no-describe --drive 0x80` instead of `exit` because SeaBIOS
+// (used by Proxmox/QEMU VMs) restarts the PXE loop on exit rather than falling
+// through to the next boot order entry, causing an infinite PXE loop. sanboot
+// uses iPXE's built-in INT 13h chainload to explicitly boot the first local disk
+// (0x80), bypassing firmware boot-order handling entirely. This works on both
+// SeaBIOS VMs and real BIOS/UEFI hardware — same pattern used by xCAT and
+// Warewulf. Diagnosed by Gilfoyle; VM207 was stuck in the loop before this fix.
 //
 // The hostname comment is templated in so operators can confirm the correct node
 // is receiving the disk-boot response in packet captures or iPXE serial output.
 const diskBootScriptTemplate = `#!ipxe
 echo Node {{.Hostname}} is deployed -- booting from local disk
-exit
+sanboot --no-describe --drive 0x80
 `
 
 var diskBootTmpl = template.Must(template.New("diskboot").Parse(diskBootScriptTemplate))
