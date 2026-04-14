@@ -69,10 +69,15 @@ mknod -m 640 "$WORKDIR/dev/tty1"    c 4 1 2>/dev/null || true
 mkdir -p "$WORKDIR/dev/pts"
 
 # Install clonr binary.
-cp "$CLONR_BIN" "$WORKDIR/usr/bin/clonr"
-chmod 755 "$WORKDIR/usr/bin/clonr"
+# The binary is ALWAYS installed as exactly /usr/bin/clonr regardless of the
+# source name (e.g. clonr-static, clonr-linux-amd64).  The init script exec
+# line is hardcoded to /usr/bin/clonr — any mismatch here would cause the
+# deploy agent to not be found at runtime.
+CLONR_INSTALLED_PATH="$WORKDIR/usr/bin/clonr"
+cp "$CLONR_BIN" "$CLONR_INSTALLED_PATH"
+chmod 755 "$CLONR_INSTALLED_PATH"
 
-echo "  [+] Installed clonr binary ($(du -h "$CLONR_BIN" | cut -f1))"
+echo "  [+] Installed clonr binary as /usr/bin/clonr ($(du -h "$CLONR_BIN" | cut -f1), src=$(basename "$CLONR_BIN"))"
 
 # Install busybox for shell and basic utilities.
 # Prefer a musl static build from busybox.net (most complete applet set).
@@ -1038,6 +1043,7 @@ REQUIRED_CMDS=(
     "lsblk:/usr/bin/lsblk"
     "curl:/usr/bin/curl"
     "mdadm:/usr/sbin/mdadm,/sbin/mdadm"
+    "clonr:/usr/bin/clonr"
 )
 
 for entry in "${REQUIRED_CMDS[@]}"; do
