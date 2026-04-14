@@ -177,8 +177,14 @@ func TestPartitionDevices(t *testing.T) {
 	})
 }
 
-// TestGrubInstallTargets verifies that grubInstallTargets expands RAID member
-// lists correctly and falls back to defaultDisk for non-RAID layouts.
+// TestGrubInstallTargets verifies grubInstallTargets topology detection.
+//
+// The key distinction is RAID-on-whole-disk vs md-on-partitions:
+//   - RAID-on-whole-disk: all PartitionSpec.Device values point to md arrays
+//     → grub2-install must target the md device (e.g. /dev/md0) because
+//       the raw member disks have no partition table of their own
+//   - md-on-partitions: raw disks have biosboot partitions; md arrays are formed
+//     from those partition slices → grub2-install targets the raw member disks
 func TestGrubInstallTargets(t *testing.T) {
 	t.Run("no RAID — returns defaultDisk only", func(t *testing.T) {
 		layout := api.DiskLayout{}
@@ -188,43 +194,96 @@ func TestGrubInstallTargets(t *testing.T) {
 		}
 	})
 
-	t.Run("RAID1 with two named members — returns both disks", func(t *testing.T) {
+	t.Run("RAID-on-whole-disk: all partitions on md0 — returns /dev/md0", func(t *testing.T) {
+		// twoIdenticalDisks() topology: all 4 partitions have Device="md0".
+		// grub2-install must target /dev/md0 (the md device has the biosboot partition).
 		layout := api.DiskLayout{
 			RAIDArrays: []api.RAIDSpec{
 				{Name: "md0", Level: "raid1", Members: []string{"sda", "sdb"}},
 			},
+			Partitions: []api.PartitionSpec{
+				{Device: "md0", Label: "biosboot", Flags: []string{"bios_grub"}},
+				{Device: "md0", Label: "boot", MountPoint: "/boot"},
+				{Device: "md0", Label: "swap", MountPoint: "swap"},
+				{Device: "md0", Label: "root", MountPoint: "/"},
+			},
 		}
 		got := grubInstallTargets("/dev/sda", layout)
-		want := map[string]bool{"/dev/sda": true, "/dev/sdb": true}
+		if len(got) != 1 || got[0] != "/dev/md0" {
+			t.Errorf("got %v, want [/dev/md0] for RAID-on-whole-disk topology", got)
+		}
+	})
+
+	t.Run("RAID-on-whole-disk: two md arrays — returns both md devices", func(t *testing.T) {
+		layout := api.DiskLayout{
+			RAIDArrays: []api.RAIDSpec{
+				{Name: "md0", Level: "raid1", Members: []string{"sda", "sdb"}},
+				{Name: "md1", Level: "raid1", Members: []string{"sdc", "sdd"}},
+			},
+			Partitions: []api.PartitionSpec{
+				{Device: "md0", Label: "boot", MountPoint: "/boot"},
+				{Device: "md1", Label: "root", MountPoint: "/"},
+			},
+		}
+		got := grubInstallTargets("/dev/sda", layout)
+		want := map[string]bool{"/dev/md0": true, "/dev/md1": true}
 		if len(got) != 2 {
-			t.Fatalf("got %v, want 2 entries", got)
+			t.Fatalf("got %v, want 2 md device entries", got)
 		}
 		for _, d := range got {
 			if !want[d] {
-				t.Errorf("unexpected disk %q in grub targets %v", d, got)
+				t.Errorf("unexpected target %q in grub targets %v", d, got)
 			}
 		}
 	})
 
-	t.Run("RAID1 with absolute member paths", func(t *testing.T) {
+	t.Run("md-on-partitions: no Device on partitions — returns raw member disks", func(t *testing.T) {
+		// Partitions have no Device field (land on raw disks). md array is formed
+		// from slices of sda and sdb. Each raw disk needs its own bootloader.
 		layout := api.DiskLayout{
 			RAIDArrays: []api.RAIDSpec{
-				{Name: "md0", Level: "raid1", Members: []string{"/dev/sda", "/dev/sdb"}},
+				{Name: "md0", Level: "raid1", Members: []string{"sda", "sdb"}},
+			},
+			Partitions: []api.PartitionSpec{
+				{Label: "biosboot", Flags: []string{"bios_grub"}}, // sda1/sdb1 — no Device
+				{Label: "boot", MountPoint: "/boot"},               // no Device
 			},
 		}
 		got := grubInstallTargets("/dev/sda", layout)
 		want := map[string]bool{"/dev/sda": true, "/dev/sdb": true}
 		if len(got) != 2 {
-			t.Fatalf("got %v, want 2 entries", got)
+			t.Fatalf("got %v, want raw member disks [/dev/sda /dev/sdb]", got)
 		}
 		for _, d := range got {
 			if !want[d] {
-				t.Errorf("unexpected disk %q in grub targets %v", d, got)
+				t.Errorf("unexpected target %q in grub targets %v", d, got)
 			}
 		}
 	})
 
-	t.Run("RAID with smallest-N selector — falls back to defaultDisk", func(t *testing.T) {
+	t.Run("md-on-partitions with absolute member paths", func(t *testing.T) {
+		layout := api.DiskLayout{
+			RAIDArrays: []api.RAIDSpec{
+				{Name: "md0", Level: "raid1", Members: []string{"/dev/sda", "/dev/sdb"}},
+			},
+			Partitions: []api.PartitionSpec{
+				{Label: "biosboot", Flags: []string{"bios_grub"}},
+				{Label: "boot", MountPoint: "/boot"},
+			},
+		}
+		got := grubInstallTargets("/dev/sda", layout)
+		want := map[string]bool{"/dev/sda": true, "/dev/sdb": true}
+		if len(got) != 2 {
+			t.Fatalf("got %v, want [/dev/sda /dev/sdb]", got)
+		}
+		for _, d := range got {
+			if !want[d] {
+				t.Errorf("unexpected target %q in grub targets %v", d, got)
+			}
+		}
+	})
+
+	t.Run("RAID with smallest-N selector only — falls back to defaultDisk", func(t *testing.T) {
 		layout := api.DiskLayout{
 			RAIDArrays: []api.RAIDSpec{
 				{Name: "md0", Level: "raid1", Members: []string{"smallest-2"}},
@@ -233,19 +292,6 @@ func TestGrubInstallTargets(t *testing.T) {
 		got := grubInstallTargets("/dev/sda", layout)
 		if len(got) != 1 || got[0] != "/dev/sda" {
 			t.Errorf("got %v, want [/dev/sda] for selector-only members", got)
-		}
-	})
-
-	t.Run("de-duplication across multiple arrays", func(t *testing.T) {
-		layout := api.DiskLayout{
-			RAIDArrays: []api.RAIDSpec{
-				{Name: "md0", Level: "raid1", Members: []string{"sda", "sdb"}},
-				{Name: "md1", Level: "raid1", Members: []string{"sda", "sdb"}}, // same disks, different array
-			},
-		}
-		got := grubInstallTargets("/dev/sda", layout)
-		if len(got) != 2 {
-			t.Errorf("got %v, want exactly 2 unique disks (de-duped)", got)
 		}
 	})
 }

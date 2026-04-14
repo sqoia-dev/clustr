@@ -489,14 +489,48 @@ func partitionDevices(defaultDisk string, layout api.DiskLayout) []string {
 	return devs
 }
 
-// grubInstallTargets returns the ordered, de-duped list of raw disk devices that
+// grubInstallTargets returns the ordered, de-duped list of disk devices that
 // grub2-install must target. For single-disk layouts this is just [defaultDisk].
-// For RAID-on-whole-disk layouts (where RAIDArrays[*].Members lists raw disks)
-// it is ALL member disks from all arrays — each member needs its own MBR so the
-// node can boot from any surviving disk after a member failure.
+//
+// For RAID-on-whole-disk layouts (where all PartitionSpec.Device values point to
+// md arrays rather than raw disks), grub2-install must target the md device itself
+// (e.g. /dev/md0). In this topology the raw member disks have NO partition table
+// — only the md device is partitioned — so running grub2-install on sda/sdb would
+// fail with "unable to identify a filesystem". GRUB's diskfilter/mdraid1x modules
+// handle writing the MBR to each physical member disk when the md device is used.
+//
+// For md-on-partitions layouts (where partitions exist on the raw disks and the md
+// array is formed from those partitions), the raw member disks are targeted so each
+// physical disk gets its own biosboot+MBR for independent bootability.
 func grubInstallTargets(defaultDisk string, layout api.DiskLayout) []string {
 	if len(layout.RAIDArrays) == 0 {
 		return []string{defaultDisk}
+	}
+
+	// Build a set of md array names referenced by at least one non-biosboot partition.
+	// If ANY non-biosboot partition lives on an md device, we are in RAID-on-whole-disk
+	// topology and grub2-install must target the md device(s), not the raw members.
+	mdDevicesWithPartitions := make(map[string]bool)
+	for _, p := range layout.Partitions {
+		if p.Device == "" {
+			continue
+		}
+		// Skip pure biosboot partitions — they don't have a real filesystem and
+		// their device placement doesn't determine the topology.
+		isBIOSBoot := false
+		for _, flag := range p.Flags {
+			if flag == "bios_grub" || flag == "biosboot" {
+				isBIOSBoot = true
+				break
+			}
+		}
+		if isBIOSBoot {
+			continue
+		}
+		base := strings.TrimPrefix(p.Device, "/dev/")
+		if strings.HasPrefix(base, "md") {
+			mdDevicesWithPartitions[base] = true
+		}
 	}
 
 	seen := make(map[string]bool)
@@ -508,25 +542,34 @@ func grubInstallTargets(defaultDisk string, layout api.DiskLayout) []string {
 		}
 	}
 
-	for _, raid := range layout.RAIDArrays {
-		for _, member := range raid.Members {
-			var dev string
-			if strings.HasPrefix(member, "/dev/") {
-				dev = member
-			} else {
-				dev = "/dev/" + member
+	if len(mdDevicesWithPartitions) > 0 {
+		// RAID-on-whole-disk: target the md device(s) directly. GRUB's diskfilter
+		// module will write the core image to the biosboot partition on the md device
+		// and stamp the MBR on each physical member automatically.
+		for mdName := range mdDevicesWithPartitions {
+			add("/dev/" + mdName)
+		}
+	} else {
+		// md-on-partitions: target each raw member disk so every physical disk has
+		// its own bootloader for independent boot after a member failure.
+		for _, raid := range layout.RAIDArrays {
+			for _, member := range raid.Members {
+				// Skip size-based selectors — concrete names only.
+				if strings.HasPrefix(member, "smallest-") {
+					continue
+				}
+				var dev string
+				if strings.HasPrefix(member, "/dev/") {
+					dev = member
+				} else {
+					dev = "/dev/" + member
+				}
+				add(dev)
 			}
-			// Skip size-based selectors ("smallest-N") — they are resolved at
-			// RAID-create time and are not meaningful here. We only need concrete
-			// device names for grub2-install.
-			if strings.HasPrefix(member, "smallest-") {
-				continue
-			}
-			add(dev)
 		}
 	}
 
-	// If no concrete member names found (all were selectors), fall back to defaultDisk.
+	// If no concrete targets found (all selectors, no md devices), fall back.
 	if len(targets) == 0 {
 		return []string{defaultDisk}
 	}
