@@ -375,11 +375,10 @@ func (d *FilesystemDeployer) Finalize(ctx context.Context, cfg api.NodeConfig, m
 		return fmt.Errorf("deploy: Preflight must be called before Finalize")
 	}
 
-	// Re-create the partition device list from the stored layout.
-	partDevs := make([]string, len(d.layout.Partitions))
-	for i := range d.layout.Partitions {
-		partDevs[i] = partitionDevice(d.targetDisk, i+1)
-	}
+	// Re-create the partition device list from the stored layout, using the same
+	// per-target counter logic as createFilesystems so partition numbers are
+	// consistent across both phases.
+	partDevs := partitionDevices(d.targetDisk, d.layout)
 
 	// Re-mount all partitions so applyNodeConfig can write into the filesystem.
 	if err := d.mountPartitions(ctx, partDevs, mountRoot); err != nil {
@@ -392,8 +391,13 @@ func (d *FilesystemDeployer) Finalize(ctx context.Context, cfg api.NodeConfig, m
 	}
 
 	// Install the GRUB bootloader if the layout includes a bios_grub partition.
-	// This writes stage1/stage1.5 to the bios_grub partition and the MBR so the
-	// deployed system can boot on BIOS/GPT systems without EFI.
+	// For RAID1 nodes, grub2-install must run on EVERY raw member disk so the
+	// node can boot from either disk if one fails. We collect grub install targets
+	// from two sources:
+	//   1. d.targetDisk (the raw disk picked by selectTargetDisk for single-disk layouts).
+	//   2. Every member disk in every RAIDSpec (for RAID-on-whole-disk layouts).
+	// For a RAID1 layout with two members both disks get a bootloader; for a
+	// single-disk layout only that disk does. Duplicates are de-duped.
 	hasBIOSGrub := false
 	for _, p := range d.layout.Partitions {
 		for _, flag := range p.Flags {
@@ -406,22 +410,28 @@ func (d *FilesystemDeployer) Finalize(ctx context.Context, cfg api.NodeConfig, m
 	if hasBIOSGrub {
 		log := logger()
 		bootDir := filepath.Join(mountRoot, "boot")
-		log.Info().Str("disk", d.targetDisk).Str("bootDir", bootDir).
-			Msg("finalize: installing GRUB bootloader (BIOS/GPT)")
-		grubArgs := []string{
-			"--target=i386-pc",
-			"--boot-directory=" + bootDir,
-			"--recheck",
-			d.targetDisk,
-		}
-		if err := runAndLog(ctx, "grub2-install", exec.CommandContext(ctx, "grub2-install", grubArgs...)); err != nil {
-			// Non-fatal: log prominently. The node may still boot if the image
-			// already had a working bootloader installed (e.g. a snapshot of a
-			// running system). Manual intervention: chroot in and run grub2-install.
-			log.Warn().Err(err).Str("disk", d.targetDisk).
-				Msg("WARNING: finalize: grub2-install failed (non-fatal) — node may not boot; run grub2-install manually")
-		} else {
-			log.Info().Str("disk", d.targetDisk).Msg("finalize: GRUB bootloader installed")
+
+		// Collect all raw disks that need a bootloader.
+		grubTargets := grubInstallTargets(d.targetDisk, d.layout)
+		log.Info().Strs("disks", grubTargets).Msg("finalize: installing GRUB bootloader on all RAID member disks (BIOS/GPT)")
+
+		for _, grubDisk := range grubTargets {
+			log.Info().Str("disk", grubDisk).Str("bootDir", bootDir).
+				Msg("finalize: running grub2-install")
+			grubArgs := []string{
+				"--target=i386-pc",
+				"--boot-directory=" + bootDir,
+				"--recheck",
+				grubDisk,
+			}
+			if err := runAndLog(ctx, "grub2-install", exec.CommandContext(ctx, "grub2-install", grubArgs...)); err != nil {
+				// Non-fatal: log prominently. The node may still boot if the image
+				// already had a working bootloader or if another member disk succeeded.
+				log.Warn().Err(err).Str("disk", grubDisk).
+					Msg("WARNING: finalize: grub2-install failed (non-fatal) — node may not boot from this disk; run grub2-install manually")
+			} else {
+				log.Info().Str("disk", grubDisk).Msg("finalize: GRUB bootloader installed")
+			}
 		}
 	}
 
@@ -432,7 +442,14 @@ func (d *FilesystemDeployer) Finalize(ctx context.Context, cfg api.NodeConfig, m
 	// grub2-install writes the bootloader binary; applyBootConfig makes it
 	// functional by regenerating the config with the target's actual kernel,
 	// initramfs, and partition UUIDs.
-	if err := applyBootConfig(ctx, mountRoot, d.targetDisk, d.layout, partDevs); err != nil {
+	//
+	// For applyBootConfig's targetDisk argument (used for kernel-install fallback
+	// only), pass the first grub install target so it references a real raw disk.
+	bootConfigDisk := d.targetDisk
+	if targets := grubInstallTargets(d.targetDisk, d.layout); len(targets) > 0 {
+		bootConfigDisk = targets[0]
+	}
+	if err := applyBootConfig(ctx, mountRoot, bootConfigDisk, d.layout, partDevs); err != nil {
 		return fmt.Errorf("deploy: finalize: boot config: %w", err)
 	}
 
@@ -458,87 +475,163 @@ func (d *FilesystemDeployer) Finalize(ctx context.Context, cfg api.NodeConfig, m
 	return nil
 }
 
-// partitionDisk wipes and repartitions the disk according to the layout.
-// Uses sgdisk for GPT layouts (standard for EFI systems).
+// partitionDevices reconstructs the partition device path slice for a given layout,
+// using the same per-target counter logic as createFilesystems. This must be kept
+// in sync with createFilesystems so Finalize remounts the correct devices.
+func partitionDevices(defaultDisk string, layout api.DiskLayout) []string {
+	devs := make([]string, len(layout.Partitions))
+	targetCount := make(map[string]int)
+	for i, p := range layout.Partitions {
+		target := resolvePartitionDisk(defaultDisk, p)
+		targetCount[target]++
+		devs[i] = partitionDevice(target, targetCount[target])
+	}
+	return devs
+}
+
+// grubInstallTargets returns the ordered, de-duped list of raw disk devices that
+// grub2-install must target. For single-disk layouts this is just [defaultDisk].
+// For RAID-on-whole-disk layouts (where RAIDArrays[*].Members lists raw disks)
+// it is ALL member disks from all arrays — each member needs its own MBR so the
+// node can boot from any surviving disk after a member failure.
+func grubInstallTargets(defaultDisk string, layout api.DiskLayout) []string {
+	if len(layout.RAIDArrays) == 0 {
+		return []string{defaultDisk}
+	}
+
+	seen := make(map[string]bool)
+	var targets []string
+	add := func(dev string) {
+		if !seen[dev] {
+			seen[dev] = true
+			targets = append(targets, dev)
+		}
+	}
+
+	for _, raid := range layout.RAIDArrays {
+		for _, member := range raid.Members {
+			var dev string
+			if strings.HasPrefix(member, "/dev/") {
+				dev = member
+			} else {
+				dev = "/dev/" + member
+			}
+			// Skip size-based selectors ("smallest-N") — they are resolved at
+			// RAID-create time and are not meaningful here. We only need concrete
+			// device names for grub2-install.
+			if strings.HasPrefix(member, "smallest-") {
+				continue
+			}
+			add(dev)
+		}
+	}
+
+	// If no concrete member names found (all were selectors), fall back to defaultDisk.
+	if len(targets) == 0 {
+		return []string{defaultDisk}
+	}
+	return targets
+}
+
+// partitionDisk wipes and repartitions the target disk(s) according to the layout.
+//
+// For single-disk layouts all partitions land on `disk`. For RAID-on-whole-disk
+// layouts (where every PartitionSpec.Device == "md0" etc.) the target is the md
+// device, NOT the raw member disks. The member disks were handed to mdadm --create
+// already and are now part of the running array; partitioning them directly would
+// fail with EBUSY. Instead we partition the md device and let mdadm propagate the
+// layout to both members via its partition-table-sync feature.
+//
+// Uses sgdisk for GPT (standard for BIOS+GPT and EFI systems).
 func (d *FilesystemDeployer) partitionDisk(ctx context.Context, disk string) error {
 	log := logger()
-	log.Info().Str("disk", disk).Msg("wiping existing partition table")
-	// Wipe existing partition table.
-	if err := runCmd(ctx, "sgdisk", "--zap-all", disk); err != nil {
-		log.Warn().Str("disk", disk).Err(err).Msg("sgdisk --zap-all failed, trying wipefs")
-		// Fall back to wipefs if sgdisk is unavailable.
-		if err2 := runCmd(ctx, "wipefs", "-a", disk); err2 != nil {
-			return fmt.Errorf("wipe disk %s: sgdisk failed (%v) and wipefs also failed (%v) — "+
-				"check if the disk has an active RAID superblock (wipefs -a %s)", disk, err, err2, disk)
-		}
+
+	// Build a map of target-disk → list of (originalIndex, PartitionSpec) so we
+	// can issue one sgdisk call per unique target disk. In single-disk layouts
+	// there is only one target. In RAID-on-whole-disk layouts all partitions target
+	// the md device (e.g. /dev/md0) and `disk` is unused for partitioning.
+	type partEntry struct {
+		origIdx int
+		spec    api.PartitionSpec
 	}
-	log.Info().Str("disk", disk).Msg("disk wiped")
-
-	// Build sgdisk partition arguments.
-	args := []string{}
+	targetMap := make(map[string][]partEntry) // target disk path → partitions
 	for i, p := range d.layout.Partitions {
-		num := i + 1
-		var sizeSpec string
-		if p.SizeBytes == 0 {
-			sizeSpec = "0" // fill remaining
-		} else {
-			sizeSpec = fmt.Sprintf("+%dK", p.SizeBytes/1024)
-		}
-		args = append(args, fmt.Sprintf("--new=%d:0:%s", num, sizeSpec))
+		target := resolvePartitionDisk(disk, p)
+		targetMap[target] = append(targetMap[target], partEntry{i, p})
+	}
 
-		if p.Label != "" {
-			args = append(args, fmt.Sprintf("--change-name=%d:%s", num, p.Label))
-		}
-		// Set partition type GUID based on flags.
-		for _, flag := range p.Flags {
-			switch flag {
-			case "esp", "boot":
-				// EFI System Partition: type code ef00
-				args = append(args, fmt.Sprintf("--typecode=%d:ef00", num))
-			case "bios_grub":
-				// BIOS boot partition: type code ef02 (used by GRUB2 on GPT/BIOS systems)
-				args = append(args, fmt.Sprintf("--typecode=%d:ef02", num))
+	for target, parts := range targetMap {
+		log.Info().Str("disk", target).Msg("wiping existing partition table")
+		if err := runCmd(ctx, "sgdisk", "--zap-all", target); err != nil {
+			log.Warn().Str("disk", target).Err(err).Msg("sgdisk --zap-all failed, trying wipefs")
+			if err2 := runCmd(ctx, "wipefs", "-a", target); err2 != nil {
+				return fmt.Errorf("wipe disk %s: sgdisk failed (%v) and wipefs also failed (%v) — "+
+					"check if the disk has an active RAID superblock (wipefs -a %s)", target, err, err2, target)
 			}
 		}
+		log.Info().Str("disk", target).Msg("disk wiped")
 
-		// Log each partition as it's being defined (granular progress, Problem 3).
-		sizeStr := "fill"
-		if p.SizeBytes > 0 {
-			sizeStr = humanReadableBytes(p.SizeBytes)
+		// Build sgdisk partition arguments. Partition numbers are re-indexed per
+		// target disk starting at 1 so each target gets a self-consistent GPT.
+		// d.layout.Partitions is ordered; for targets with all partitions (the
+		// common case) this preserves the original order.
+		args := []string{}
+		for localNum, pe := range parts {
+			num := localNum + 1 // 1-based partition number on this target
+			p := pe.spec
+			var sizeSpec string
+			if p.SizeBytes == 0 {
+				sizeSpec = "0" // fill remaining
+			} else {
+				sizeSpec = fmt.Sprintf("+%dK", p.SizeBytes/1024)
+			}
+			args = append(args, fmt.Sprintf("--new=%d:0:%s", num, sizeSpec))
+
+			if p.Label != "" {
+				args = append(args, fmt.Sprintf("--change-name=%d:%s", num, p.Label))
+			}
+			for _, flag := range p.Flags {
+				switch flag {
+				case "esp", "boot":
+					args = append(args, fmt.Sprintf("--typecode=%d:ef00", num))
+				case "bios_grub":
+					args = append(args, fmt.Sprintf("--typecode=%d:ef02", num))
+				}
+			}
+
+			sizeStr := "fill"
+			if p.SizeBytes > 0 {
+				sizeStr = humanReadableBytes(p.SizeBytes)
+			}
+			log.Info().Int("partition", num).Str("disk", target).
+				Str("mountpoint", p.MountPoint).Str("filesystem", p.Filesystem).
+				Str("size", sizeStr).Str("flags", strings.Join(p.Flags, ",")).
+				Msg("defining partition")
 		}
-		log.Info().Int("partition", num).Str("mountpoint", p.MountPoint).
-			Str("filesystem", p.Filesystem).Str("size", sizeStr).
-			Str("flags", strings.Join(p.Flags, ",")).
-			Msg("defining partition")
-	}
-	args = append(args, disk)
+		args = append(args, target)
 
-	log.Info().Int("count", len(d.layout.Partitions)).Str("disk", disk).Msg("running sgdisk to create partitions")
-	if err := runAndLog(ctx, "sgdisk", exec.CommandContext(ctx, "sgdisk", args...)); err != nil {
-		return fmt.Errorf("failed to create partitions on %s — "+
-			"check if the disk has an existing RAID superblock (wipefs -a %s): %w",
-			disk, disk, err)
-	}
-	log.Info().Str("disk", disk).Msg("sgdisk partition creation succeeded")
+		log.Info().Int("count", len(parts)).Str("disk", target).Msg("running sgdisk to create partitions")
+		if err := runAndLog(ctx, "sgdisk", exec.CommandContext(ctx, "sgdisk", args...)); err != nil {
+			return fmt.Errorf("failed to create partitions on %s — "+
+				"check if the disk has an existing RAID superblock (wipefs -a %s): %w",
+				target, target, err)
+		}
+		log.Info().Str("disk", target).Msg("sgdisk partition creation succeeded")
 
-	// Allow kernel to re-read the new partition table.
-	log.Info().Str("disk", disk).Msg("running partprobe to re-read partition table")
-	_ = runCmd(ctx, "partprobe", disk)
-	_ = runCmd(ctx, "udevadm", "settle")
-	// In minimal initramfs environments without udevd, partition uevent
-	// notifications are not processed, so /dev/sdaN nodes don't appear
-	// after partprobe. Run 'mdev -s' (busybox) to scan sysfs and create
-	// device nodes, then fall back to manually creating them if needed.
-	log.Info().Msg("triggering device node creation for new partitions")
-	_ = exec.CommandContext(ctx, "mdev", "-s").Run()
-	// Also trigger re-read via blockdev for kernels that support it.
-	_ = exec.CommandContext(ctx, "blockdev", "--rereadpt", disk).Run()
-	// Give the kernel time to create partition device nodes in /dev.
-	if err := waitForPartitions(ctx, disk, len(d.layout.Partitions), 15); err != nil {
-		log.Warn().Err(err).Msg("waitForPartitions timed out — attempting manual device node creation")
-		ensurePartitionNodes(disk, len(d.layout.Partitions))
+		// Allow kernel to re-read the new partition table.
+		log.Info().Str("disk", target).Msg("running partprobe to re-read partition table")
+		_ = runCmd(ctx, "partprobe", target)
+		_ = runCmd(ctx, "udevadm", "settle")
+		log.Info().Msg("triggering device node creation for new partitions")
+		_ = exec.CommandContext(ctx, "mdev", "-s").Run()
+		_ = exec.CommandContext(ctx, "blockdev", "--rereadpt", target).Run()
+		if err := waitForPartitions(ctx, target, len(parts), 15); err != nil {
+			log.Warn().Err(err).Str("disk", target).
+				Msg("waitForPartitions timed out — attempting manual device node creation")
+			ensurePartitionNodes(target, len(parts))
+		}
+		log.Info().Str("disk", target).Msg("partition table re-read complete")
 	}
-	log.Info().Str("disk", disk).Msg("partition table re-read complete")
 
 	return nil
 }
@@ -639,20 +732,63 @@ func waitForPartitions(ctx context.Context, disk string, count int, maxWaitSec i
 
 // partitionDevice returns the partition device path for a given disk and number.
 // Handles both nvme-style (nvme0n1p1) and sda-style (sda1) naming.
+// md devices (md0, md1, etc.) use the "p" separator just like nvme: /dev/md0p1.
 func partitionDevice(disk string, num int) string {
-	if strings.Contains(disk, "nvme") || strings.Contains(disk, "mmcblk") {
+	base := filepath.Base(disk)
+	if strings.Contains(disk, "nvme") || strings.Contains(disk, "mmcblk") || strings.HasPrefix(base, "md") {
 		return fmt.Sprintf("%sp%d", disk, num)
 	}
 	return fmt.Sprintf("%s%d", disk, num)
 }
 
+// resolvePartitionDisk returns the block device that a PartitionSpec should be
+// created on. When spec.Device is set (e.g. "md0" or "/dev/md0"), that device
+// is used — this covers RAID-on-whole-disk layouts where the layout recommender
+// places all partitions on top of an md array. When spec.Device is empty the
+// caller-supplied defaultDisk is used (single-disk or raw-member layouts).
+func resolvePartitionDisk(defaultDisk string, spec api.PartitionSpec) string {
+	if spec.Device == "" {
+		return defaultDisk
+	}
+	if strings.HasPrefix(spec.Device, "/dev/") {
+		return spec.Device
+	}
+	return "/dev/" + spec.Device
+}
+
+// resolveFormatTarget returns the block device path that mkfs should format for
+// partition number num (1-based) of the given spec. It calls resolvePartitionDisk
+// to pick the right parent disk then appends the partition number suffix.
+//
+// For RAID1 whole-disk layouts (spec.Device == "md0") this returns "/dev/md0p1",
+// "/dev/md0p2", etc. For single-disk layouts it returns "/dev/sda1" etc.
+func resolveFormatTarget(defaultDisk string, spec api.PartitionSpec, num int) string {
+	disk := resolvePartitionDisk(defaultDisk, spec)
+	return partitionDevice(disk, num)
+}
+
 // createFilesystems creates the appropriate filesystem on each partition.
 // Returns a slice of resolved partition device paths in layout order.
+//
+// When PartitionSpec.Device is set (e.g. "md0"), the format target is derived
+// from that device (e.g. /dev/md0p1) rather than the raw disk. This is the
+// correct behaviour for RAID-on-whole-disk layouts where partitions live on top
+// of an assembled md array. The raw member disks (sda, sdb) are already held by
+// mdadm and must not be formatted directly.
 func (d *FilesystemDeployer) createFilesystems(ctx context.Context, disk string) ([]string, error) {
 	log := logger()
 	devs := make([]string, len(d.layout.Partitions))
+
+	// Compute per-target local partition numbers. sgdisk numbers partitions
+	// starting from 1 per target disk. When all partitions share the same target
+	// (single-disk or all-on-md0 layouts) localNum == i+1. When partitions are
+	// spread across multiple targets we need independent counters per target.
+	targetCount := make(map[string]int) // target disk path → running count
 	for i, p := range d.layout.Partitions {
-		dev := partitionDevice(disk, i+1)
+		target := resolvePartitionDisk(disk, p)
+		targetCount[target]++
+		localNum := targetCount[target]
+		dev := partitionDevice(target, localNum)
 		devs[i] = dev
 
 		var mkfsArgs []string
