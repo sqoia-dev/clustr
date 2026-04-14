@@ -699,12 +699,13 @@ chmod 1777 /tmp
 LOG=/tmp/init.log
 touch "\$LOG"
 
-# log() writes to both /dev/console (VGA) and the log file.
-# We always write to /dev/console directly so output is visible on screen
-# regardless of which console= arg is last (which determines PID 1 stdio).
+# log() writes to the log file and to stdout.
+# PID 1 stdout is attached to the serial console (ttyS0) via the kernel
+# cmdline console= parameter. Do NOT also write to /dev/console — on VMs
+# without a VGA adapter /dev/console resolves to ttyS0 as well, causing
+# every log line to appear twice on the serial console.
 log() {
     echo "\$*" >> "\$LOG"
-    echo "\$*" > /dev/console 2>/dev/null || true
     echo "\$*"
 }
 
@@ -783,7 +784,7 @@ for mod in \
         dmesg | tail -3 >> "\$LOG"
     else
         log "insmod \$name: FILE MISSING at \$mod"
-        ls -la "\$(dirname \$mod)" 2>&1 | tee -a "\$LOG"
+        ls -la "\$(dirname \$mod)" 2>&1 >> "\$LOG"
     fi
 done
 
@@ -824,7 +825,7 @@ log "mdev -s ran — dev nodes after mdev: \$(ls /dev/sd* /dev/vd* /dev/nvme* 2>
 log "loaded: \$(cat /proc/modules 2>/dev/null | grep -E 'virtio|failover|xfs|ext4' | cut -d' ' -f1 | tr '\n' ' ')"
 log "ifaces: \$(ls /sys/class/net/ 2>/dev/null | tr '\n' ' ')"
 # Also dump all interfaces for diagnostics
-ls -la /sys/class/net/ 2>/dev/null | tee -a "\$LOG"
+ls -la /sys/class/net/ 2>/dev/null >> "\$LOG"
 
 # Give kernel time to enumerate the NIC after module load
 sleep 2
@@ -873,15 +874,15 @@ if [ -z "\$IFACE_UP" ]; then
 fi
 
 log "net state:"
-ip addr show 2>/dev/null | tee -a "\$LOG"
-ip route show 2>/dev/null | tee -a "\$LOG"
+ip addr show 2>/dev/null >> "\$LOG"
+ip route show 2>/dev/null >> "\$LOG"
 
 # ── Step 6b: connectivity test (output goes to VGA via /dev/console) ──────────
 log "=== NETWORK CONNECTIVITY TEST ==="
 log "ping 10.99.0.1:"
-ping -c3 -W2 10.99.0.1 2>&1 | tee -a "\$LOG"
+ping -c3 -W2 10.99.0.1 2>&1 >> "\$LOG"
 log "curl connect test:"
-curl -v --max-time 5 "http://10.99.0.1:8080/" 2>&1 | head -20 | tee -a "\$LOG"
+curl -v --max-time 5 "http://10.99.0.1:8080/" 2>&1 | head -20 >> "\$LOG"
 log "=== END CONNECTIVITY TEST ==="
 
 # ── Step 7: start log server so clonr-server can pull diagnostics ─────────────
