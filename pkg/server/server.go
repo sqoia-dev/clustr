@@ -16,6 +16,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 	"github.com/sqoia-dev/clonr/pkg/api"
 	"github.com/sqoia-dev/clonr/pkg/config"
@@ -196,6 +197,8 @@ func (s *Server) buildRouter() chi.Router {
 	}
 
 	// Handler instances.
+	apiKeysH := s.buildAPIKeysHandler()
+
 	health := &handlers.HealthHandler{Version: "dev"}
 	images := &handlers.ImagesHandler{DB: s.db, ImageDir: s.cfg.ImageDir, Progress: s.progress}
 	nodes := &handlers.NodesHandler{DB: s.db}
@@ -299,6 +302,12 @@ func (s *Server) buildRouter() chi.Router {
 		// Admin-only routes — require admin scope.
 		r.Group(func(r chi.Router) {
 			r.Use(requireScope(true)) // admin scope required
+
+			// API key management — admin can create, list, revoke, and rotate keys.
+			r.Get("/admin/api-keys", apiKeysH.HandleList)
+			r.Post("/admin/api-keys", apiKeysH.HandleCreate)
+			r.Delete("/admin/api-keys/{id}", apiKeysH.HandleRevoke)
+			r.Post("/admin/api-keys/{id}/rotate", apiKeysH.HandleRotate)
 
 			// Health
 			r.Get("/health", health.ServeHTTP)
@@ -489,6 +498,42 @@ func (s *Server) buildAuthHandler() *handlers.AuthHandler {
 		Validate:   validateFn,
 		CookieName: cookieName,
 		Secure:     s.cfg.SessionSecure,
+	}
+}
+
+// buildAPIKeysHandler constructs the APIKeysHandler with closures that call into
+// the server's DB and key-generation functions without causing circular imports.
+func (s *Server) buildAPIKeysHandler() *handlers.APIKeysHandler {
+	mintFn := func(r *http.Request, scope api.KeyScope, nodeID, label, createdBy string, expiresAt *time.Time) (string, string, string, error) {
+		raw, err := generateRawKey()
+		if err != nil {
+			return "", "", "", err
+		}
+		keyHash := sha256Hex(raw)
+		rec := db.APIKeyRecord{
+			ID:        uuid.New().String(),
+			Scope:     scope,
+			NodeID:    nodeID,
+			KeyHash:   keyHash,
+			Label:     label,
+			CreatedBy: createdBy,
+			CreatedAt: time.Now(),
+			ExpiresAt: expiresAt,
+		}
+		if err := s.db.CreateAPIKey(r.Context(), rec); err != nil {
+			return "", "", "", fmt.Errorf("create api key: %w", err)
+		}
+		return raw, rec.ID, keyHash, nil
+	}
+
+	actorLabelFn := func(r *http.Request) string {
+		return keyLabelFromContext(r.Context())
+	}
+
+	return &handlers.APIKeysHandler{
+		DB:            s.db,
+		MintKey:       mintFn,
+		GetActorLabel: actorLabelFn,
 	}
 }
 
