@@ -396,8 +396,18 @@ func extractKeyPrefix(r *http.Request) string {
 }
 
 // DeleteInitramfsHistory handles DELETE /api/v1/system/initramfs/history/{id}.
-// Deletes a single history entry by ID. Refuses to delete the most recent
-// successful entry (the live initramfs) to prevent orphaning the active image.
+// Deletes a single history entry by ID regardless of its outcome (success or
+// failure), UNLESS the entry's sha256 matches the sha256 of the initramfs file
+// currently on disk — that entry is the live image and must not be deleted.
+//
+// Guard logic:
+//  1. Compute sha256 of the on-disk initramfs file (h.InitramfsPath).
+//  2. Fetch the target record's sha256 from the DB.
+//  3. If they match → 409 live_entry_cannot_delete.
+//  4. Otherwise → proceed with deletion regardless of outcome field.
+//
+// This allows deletion of older successful entries that have been superseded by
+// a newer rebuild, while still protecting the currently-serving image.
 func (h *InitramfsHandler) DeleteInitramfsHistory(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if id == "" {
@@ -407,14 +417,34 @@ func (h *InitramfsHandler) DeleteInitramfsHistory(w http.ResponseWriter, r *http
 
 	ctx := r.Context()
 
-	// Guard: refuse to delete the most recent successful entry (that's the live initramfs).
-	liveID, err := h.DB.LatestSuccessfulInitramfsBuildID(ctx)
-	if err == nil && liveID == id {
-		writeJSON(w, http.StatusConflict, api.ErrorResponse{
-			Error: "cannot delete the most recent successful build — it points to the live initramfs",
-			Code:  "live_entry_cannot_delete",
-		})
-		return
+	// Compute sha256 of the live on-disk initramfs.  If the file does not exist
+	// we skip the live guard (no live image means nothing is protected).
+	var liveSHA256 string
+	if f, err := os.Open(h.InitramfsPath); err == nil {
+		hasher := sha256.New()
+		if _, err := io.Copy(hasher, f); err == nil {
+			liveSHA256 = hex.EncodeToString(hasher.Sum(nil))
+		}
+		f.Close()
+	}
+
+	// Fetch the target entry to get its sha256.
+	if liveSHA256 != "" {
+		rows, err := h.DB.SQL().QueryContext(ctx,
+			`SELECT sha256 FROM initramfs_builds WHERE id = ? LIMIT 1`, id)
+		if err == nil {
+			defer rows.Close()
+			if rows.Next() {
+				var entrySHA256 string
+				if rows.Scan(&entrySHA256) == nil && entrySHA256 == liveSHA256 {
+					writeJSON(w, http.StatusConflict, api.ErrorResponse{
+						Error: "cannot delete the live initramfs entry — its sha256 matches the file currently on disk",
+						Code:  "live_entry_cannot_delete",
+					})
+					return
+				}
+			}
+		}
 	}
 
 	if err := h.DB.DeleteInitramfsBuild(ctx, id); err != nil {

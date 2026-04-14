@@ -854,14 +854,24 @@ const Pages = {
         const builtAt = info && info.build_time ? fmtRelative(info.build_time) : '—';
         const kernel = info && info.kernel_version ? escHtml(info.kernel_version) : '—';
 
+        // Live sha256 — the sha256 of the file currently on disk, returned by GET
+        // /system/initramfs.  Any history entry whose sha256 matches this is the
+        // live image and must not be deleted.
+        const liveSHA256 = (info && info.sha256) ? info.sha256 : null;
+
         const historyRows = (info && info.history && info.history.length > 0)
             ? info.history.map(h => {
                 // Attribution: use label if present, fall back to key prefix, then "session".
                 const by = h.triggered_by_label ? escHtml(h.triggered_by_label)
                          : h.triggered_by_prefix && h.triggered_by_prefix !== 'session' ? escHtml(h.triggered_by_prefix)
                          : 'session';
-                const isFailed = h.outcome !== 'success' && h.outcome !== 'pending';
-                const delBtn = isFailed
+                // Show delete button for every entry that is not the currently-live
+                // initramfs.  The live entry is identified by matching sha256 against
+                // the on-disk file hash returned by GET /system/initramfs.  Pending
+                // entries have no sha256 yet — never show delete for them.
+                const isLive = h.outcome === 'success' && liveSHA256 && h.sha256 === liveSHA256;
+                const isDeletable = !isLive && h.outcome !== 'pending';
+                const delBtn = isDeletable
                     ? `<button class="btn btn-xs" style="padding:2px 6px;font-size:11px;color:var(--error);background:transparent;border:1px solid var(--error);border-radius:4px;cursor:pointer;line-height:1.2"
                          onclick="Pages.deleteInitramfsHistory('${escHtml(h.id)}')" title="Delete this entry">×</button>`
                     : '';
@@ -987,7 +997,7 @@ const Pages = {
     // ── Delete a single initramfs history entry ────────────────────────────
 
     async deleteInitramfsHistory(id) {
-        if (!confirm('Delete this failed history entry?')) return;
+        if (!confirm('Delete this history entry?')) return;
         try {
             await API.system.deleteInitramfsHistory(id);
             // Remove the row from the DOM immediately without a full page reload.
