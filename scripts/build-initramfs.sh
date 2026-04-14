@@ -1022,7 +1022,23 @@ for entry in "${REQUIRED_CMDS[@]}"; do
     found=false
     IFS=',' read -ra path_list <<< "$paths"
     for p in "${path_list[@]}"; do
-        if [[ -f "$WORKDIR$p" && -x "$WORKDIR$p" ]]; then
+        local_path="$WORKDIR$p"
+        if [[ -L "$local_path" ]]; then
+            # Symlink — resolve target relative to WORKDIR (absolute symlinks like
+            # /bin/busybox must be resolved within the staging tree, not the host).
+            link_target=$(readlink "$local_path")
+            if [[ "$link_target" = /* ]]; then
+                # Absolute symlink — target is relative to WORKDIR
+                resolved="$WORKDIR$link_target"
+            else
+                # Relative symlink — target is relative to the symlink's directory
+                resolved="$(dirname "$local_path")/$link_target"
+            fi
+            if [[ -f "$resolved" && -x "$resolved" ]]; then
+                found=true
+                break
+            fi
+        elif [[ -f "$local_path" && -x "$local_path" ]]; then
             found=true
             break
         fi
