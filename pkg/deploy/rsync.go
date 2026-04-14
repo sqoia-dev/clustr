@@ -454,15 +454,24 @@ func (d *FilesystemDeployer) Finalize(ctx context.Context, cfg api.NodeConfig, m
 			}
 			if raidOnWholeDisk {
 				// The biosboot partition lives on the md device (md0p1), not on the
-				// raw member disk. grub2-install on the raw disk won't find a BIOS
-				// Boot Partition through normal probing.
-				// --force: bypass "no BIOS boot partition found" safety check so GRUB
-				//   writes MBR + embeds core.img to the raw disk's first sectors.
+				// raw member disk. grub2-install on the raw disk needs three flags:
+				//
+				// --force: bypass "no BIOS boot partition found" safety check.
+				//   Required because the GPT biosboot partition is on /dev/md0p1,
+				//   not on the raw disk partition table.
+				//
+				// --skip-fs-probe: bypass "unable to identify a filesystem" check.
+				//   The raw member disk has no partition table of its own (it was
+				//   handed directly to mdadm), so grub2-probe cannot find any
+				//   filesystem. This flag tells GRUB to write directly to the raw
+				//   disk's MBR boot sector without probing.
+				//
 				// --modules: bake mdraid1x and diskfilter into core.img so GRUB can
 				//   locate /boot on the md array at runtime before loading its own
 				//   module files from any partition.
 				grubArgs = append(grubArgs,
 					"--force",
+					"--skip-fs-probe",
 					"--modules=mdraid1x diskfilter",
 				)
 			}
