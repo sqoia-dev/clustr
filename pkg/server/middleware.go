@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog/log"
 	"github.com/sqoia-dev/clonr/pkg/api"
 	"github.com/sqoia-dev/clonr/pkg/db"
@@ -21,9 +22,19 @@ import (
 // ctxKeyScope is the context key used to store the resolved API key scope.
 type ctxKeyScope struct{}
 
+// ctxKeyNodeID is the context key used to store the node ID bound to a node-scoped key.
+type ctxKeyNodeID struct{}
+
 // scopeFromContext returns the KeyScope stored in the request context, or "".
 func scopeFromContext(ctx context.Context) api.KeyScope {
 	v, _ := ctx.Value(ctxKeyScope{}).(api.KeyScope)
+	return v
+}
+
+// nodeIDFromContext returns the node ID stored in the request context, or "".
+// Only set for requests authenticated with a node-scoped key.
+func nodeIDFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(ctxKeyNodeID{}).(string)
 	return v
 }
 
@@ -108,10 +119,14 @@ func apiKeyAuth(database *db.DB, devMode bool, sessionSecret []byte, sessionSecu
 				}
 			}
 			hash := sha256Hex(hashInput)
-			scope, err := database.LookupAPIKey(r.Context(), hash)
+			lookupResult, err := database.LookupAPIKey(r.Context(), hash)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					writeUnauthorized(w, "invalid API key")
+					return
+				}
+				if errors.Is(err, db.ErrExpired) {
+					writeUnauthorized(w, "API key expired")
 					return
 				}
 				log.Error().Err(err).Msg("api key auth: db lookup failed")
@@ -121,7 +136,10 @@ func apiKeyAuth(database *db.DB, devMode bool, sessionSecret []byte, sessionSecu
 				return
 			}
 
-			ctx := context.WithValue(r.Context(), ctxKeyScope{}, scope)
+			ctx := context.WithValue(r.Context(), ctxKeyScope{}, lookupResult.Scope)
+			if lookupResult.NodeID != "" {
+				ctx = context.WithValue(ctx, ctxKeyNodeID{}, lookupResult.NodeID)
+			}
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
@@ -149,6 +167,86 @@ func requireScope(adminOnly bool) func(http.Handler) http.Handler {
 			}
 			if scope != api.KeyScopeAdmin && scope != api.KeyScopeNode {
 				writeForbidden(w, "unrecognized scope")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// requireNodeOwnership returns a middleware that ensures the authenticated node key
+// matches the {id} URL parameter. Admin keys always pass. Node keys are only allowed
+// if their bound node_id matches the URL {id} parameter.
+//
+// Use this on deploy-complete, deploy-failed, and other node-self-report routes.
+func requireNodeOwnership(nodeIDParam string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			scope := scopeFromContext(r.Context())
+			if scope == "" {
+				writeUnauthorized(w, "authentication required")
+				return
+			}
+			if scope == api.KeyScopeAdmin {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if scope != api.KeyScopeNode {
+				writeForbidden(w, "unrecognized scope")
+				return
+			}
+			// Node scope: the key's bound node_id must match the URL parameter.
+			tokenNodeID := nodeIDFromContext(r.Context())
+			urlNodeID := chi.URLParam(r, nodeIDParam)
+			if tokenNodeID == "" || tokenNodeID != urlNodeID {
+				writeForbidden(w, "node key is not authorized for this node")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// requireImageAccess returns a middleware that allows either:
+//   - Admin-scoped keys: always allowed.
+//   - Node-scoped keys: allowed only if the node's currently-assigned base_image_id
+//     matches the imageID URL parameter. This prevents a node from fetching images
+//     other than the one it is supposed to deploy.
+//
+// Use this on GET /images/{id} and GET /images/{id}/blob.
+func requireImageAccess(imageIDParam string, database *db.DB) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			scope := scopeFromContext(r.Context())
+			if scope == "" {
+				writeUnauthorized(w, "authentication required")
+				return
+			}
+			if scope == api.KeyScopeAdmin {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if scope != api.KeyScopeNode {
+				writeForbidden(w, "unrecognized scope")
+				return
+			}
+			// Node scope: look up the node's assigned image and compare.
+			tokenNodeID := nodeIDFromContext(r.Context())
+			if tokenNodeID == "" {
+				writeForbidden(w, "node key has no bound node ID")
+				return
+			}
+			nodeCfg, err := database.GetNodeConfig(r.Context(), tokenNodeID)
+			if err != nil {
+				log.Error().Err(err).Str("node_id", tokenNodeID).Msg("requireImageAccess: lookup node")
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(api.ErrorResponse{Error: "internal server error", Code: "internal_error"})
+				return
+			}
+			urlImageID := chi.URLParam(r, imageIDParam)
+			if nodeCfg.BaseImageID == "" || nodeCfg.BaseImageID != urlImageID {
+				writeForbidden(w, "node key is not authorized to access this image")
 				return
 			}
 			next.ServeHTTP(w, r)

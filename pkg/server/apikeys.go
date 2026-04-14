@@ -94,3 +94,43 @@ func CreateAPIKey(ctx context.Context, database *db.DB, scope api.KeyScope, desc
 
 	return raw, rec.ID, nil
 }
+
+// CreateNodeScopedKey mints a fresh node-scoped API key bound to nodeID with a
+// 1-hour TTL. Any existing node-scoped keys for the same node are revoked first
+// (clean rotation: exactly one live token per node at any given time).
+//
+// Returns the raw key (prefix: clonr-node-<raw>) for embedding in the iPXE cmdline.
+// The raw key is never stored — only its SHA-256 hash is persisted.
+func CreateNodeScopedKey(ctx context.Context, database *db.DB, nodeID string) (rawKey string, err error) {
+	// Revoke any existing node-scoped keys for this node before minting a new one.
+	if err := database.RevokeNodeScopedKeys(ctx, nodeID); err != nil {
+		return "", fmt.Errorf("create node scoped key: revoke old keys: %w", err)
+	}
+
+	raw, err := generateRawKey()
+	if err != nil {
+		return "", err
+	}
+
+	exp := time.Now().Add(1 * time.Hour)
+	rec := db.APIKeyRecord{
+		ID:          uuid.New().String(),
+		Scope:       api.KeyScopeNode,
+		NodeID:      nodeID,
+		KeyHash:     sha256Hex(raw),
+		Description: "node-scoped deploy token (auto-generated at PXE serve time)",
+		CreatedAt:   time.Now(),
+		ExpiresAt:   &exp,
+	}
+	if err := database.CreateAPIKey(ctx, rec); err != nil {
+		return "", fmt.Errorf("create node scoped key: persist: %w", err)
+	}
+
+	log.Info().
+		Str("node_id", nodeID).
+		Str("key_id", rec.ID).
+		Time("expires_at", exp).
+		Msg("node-scoped deploy token minted")
+
+	return raw, nil
+}

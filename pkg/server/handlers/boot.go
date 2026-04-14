@@ -26,6 +26,10 @@ type BootHandler struct {
 	// DB is used to look up node state by MAC for PXE boot routing.
 	// When nil the handler always returns the full boot script (safe default).
 	DB *db.DB
+	// MintNodeToken is called to generate a fresh node-scoped API key at PXE-serve
+	// time. The returned raw key is embedded in the kernel cmdline as clonr.token.
+	// When nil (e.g. in tests that don't need auth), an empty token is used.
+	MintNodeToken func(nodeID string) (rawKey string, err error)
 }
 
 // ServeIPXEScript handles GET /api/v1/boot/ipxe.
@@ -44,6 +48,10 @@ type BootHandler struct {
 //   - All other states (Registered, Configured, ReimagePending, Failed, or
 //     unknown MAC): the full clonr initramfs boot script, which causes the
 //     node to run `clonr deploy --auto` and deploy or wait for assignment.
+//
+// For non-deployed nodes a fresh node-scoped API key is minted and embedded in
+// the kernel cmdline as clonr.token=<key> so the deploy agent can authenticate
+// against /images/{id} and /images/{id}/blob without an admin key.
 //
 // This is the canonical pattern used by xCAT, Warewulf, and Cobbler: the PXE
 // server is the source of truth for what each node boots. No BMC SetNextBoot
@@ -81,16 +89,30 @@ func (h *BootHandler) ServeIPXEScript(w http.ResponseWriter, r *http.Request) {
 				_, _ = w.Write(script)
 				return
 			}
-			// All other states fall through to the full clonr boot script below.
+
+			// Non-deployed node: mint a fresh node-scoped token for this deploy run.
+			token := h.mintToken(r, nodeCfg.ID)
+			script, genErr := pxe.GenerateBootScript(h.ServerURL, "clonr-node-"+token)
+			if genErr != nil {
+				log.Error().Err(genErr).Str("mac", mac).Msg("boot: generate boot script")
+				http.Error(w, "failed to generate boot script", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(script)
+			return
 		}
-		// Unknown MAC (ErrNotFound): node will self-register on boot.
+		// Unknown MAC (ErrNotFound): node will self-register on boot. Serve script
+		// without a token — the node has no ID yet and will register first, then
+		// receive a token on its next PXE boot (triggered by the reimage flow).
 	} else if mac == "" {
 		log.Warn().Msg("boot: iPXE script requested without ?mac= -- returning full boot script")
 	}
 
-	// Default: return the full clonr initramfs boot script.
-	// Covers: Registered, Configured, ReimagePending, Failed, and unknown MACs.
-	script, err := pxe.GenerateBootScript(h.ServerURL)
+	// Default: return the full clonr initramfs boot script with no token.
+	// Covers: unknown MACs and requests without a MAC parameter.
+	script, err := pxe.GenerateBootScript(h.ServerURL, "")
 	if err != nil {
 		log.Error().Err(err).Msg("boot: generate iPXE script")
 		http.Error(w, "failed to generate boot script", http.StatusInternalServerError)
@@ -99,6 +121,21 @@ func (h *BootHandler) ServeIPXEScript(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(script)
+}
+
+// mintToken calls MintNodeToken if configured and logs failures. Returns the raw
+// key (without the clonr-node- prefix) on success, or "" on failure/unconfigured.
+// The caller prepends "clonr-node-" before embedding in the cmdline.
+func (h *BootHandler) mintToken(r *http.Request, nodeID string) string {
+	if h.MintNodeToken == nil || nodeID == "" {
+		return ""
+	}
+	raw, err := h.MintNodeToken(nodeID)
+	if err != nil {
+		log.Error().Err(err).Str("node_id", nodeID).Msg("boot: failed to mint node-scoped token")
+		return ""
+	}
+	return raw
 }
 
 // ServeVMLinuz handles GET /api/v1/boot/vmlinuz.

@@ -228,6 +228,9 @@ func (s *Server) buildRouter() chi.Router {
 		TFTPDir:   s.cfg.PXE.TFTPDir,
 		ServerURL: serverURL,
 		DB:        s.db,
+		MintNodeToken: func(nodeID string) (string, error) {
+			return CreateNodeScopedKey(context.Background(), s.db, nodeID)
+		},
 	}
 
 	// Embedded web UI — served without bearer auth.
@@ -262,6 +265,19 @@ func (s *Server) buildRouter() chi.Router {
 		r.Post("/logs", logs.IngestLogs)
 		r.Post("/deploy/progress", progress.IngestProgress)
 
+		// Deploy lifecycle callbacks — require node-scope auth where the key's bound
+		// node_id must match the URL {id}. Admin keys also pass (for manual overrides).
+		// These are intentionally outside the admin-only group so the deploy agent
+		// running in initramfs can call them using its node-scoped key.
+		r.With(requireNodeOwnership("id")).Post("/nodes/{id}/deploy-complete", nodes.DeployComplete)
+		r.With(requireNodeOwnership("id")).Post("/nodes/{id}/deploy-failed", nodes.DeployFailed)
+
+		// Image fetch routes accessible by node-scoped keys (deploy agent reads its assigned image).
+		// requireImageAccess handles both admin and node scopes; node keys may only access the
+		// image currently assigned to their bound node. Must be outside the admin-only group.
+		r.With(requireImageAccess("id", s.db)).Get("/images/{id}", images.GetImage)
+		r.With(requireImageAccess("id", s.db)).Get("/images/{id}/blob", images.DownloadBlob)
+
 		// Admin-only routes — require admin scope.
 		r.Group(func(r chi.Router) {
 			r.Use(requireScope(true)) // admin scope required
@@ -269,16 +285,16 @@ func (s *Server) buildRouter() chi.Router {
 			// Health
 			r.Get("/health", health.ServeHTTP)
 
-			// Images
+			// Images — mutating operations are admin-only.
+			// GET /images/{id} and GET /images/{id}/blob are registered above with
+			// requireImageAccess so node keys can also reach them.
 			r.Get("/images", images.ListImages)
 			r.Post("/images", images.CreateImage)
-			r.Get("/images/{id}", images.GetImage)
 			r.Delete("/images/{id}", images.DeleteImage)
 			r.Get("/images/{id}/status", images.GetImageStatus)
 			r.Get("/images/{id}/disklayout", images.GetDiskLayout)
 			r.Put("/images/{id}/disklayout", images.PutDiskLayout)
 			r.Post("/images/{id}/blob", images.UploadBlob)
-			r.Get("/images/{id}/blob", images.DownloadBlob)
 
 			// Factory
 			r.Get("/image-roles", factory.ListImageRoles)
@@ -311,12 +327,6 @@ func (s *Server) buildRouter() chi.Router {
 			r.Get("/nodes/{id}", nodes.GetNode)
 			r.Put("/nodes/{id}", nodes.UpdateNode)
 			r.Delete("/nodes/{id}", nodes.DeleteNode)
-
-			// Deploy lifecycle callbacks — called by the node after finalize.
-			// These are the mechanism by which the PXE server learns whether a
-			// node should boot from disk or run another deploy on next PXE boot.
-			r.Post("/nodes/{id}/deploy-complete", nodes.DeployComplete)
-			r.Post("/nodes/{id}/deploy-failed", nodes.DeployFailed)
 
 			// Disk layout hierarchy — node-level overrides, group assignment,
 			// hardware-aware recommendations, and validation.
@@ -403,7 +413,7 @@ func (s *Server) buildAuthHandler() *handlers.AuthHandler {
 		}
 		h := sha256.Sum256([]byte(hashInput))
 		hashHex := fmt.Sprintf("%x", h)
-		sc, err := s.db.LookupAPIKey(context.Background(), hashHex)
+		lookupResult, err := s.db.LookupAPIKey(context.Background(), hashHex)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return "", "", false
@@ -412,9 +422,10 @@ func (s *Server) buildAuthHandler() *handlers.AuthHandler {
 			return "", "", false
 		}
 		// Login only allows admin-scope keys.
-		if sc != api.KeyScopeAdmin {
+		if lookupResult.Scope != api.KeyScopeAdmin {
 			return "", "", false
 		}
+		sc := lookupResult.Scope
 		kid := hashInput
 		if len(kid) > 8 {
 			kid = kid[:8]

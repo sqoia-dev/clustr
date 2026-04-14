@@ -1,9 +1,9 @@
 package pxe
 
 import (
+	"bytes"
 	"fmt"
 	"text/template"
-	"bytes"
 )
 
 // iPXE boot script template.
@@ -19,9 +19,13 @@ import (
 //
 // This applies to both UEFI (ipxe.efi) and BIOS (undionly.kpxe) clients because
 // the named-initrd form is the only reliably portable syntax across iPXE versions.
+//
+// clonr.token is a short-lived node-scoped API key minted at PXE-serve time.
+// The initramfs init script parses it from /proc/cmdline and exports CLONR_TOKEN
+// so that `clonr deploy --auto` can authenticate against the server.
 const bootScriptTemplate = `#!ipxe
 set server-url {{.ServerURL}}
-kernel ${server-url}/api/v1/boot/vmlinuz initrd=initramfs.img clonr.server=${server-url} clonr.mac=${mac} console=ttyS0,115200n8
+kernel ${server-url}/api/v1/boot/vmlinuz initrd=initramfs.img clonr.server=${server-url} clonr.mac=${mac} clonr.token={{.Token}} console=ttyS0,115200n8
 initrd --name initramfs.img ${server-url}/api/v1/boot/initramfs.img
 boot
 `
@@ -31,12 +35,14 @@ var bootTmpl = template.Must(template.New("boot").Parse(bootScriptTemplate))
 // bootScriptData holds template vars for the iPXE boot script.
 type bootScriptData struct {
 	ServerURL string
+	Token     string // full clonr-node-<hex> token, embedded in kernel cmdline
 }
 
-// GenerateBootScript renders the iPXE boot script for the given server URL.
-// The MAC is left as an iPXE variable (${mac}) so iPXE fills it at runtime.
-func GenerateBootScript(serverURL string) ([]byte, error) {
-	data := bootScriptData{ServerURL: serverURL}
+// GenerateBootScript renders the iPXE boot script for the given server URL and
+// node-scoped deploy token. The MAC is left as an iPXE variable (${mac}) so iPXE
+// fills it at runtime.
+func GenerateBootScript(serverURL, token string) ([]byte, error) {
+	data := bootScriptData{ServerURL: serverURL, Token: token}
 	var buf bytes.Buffer
 	if err := bootTmpl.Execute(&buf, data); err != nil {
 		return nil, fmt.Errorf("pxe/boot: render boot script: %w", err)
