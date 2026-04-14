@@ -21,6 +21,9 @@ import (
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
+// ErrExpired is returned by LookupAPIKey when a key exists but its TTL has elapsed.
+var ErrExpired = fmt.Errorf("api key expired")
+
 // DB wraps sql.DB with typed clonr operations.
 type DB struct {
 	sql *sql.DB
