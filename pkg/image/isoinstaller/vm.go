@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -343,21 +344,55 @@ func Build(ctx context.Context, opts BuildOptions) (*BuildResult, error) {
 		Err(procExitErr).
 		Msg("isoinstaller: install VM exited — verifying disk")
 
-	// ── Fail-fast on startup failures ─────────────────────────────────────
-	// If QEMU exited in under 60 seconds with a non-zero status, that's a
-	// startup failure (wrong CPU flag, missing device, bad ISO, etc.), not a
-	// successful install. Anaconda/subiquity installs always take at least
-	// 5+ minutes. Proceeding to extract would produce a blank image or
-	// confusing partition errors. Read the serial log tail so the admin can
-	// see exactly why QEMU failed.
-	if procExitErr != nil && elapsed < 60*time.Second {
+	// ── Classify exit errors ───────────────────────────────────────────────
+	// Inspect the exit status to give operators an actionable diagnosis. The
+	// former <60s gate is removed — a SIGKILL at 47s means OOM, not a startup
+	// failure; the signal inspection below correctly distinguishes those cases.
+	if procExitErr != nil {
 		tail := readSerialLogTail(serialLogPath, 30)
 		qemuStderr := strings.TrimSpace(stderrBuf.String())
 		qemuInvocation := qemuBin + " " + strings.Join(qemuArgs, " ")
 
+		var headline string
+		var oomHint string
+
+		if exitErr, ok := procExitErr.(*exec.ExitError); ok {
+			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+				if status.Signaled() {
+					sig := status.Signal()
+					switch sig {
+					case syscall.SIGKILL:
+						headline = fmt.Sprintf(
+							"isoinstaller: QEMU killed by SIGKILL after %v — likely OOM from cgroup limit; "+
+								"check systemd MemoryMax on parent unit and run: dmesg -T | grep -i 'killed process'",
+							elapsed.Round(time.Second))
+						oomHint = scanDmesgForOOM()
+					case syscall.SIGTERM:
+						headline = fmt.Sprintf(
+							"isoinstaller: QEMU received SIGTERM after %v — process was asked to shut down externally (check if the service manager stopped it)",
+							elapsed.Round(time.Second))
+					default:
+						headline = fmt.Sprintf(
+							"isoinstaller: QEMU killed by signal %v after %v",
+							sig, elapsed.Round(time.Second))
+					}
+				} else {
+					headline = fmt.Sprintf(
+						"isoinstaller: installer exited with code %d after %v (guest init script failure; check serial log at %s)",
+						status.ExitStatus(), elapsed.Round(time.Second), serialLogPath)
+				}
+			} else {
+				headline = fmt.Sprintf("isoinstaller: QEMU exited with error after %v: %v", elapsed.Round(time.Second), procExitErr)
+			}
+		} else {
+			headline = fmt.Sprintf("isoinstaller: QEMU exited with error after %v: %v", elapsed.Round(time.Second), procExitErr)
+		}
+
 		var errMsg strings.Builder
-		fmt.Fprintf(&errMsg, "isoinstaller: QEMU exited after %v with status %v — install failed to start (check serial log at %s)",
-			elapsed.Round(time.Second), procExitErr, serialLogPath)
+		fmt.Fprint(&errMsg, headline)
+		if oomHint != "" {
+			fmt.Fprintf(&errMsg, "\n\n[dmesg OOM evidence]\n%s", oomHint)
+		}
 		fmt.Fprintf(&errMsg, "\n\n[qemu invocation]\n%s", qemuInvocation)
 		if qemuStderr != "" {
 			fmt.Fprintf(&errMsg, "\n\n[qemu stderr]\n%s", qemuStderr)
@@ -457,6 +492,44 @@ func readSerialLogTail(path string, lines int) string {
 		all = all[len(all)-lines:]
 	}
 	return "--- last " + fmt.Sprintf("%d", len(all)) + " serial lines ---\n" + strings.Join(all, "\n")
+}
+
+// scanDmesgForOOM does a best-effort scan of dmesg output for OOM killer events
+// mentioning qemu, kvm, or "Out of memory" in the last 2 minutes. Returns
+// matching lines as a formatted string, or an empty string if none found or
+// dmesg is unavailable (e.g. containerised environments without CAP_SYSLOG).
+func scanDmesgForOOM() string {
+	out, err := exec.Command("dmesg", "-T", "--level=err,crit,alert,emerg").Output()
+	if err != nil || len(out) == 0 {
+		// Fallback: try without -T (older kernels) and without level filter.
+		out, err = exec.Command("dmesg").Output()
+		if err != nil || len(out) == 0 {
+			return ""
+		}
+	}
+
+	var matched []string
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "killed process") ||
+			strings.Contains(lower, "out of memory") ||
+			strings.Contains(lower, "oom") {
+			if strings.Contains(lower, "qemu") || strings.Contains(lower, "kvm") ||
+				strings.Contains(lower, "killed process") || strings.Contains(lower, "out of memory") {
+				matched = append(matched, line)
+			}
+		}
+	}
+	if len(matched) == 0 {
+		return "(no OOM evidence found in dmesg — check /var/log/messages or journalctl -k)"
+	}
+	// Return last 10 matching lines to keep error messages concise.
+	if len(matched) > 10 {
+		matched = matched[len(matched)-10:]
+	}
+	return strings.Join(matched, "\n")
 }
 
 // applyDefaults fills in zero-value BuildOptions fields with sensible defaults.
