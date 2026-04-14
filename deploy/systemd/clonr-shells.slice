@@ -1,0 +1,33 @@
+[Unit]
+Description=Clonr interactive nspawn shell session scope slice
+Documentation=https://github.com/sqoia-dev/clonr
+# This slice is the resource envelope for all systemd-nspawn shell sessions
+# spawned by clonr-serverd. systemd-run --scope --slice=clonr-shells.slice
+# places each nspawn process here, isolating it from clonr-serverd's own
+# NoNewPrivileges=true and CapabilityBoundingSet restrictions.
+#
+# nspawn requires CAP_SYS_ADMIN to create mount, UTS, and PID namespaces
+# and to call pivot_root(2). It also needs CAP_MKNOD to create device nodes
+# inside the container. Without these capabilities the nspawn invocation
+# fails with "Failed to move root directory: Operation not permitted".
+
+[Slice]
+MemoryMax=2G
+CPUWeight=100
+IOWeight=100
+
+# Capabilities required by systemd-nspawn for namespace and container setup.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_MKNOD CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_SYS_ADMIN CAP_MKNOD CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID CAP_NET_BIND_SERVICE
+
+# nspawn needs real device access for /dev/pts (PTY allocation in container).
+PrivateDevices=no
+
+# nspawn needs to mount procfs/sysfs inside the container namespace.
+ProtectSystem=no
+
+# nspawn loads kernel modules (e.g. loop) inside containers on some setups.
+ProtectKernelModules=no
+
+# nspawn creates mount, UTS, and PID namespaces — must not restrict namespace creation.
+RestrictNamespaces=no

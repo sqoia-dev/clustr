@@ -15,6 +15,39 @@ import (
 	"github.com/sqoia-dev/clonr/pkg/api"
 )
 
+// systemdRunAvailable returns true if systemd-run(1) is present on PATH.
+// Used to decide whether to wrap nspawn in a systemd-run --scope.
+var systemdRunAvailable = func() bool {
+	_, err := exec.LookPath("systemd-run")
+	return err == nil
+}()
+
+// wrapNspawnInScope wraps a systemd-nspawn invocation in a systemd-run
+// --scope --slice=clonr-shells.slice so the nspawn process runs outside the
+// clonr-serverd cgroup and is not subject to its NoNewPrivileges=true or
+// CapabilityBoundingSet restrictions.  Without this wrapping, nspawn fails
+// with "Failed to move root directory: Operation not permitted" because it
+// cannot call pivot_root(2) without CAP_SYS_ADMIN.
+//
+// Falls back to a direct systemd-nspawn invocation when systemd-run is not
+// available (e.g. inside a Docker container or minimal install).
+func wrapNspawnInScope(sessionID string, nspawnArgs []string) *exec.Cmd {
+	if !systemdRunAvailable {
+		return exec.Command("systemd-nspawn", nspawnArgs...)
+	}
+	scopeName := "clonr-shell-" + sessionID + ".scope"
+	args := []string{
+		"--scope",
+		"--slice=clonr-shells.slice",
+		"--unit=" + scopeName,
+		"--quiet",
+		"--",
+		"systemd-nspawn",
+	}
+	args = append(args, nspawnArgs...)
+	return exec.Command("systemd-run", args...)
+}
+
 // wsUpgrader allows all origins for the embedded UI (same-origin in prod,
 // localhost in dev). In a future release this should be locked to the server's
 // own origin.
@@ -93,12 +126,19 @@ func (h *FactoryHandler) ShellWS(w http.ResponseWriter, r *http.Request) {
 	// PID, and mount namespaces are all handled automatically. This prevents
 	// the shell from inheriting the management server's hostname and avoids
 	// the need to manually bind-mount /proc, /sys, /dev, etc.
-	cmd := exec.Command("systemd-nspawn",
+	//
+	// Wrap in systemd-run --scope --slice=clonr-shells.slice so the nspawn
+	// process runs outside the clonr-serverd cgroup and is not subject to its
+	// NoNewPrivileges=true restriction. Without this, pivot_root(2) fails with
+	// "Operation not permitted" because CAP_SYS_ADMIN cannot be used through
+	// a NoNewPrivileges boundary.
+	nspawnArgs := []string{
 		"--quiet",
 		"-D", rootDir,
 		"--",
 		shell, "--login",
-	)
+	}
+	cmd := wrapNspawnInScope(sessionID, nspawnArgs)
 	cmd.Env = []string{
 		"TERM=xterm-256color",
 		"HOME=/root",
