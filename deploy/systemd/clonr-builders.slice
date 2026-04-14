@@ -1,0 +1,14 @@
+[Unit]
+Description=Clonr ISO builder QEMU scope slice
+Documentation=https://github.com/sqoia-dev/clonr
+# This slice is the resource envelope for all clonr ISO build QEMU processes.
+# systemd-run --scope --slice=clonr-builders.slice places each QEMU child here,
+# isolating it from clonr-serverd's own MemoryMax.
+#
+# Raise MemoryMax here when building very large distros or enabling InstallUpdates.
+# 12G gives headroom for concurrent builds on a moderately sized host.
+
+[Slice]
+MemoryMax=12G
+CPUWeight=100
+IOWeight=100

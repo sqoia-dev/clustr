@@ -99,6 +99,12 @@ type BuildOptions struct {
 	// "bios": SeaBIOS via -bios flag (or omitted — SeaBIOS is the QEMU default).
 	// When empty, "uefi" is assumed.
 	Firmware string
+
+	// BuildID is a short unique identifier for this build run (e.g. a UUID or
+	// image name slug). Used to name the systemd-run scope unit so operators
+	// can correlate systemctl status with a specific build.
+	// When empty, "unknown" is used.
+	BuildID string
 }
 
 // BuildResult is returned by a successful Build call.
@@ -123,6 +129,39 @@ const (
 	defaultCPUs       = 2
 	defaultTimeout    = 30 * time.Minute
 )
+
+// systemdRunAvailable is detected once at package init time and used to decide
+// whether to wrap QEMU in a systemd-run scope (see wrapQEMUInScope).
+var systemdRunAvailable bool
+
+func init() {
+	_, err := exec.LookPath("systemd-run")
+	systemdRunAvailable = (err == nil)
+}
+
+// wrapQEMUInScope wraps qemuBin + qemuArgs in a systemd-run --scope invocation
+// so QEMU runs in its own cgroup (clonr-builders.slice) rather than inheriting
+// clonr-serverd's MemoryMax. This prevents the OOM killer from hitting QEMU
+// when the parent service unit has a tight MemoryMax.
+//
+// When systemd-run is unavailable (dev machines without systemd), it returns
+// the original bin and args unchanged.
+func wrapQEMUInScope(buildID, qemuBin string, qemuArgs []string) (bin string, args []string) {
+	if !systemdRunAvailable {
+		return qemuBin, qemuArgs
+	}
+	unitName := "clonr-iso-build-" + buildID + ".scope"
+	wrappedArgs := []string{
+		"--scope",
+		"--slice=clonr-builders.slice",
+		"--unit=" + unitName,
+		"--quiet",
+		"--",
+		qemuBin,
+	}
+	wrappedArgs = append(wrappedArgs, qemuArgs...)
+	return "systemd-run", wrappedArgs
+}
 
 // Build runs an OS installer ISO inside a temporary QEMU VM, waits for the
 // guest to halt (which the kickstart/autoinstall triggers at the end of
@@ -236,7 +275,20 @@ func Build(ctx context.Context, opts BuildOptions) (*BuildResult, error) {
 		return nil, fmt.Errorf("isoinstaller: qemu not found — install qemu-kvm (RHEL/Rocky) or qemu-system-x86_64 (Debian/Ubuntu)")
 	}
 
-	qemu := exec.CommandContext(installCtx, qemuBin, qemuArgs...)
+	// Wrap QEMU in a dedicated systemd-run scope so it inherits
+	// clonr-builders.slice resource limits rather than clonr-serverd's
+	// MemoryMax. Falls back to direct exec when systemd-run is unavailable.
+	launchBin, launchArgs := wrapQEMUInScope(opts.BuildID, qemuBin, qemuArgs)
+	if systemdRunAvailable {
+		log.Info().
+			Str("unit", "clonr-iso-build-"+opts.BuildID+".scope").
+			Str("slice", "clonr-builders.slice").
+			Msg("isoinstaller: launching QEMU inside systemd-run scope")
+	} else {
+		log.Warn().Msg("isoinstaller: systemd-run unavailable — launching QEMU directly (no cgroup isolation)")
+	}
+
+	qemu := exec.CommandContext(installCtx, launchBin, launchArgs...)
 
 	// Capture QEMU stderr into an in-memory ring buffer (capped at 16 KB) so
 	// startup errors are always available, regardless of whether a caller has
@@ -351,7 +403,7 @@ func Build(ctx context.Context, opts BuildOptions) (*BuildResult, error) {
 	if procExitErr != nil {
 		tail := readSerialLogTail(serialLogPath, 30)
 		qemuStderr := strings.TrimSpace(stderrBuf.String())
-		qemuInvocation := qemuBin + " " + strings.Join(qemuArgs, " ")
+		qemuInvocation := launchBin + " " + strings.Join(launchArgs, " ")
 
 		var headline string
 		var oomHint string
@@ -545,6 +597,9 @@ func applyDefaults(opts *BuildOptions) {
 	}
 	if opts.Timeout == 0 {
 		opts.Timeout = defaultTimeout
+	}
+	if opts.BuildID == "" {
+		opts.BuildID = "unknown"
 	}
 }
 
