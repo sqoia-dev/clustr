@@ -22,6 +22,41 @@ import (
 
 var version = "dev"
 
+// imageFirmwareLayoutMismatch returns a non-empty description when img's declared
+// firmware field contradicts its stored default_layout.  Returns "" when consistent.
+//
+// Known mismatches:
+//   - firmware=bios  + ESP partition (vfat/boot/efi) → should be biosboot
+//   - firmware=uefi  + biosboot partition             → should be ESP
+func imageFirmwareLayoutMismatch(img api.BaseImage) string {
+	hasESP := false
+	hasBiosBoot := false
+	for _, p := range img.DiskLayout.Partitions {
+		if p.MountPoint == "/boot/efi" || p.Filesystem == "vfat" {
+			hasESP = true
+		}
+		for _, flag := range p.Flags {
+			if flag == "bios_grub" || flag == "biosboot" {
+				hasBiosBoot = true
+			}
+		}
+		if p.Filesystem == "biosboot" || p.Filesystem == "bios_grub" {
+			hasBiosBoot = true
+		}
+	}
+	switch img.Firmware {
+	case api.FirmwareBIOS:
+		if hasESP {
+			return "firmware=bios but layout contains an ESP (vfat/EFI) partition — layout should use biosboot (EF02)"
+		}
+	case api.FirmwareUEFI:
+		if hasBiosBoot {
+			return "firmware=uefi but layout contains a biosboot partition — layout should use ESP (EF00)"
+		}
+	}
+	return ""
+}
+
 var rootCmd = &cobra.Command{
 	Use:   "clonr-serverd",
 	Short: "clonr provisioning server",
@@ -201,6 +236,23 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	// Wire up and start the HTTP server.
 	srv := server.New(cfg, database)
+
+	// Startup firmware/layout consistency audit.
+	// Log warnings for any image whose declared firmware contradicts its stored
+	// default_layout — e.g. firmware=bios with an ESP partition (the symptom that
+	// caused VM207's grub2-install failure).  These are advisory only; the server
+	// continues to start normally.
+	if imgs, auditErr := database.ListBaseImages(ctx, ""); auditErr == nil {
+		for _, img := range imgs {
+			if warn := imageFirmwareLayoutMismatch(img); warn != "" {
+				log.Warn().
+					Str("image_id", img.ID).
+					Str("image_name", img.Name).
+					Str("firmware", string(img.Firmware)).
+					Msg("firmware/layout mismatch: " + warn)
+			}
+		}
+	}
 
 	// Reconcile any images stuck in "building" state from before the restart.
 	// These have no live goroutine behind them and will never progress on their own.

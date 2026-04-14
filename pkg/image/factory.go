@@ -674,7 +674,9 @@ func (f *Factory) captureAsync(imageID string, req CaptureRequest, sshUser strin
 		Msg("factory: rsync complete")
 
 	// Auto-detect disk layout from the captured rootfs before scrubbing (EFI check).
-	diskLayout := f.detectDiskLayout(rootfs)
+	// Capture paths don't carry a declared firmware, so pass "" to fall back to
+	// the rootfs heuristic (presence of /boot/efi content → UEFI).
+	diskLayout := f.detectDiskLayout(rootfs, "")
 	if err := f.Store.UpdateDiskLayout(ctx, imageID, diskLayout); err != nil {
 		f.Logger.Warn().Err(err).Str("image_id", imageID).Msg("factory: set disk layout (non-fatal)")
 	}
@@ -712,29 +714,50 @@ func (f *Factory) captureAsync(imageID string, req CaptureRequest, sshUser strin
 		Msg("factory: capture complete -- image is ready")
 }
 
-// detectDiskLayout inspects the captured rootfs to infer a disk layout.
-// Checks for /boot/efi (UEFI) or falls back to BIOS/MBR. Admin should review before deploy.
-func (f *Factory) detectDiskLayout(rootfs string) api.DiskLayout {
-	efiDir := filepath.Join(rootfs, "boot", "efi")
-	efiEntries, err := os.ReadDir(efiDir)
-	if err == nil && len(efiEntries) > 0 {
-		return api.DiskLayout{
-			Partitions: []api.PartitionSpec{
-				{Label: "esp", SizeBytes: 512 * 1024 * 1024, Filesystem: "vfat", MountPoint: "/boot/efi", Flags: []string{"boot", "esp"}},
-				{Label: "boot", SizeBytes: 1 * 1024 * 1024 * 1024, Filesystem: "xfs", MountPoint: "/boot"},
-				{Label: "root", SizeBytes: 0, Filesystem: "xfs", MountPoint: "/"},
-			},
-			Bootloader: api.Bootloader{Type: "grub2", Target: "x86_64-efi"},
-		}
-	}
-	return api.DiskLayout{
+// detectDiskLayout inspects the captured rootfs and the image's declared firmware
+// to determine the correct default disk layout. The firmware parameter takes
+// precedence over rootfs inspection: if firmware=="bios", a biosboot layout is
+// always emitted regardless of whether /boot/efi exists in the rootfs (BIOS images
+// built from Rocky/RHEL ISOs install EFI shimx64.efi even in legacy-BIOS mode,
+// which would otherwise trick the UEFI heuristic into emitting the wrong layout).
+//
+// firmware should be string(api.FirmwareBIOS) or string(api.FirmwareUEFI).
+// An empty string falls back to rootfs-based detection (legacy behaviour for
+// capture/pull paths that predate the firmware field).
+func (f *Factory) detectDiskLayout(rootfs string, firmware string) api.DiskLayout {
+	biosLayout := api.DiskLayout{
 		Partitions: []api.PartitionSpec{
-			{Label: "biosboot", SizeBytes: 1 * 1024 * 1024, Filesystem: "", MountPoint: "", Flags: []string{"bios_grub"}},
+			{Label: "biosboot", SizeBytes: 1 * 1024 * 1024, Filesystem: "biosboot", MountPoint: "", Flags: []string{"bios_grub"}},
 			{Label: "boot", SizeBytes: 1 * 1024 * 1024 * 1024, Filesystem: "xfs", MountPoint: "/boot"},
 			{Label: "root", SizeBytes: 0, Filesystem: "xfs", MountPoint: "/"},
 		},
 		Bootloader: api.Bootloader{Type: "grub2", Target: "i386-pc"},
 	}
+	efiLayout := api.DiskLayout{
+		Partitions: []api.PartitionSpec{
+			{Label: "esp", SizeBytes: 512 * 1024 * 1024, Filesystem: "vfat", MountPoint: "/boot/efi", Flags: []string{"boot", "esp"}},
+			{Label: "boot", SizeBytes: 1 * 1024 * 1024 * 1024, Filesystem: "xfs", MountPoint: "/boot"},
+			{Label: "root", SizeBytes: 0, Filesystem: "xfs", MountPoint: "/"},
+		},
+		Bootloader: api.Bootloader{Type: "grub2", Target: "x86_64-efi"},
+	}
+
+	// Firmware field wins — don't trust rootfs heuristics when the caller knows
+	// which firmware interface the image was built for.
+	switch strings.ToLower(firmware) {
+	case string(api.FirmwareBIOS):
+		return biosLayout
+	case string(api.FirmwareUEFI):
+		return efiLayout
+	}
+
+	// No firmware declared — fall back to rootfs heuristic (capture/pull paths).
+	efiDir := filepath.Join(rootfs, "boot", "efi")
+	efiEntries, err := os.ReadDir(efiDir)
+	if err == nil && len(efiEntries) > 0 {
+		return efiLayout
+	}
+	return biosLayout
 }
 
 // ─── internal helpers ────────────────────────────────────────────────────────
@@ -1493,7 +1516,9 @@ func (f *Factory) buildISOAsync(imageID string, req api.BuildFromISORequest, dis
 	}
 
 	// ── Detect disk layout from extracted rootfs ──────────────────────────
-	diskLayout := f.detectDiskLayout(rootfsPath)
+	// Use req.Firmware to override rootfs heuristics: BIOS images may contain
+	// /boot/efi from the installer even though they target legacy BIOS mode.
+	diskLayout := f.detectDiskLayout(rootfsPath, req.Firmware)
 	if err := f.Store.UpdateDiskLayout(ctx, imageID, diskLayout); err != nil {
 		f.Logger.Warn().Err(err).Str("image_id", imageID).Msg("factory: update disk layout (non-fatal)")
 	}
@@ -1618,7 +1643,7 @@ func (f *Factory) buildFromISOFile(
 		return "", 0, "", fmt.Errorf("extract rootfs: %w", err)
 	}
 
-	diskLayout := f.detectDiskLayout(rootfsPath)
+	diskLayout := f.detectDiskLayout(rootfsPath, req.Firmware)
 	if dbErr := f.Store.UpdateDiskLayout(ctx, imageID, diskLayout); dbErr != nil {
 		f.Logger.Warn().Err(dbErr).Str("image_id", imageID).Msg("factory: update disk layout (non-fatal)")
 	}
@@ -1692,14 +1717,14 @@ func (f *Factory) ResumeFromPhase(imageID string, img api.BaseImage, phase strin
 			failResume("extract rootfs", err)
 			return
 		}
-		f.resumeFinalize(ctx, imageID, imageRoot, rootfsPath, ph, failResume)
+		f.resumeFinalize(ctx, imageID, imageRoot, rootfsPath, string(img.Firmware), ph, failResume)
 
 	case "finalizing":
 		if _, err := os.Stat(rootfsPath); err != nil {
 			failResume("rootfs not found for finalizing resume", err)
 			return
 		}
-		f.resumeFinalize(ctx, imageID, imageRoot, rootfsPath, ph, failResume)
+		f.resumeFinalize(ctx, imageID, imageRoot, rootfsPath, string(img.Firmware), ph, failResume)
 
 	default:
 		f.resumeFromDownload(ctx, imageID, img, ph, failResume)
@@ -1707,8 +1732,10 @@ func (f *Factory) ResumeFromPhase(imageID string, img api.BaseImage, phase strin
 }
 
 // resumeFinalize performs scrub → checksum → finalize, shared between resume paths.
-func (f *Factory) resumeFinalize(ctx context.Context, imageID, imageRoot, rootfsPath string, ph BuildHandle, failBuild func(string, error)) {
-	diskLayout := f.detectDiskLayout(rootfsPath)
+// firmware is string(img.Firmware) from the in-progress image record; pass ""
+// to fall back to rootfs heuristics (capture paths).
+func (f *Factory) resumeFinalize(ctx context.Context, imageID, imageRoot, rootfsPath, firmware string, ph BuildHandle, failBuild func(string, error)) {
+	diskLayout := f.detectDiskLayout(rootfsPath, firmware)
 	if err := f.Store.UpdateDiskLayout(ctx, imageID, diskLayout); err != nil {
 		f.Logger.Warn().Err(err).Str("image_id", imageID).Msg("factory: update disk layout (non-fatal)")
 	}

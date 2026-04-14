@@ -178,11 +178,20 @@ func (h *NodesHandler) UpdateNode(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Resolve the layout override: use whatever was in the request, but honour
-	// ClearLayoutOverride to explicitly remove a previously set override.
-	layoutOverride := req.DiskLayoutOverride
-	if req.ClearLayoutOverride {
-		layoutOverride = nil
+	// Resolve the layout override:
+	//   - ClearLayoutOverride=true  → explicitly remove override (set nil)
+	//   - DiskLayoutOverride present in request → use the new value
+	//   - Neither present (omitempty field absent) → preserve existing override
+	//     so that a PUT to change hostname/image does not silently wipe a
+	//     node-level disk layout that was set via the dedicated override endpoint.
+	var layoutOverride *api.DiskLayout
+	switch {
+	case req.ClearLayoutOverride:
+		layoutOverride = nil // explicit clear
+	case req.DiskLayoutOverride != nil:
+		layoutOverride = req.DiskLayoutOverride // caller supplied a new override
+	default:
+		layoutOverride = existing.DiskLayoutOverride // preserve existing
 	}
 	// Preserve the existing group assignment unless explicitly changed in the request.
 	groupID := existing.GroupID
