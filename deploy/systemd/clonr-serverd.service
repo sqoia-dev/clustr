@@ -36,9 +36,18 @@ RestartSec=5s
 # ---------------------------------------------------------------------------
 # Resource limits
 # ---------------------------------------------------------------------------
-# 2G ceiling: if clonr-serverd is leaking or mishandling blob data it should
-# be killed fast rather than consuming all host memory.
-MemoryMax=2G
+# 8G ceiling: clonr-serverd is a combined management plane + ISO builder that
+# spawns QEMU children. Each QEMU builder VM requests -m 2048 (2G), and
+# multiple concurrent builds plus Go runtime overhead easily exceed 2G.
+# The old 2G limit was appropriate for a pure control plane; with builders
+# co-located it caused SIGKILL at mid-build (confirmed: Rocky 10 SeaBIOS
+# OOM'd at ~47s during package download).
+#
+# Follow-on: introduce clonr-builders.slice so builder QEMU children are
+# accounted separately from the management plane cgroup. The code change to
+# invoke `systemd-run --scope --slice=clonr-builders.slice` will land in a
+# subsequent Dinesh commit. For now, 8G on the parent unit unblocks builds.
+MemoryMax=8G
 
 # Deprioritise OOM kill — clonr-serverd is the control plane; let other
 # processes be killed first under memory pressure. Range: -1000..1000.
