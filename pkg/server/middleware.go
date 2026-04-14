@@ -294,12 +294,16 @@ func apiVersionHeader(next http.Handler) http.Handler {
 			w.Header().Set("API-Version", "v1")
 
 			// Tolerate both the versioned vendor MIME type and plain application/json.
-			// Only enforce on non-GET, non-HEAD requests that actually send a body.
+			// Also tolerate text/event-stream (SSE endpoints) and text/plain.
+			// Only reject requests that explicitly advertise an Accept that we
+			// cannot satisfy with a JSON or event-stream response.
 			accept := r.Header.Get("Accept")
 			if accept != "" &&
 				accept != "*/*" &&
 				!strings.Contains(accept, "application/json") &&
 				!strings.Contains(accept, "application/vnd.clonr.v1+json") &&
+				!strings.Contains(accept, "text/event-stream") &&
+				!strings.Contains(accept, "text/plain") &&
 				!strings.Contains(accept, "*/*") {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusNotAcceptable)
