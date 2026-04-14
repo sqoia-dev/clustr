@@ -2824,7 +2824,7 @@ const Pages = {
                         <div class="card-body">
                             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
                                 <span class="text-dim" style="font-size:12px">Configure logical interfaces. Discovered interfaces are shown read-only on the Hardware tab.</span>
-                                <button type="button" class="btn btn-secondary btn-sm" onclick="Pages._netAddInterface(${JSON.stringify(discoveredMACsJSON)})">+ Add Interface</button>
+                                <button type="button" class="btn btn-secondary btn-sm" data-macs="${escHtml(discoveredMACsJSON)}" onclick="Pages._netAddInterface(JSON.parse(this.dataset.macs))">+ Add Interface</button>
                             </div>
                             <div id="net-interfaces-list">
                                 ${(node.interfaces || []).length === 0
@@ -3659,17 +3659,15 @@ const Pages = {
         </div>`;
     },
 
-    _netAddInterface(discoveredMACsJSON) {
+    _netAddInterface(discoveredMACs) {
         const list = document.getElementById('net-interfaces-list');
         if (!list) return;
         const emptyEl = document.getElementById('net-empty');
         if (emptyEl) emptyEl.remove();
 
-        let discoveredMACs = [];
-        try { discoveredMACs = JSON.parse(discoveredMACsJSON); } catch (_) {}
-
+        const macs = Array.isArray(discoveredMACs) ? discoveredMACs : [];
         const idx = list.querySelectorAll('.net-iface-row').length;
-        list.insertAdjacentHTML('beforeend', Pages._netInterfaceRowHTML(idx, {}, discoveredMACs));
+        list.insertAdjacentHTML('beforeend', Pages._netInterfaceRowHTML(idx, {}, macs));
         Pages._tabMarkDirty('network');
     },
 
