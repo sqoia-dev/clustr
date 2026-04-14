@@ -2647,14 +2647,16 @@ const Pages = {
         Pages._nodeEditorNodeId = id;
 
         try {
-            const [node, imagesResp, nodeGroupsResp] = await Promise.all([
+            const [node, imagesResp, nodeGroupsResp, reimagesResp] = await Promise.all([
                 API.nodes.get(id),
                 API.images.list(),
                 API.nodeGroups.list().catch(() => ({ groups: [] })),
+                API.reimages.listForNode(id).catch(() => ({ requests: [] })),
             ]);
             const images     = imagesResp.images || [];
             const nodeGroups = (nodeGroupsResp && (nodeGroupsResp.node_groups || nodeGroupsResp.groups)) || [];
             const img        = images.find(i => i.id === node.base_image_id);
+            const reimageHistory = (reimagesResp && reimagesResp.requests) || [];
 
             let hw = null;
             try {
@@ -2826,6 +2828,50 @@ const Pages = {
                                 <div class="kv-item"><div class="kv-key">Updated</div><div class="kv-value">${fmtDate(node.updated_at)}</div></div>
                             </div>
                         </div>`)}
+
+                    ${cardWrap('Reimage History', (() => {
+                        const recent = reimageHistory.slice(0, 10);
+                        if (recent.length === 0) {
+                            return `<div class="card-body">${emptyState('No reimage history', 'Reimage requests appear here after the first deploy.')}</div>`;
+                        }
+                        const statusBadge = (s) => {
+                            const cls = {
+                                complete:    'badge-success',
+                                succeeded:   'badge-success',
+                                failed:      'badge-danger',
+                                in_progress: 'badge-warning',
+                                triggered:   'badge-warning',
+                                pending:     'badge-neutral',
+                                canceled:    'badge-neutral',
+                            }[s] || 'badge-neutral';
+                            return `<span class="badge ${cls}">${escHtml(s)}</span>`;
+                        };
+                        const rows = recent.map(r => {
+                            const failDetail = r.status === 'failed' && (r.exit_code != null || r.phase)
+                                ? `<div class="text-dim text-sm" style="margin-top:2px">exit&nbsp;${r.exit_code ?? '?'}&nbsp;(${escHtml(r.exit_name || r.phase || 'unknown')})</div>`
+                                : '';
+                            const errTip = r.error_message
+                                ? `title="${escHtml(r.error_message)}"`
+                                : '';
+                            return `<tr>
+                                <td class="text-mono text-sm" ${errTip}>${escHtml(r.id.slice(0,8))}</td>
+                                <td>${statusBadge(r.status)}${failDetail}</td>
+                                <td class="text-sm">${r.completed_at ? fmtDate(r.completed_at) : (r.created_at ? fmtDate(r.created_at) : '—')}</td>
+                                <td class="text-sm text-dim">${escHtml(r.phase || '—')}</td>
+                            </tr>`;
+                        }).join('');
+                        return `<div class="card-body" style="padding:0">
+                            <table style="width:100%;border-collapse:collapse;font-size:13px">
+                                <thead><tr style="border-bottom:1px solid var(--border)">
+                                    <th style="padding:8px 16px;text-align:left;font-weight:500;color:var(--text-secondary)">ID</th>
+                                    <th style="padding:8px 16px;text-align:left;font-weight:500;color:var(--text-secondary)">Status</th>
+                                    <th style="padding:8px 16px;text-align:left;font-weight:500;color:var(--text-secondary)">When</th>
+                                    <th style="padding:8px 16px;text-align:left;font-weight:500;color:var(--text-secondary)">Phase</th>
+                                </tr></thead>
+                                <tbody>${rows}</tbody>
+                            </table>
+                        </div>`;
+                    })())}
                 </div>
 
                 <!-- Hardware tab — read-only display + re-discover action -->

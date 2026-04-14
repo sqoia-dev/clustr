@@ -232,6 +232,15 @@ const API = {
         update(id, body)    { return API.put(`/node-groups/${id}`, body); },
         del(id)             { return API.del(`/node-groups/${id}`); },
     },
+    reimages: {
+        // listForNode fetches reimage history for a single node.
+        listForNode(nodeId)                 { return API.get(`/nodes/${nodeId}/reimage`); },
+        // list fetches all reimage records with optional filters.
+        list(params = {})                   { return API.get('/reimages', params); },
+        get(id)                             { return API.get(`/reimage/${id}`); },
+        cancel(id)                          { return API.del(`/reimage/${id}`); },
+        retry(id)                           { return API.post(`/reimage/${id}/retry`, {}); },
+    },
     health: {
         get()                 { return API.get('/health'); },
     },

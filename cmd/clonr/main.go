@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -777,7 +778,7 @@ func runAutoDeployImage(ctx context.Context, c *client.Client, nodeCfg api.NodeC
 				Interface("panic", r).
 				Stack().
 				Msg("deploy panicked — caught by recovery wrapper")
-			retErr = fmt.Errorf("deploy panicked: %v", r)
+			retErr = Wrap(ExitPanic, "panic", fmt.Errorf("deploy panicked: %v", r))
 			// Flush immediately so crash logs reach the server before we exit.
 			remoteWriter.FlushSync()
 		}
@@ -804,10 +805,31 @@ func runAutoDeployImage(ctx context.Context, c *client.Client, nodeCfg api.NodeC
 		if deployCompleted {
 			return // server already received deploy-complete — do not double-transition
 		}
-		deployLog.Error().Err(retErr).Msg("deploy failed — reporting to server (deferred)")
+		// Build classified payload. Fall back to ExitUnknown if retErr is not a DeployError.
+		payload := api.DeployFailedPayload{
+			ExitCode: int(ExitUnknown),
+			ExitName: ExitUnknown.Name(),
+			Phase:    "unknown",
+			Message:  retErr.Error(),
+		}
+		var de *DeployError
+		if errors.As(retErr, &de) {
+			payload.ExitCode = int(de.Code)
+			payload.ExitName = de.Code.Name()
+			payload.Phase = de.Phase
+			payload.Message = de.Error()
+		}
+
+		deployLog.Error().
+			Err(retErr).
+			Int("exit_code", payload.ExitCode).
+			Str("exit_name", payload.ExitName).
+			Str("phase", payload.Phase).
+			Msg("deploy failed — reporting to server (deferred)")
+
 		reportCtx, reportCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer reportCancel()
-		if reportErr := c.ReportDeployFailed(reportCtx, nodeCfg.ID); reportErr != nil {
+		if reportErr := c.ReportDeployFailed(reportCtx, nodeCfg.ID, payload); reportErr != nil {
 			deployLog.Warn().Err(reportErr).Msg("deferred deploy-failed report to server failed (non-fatal)")
 		}
 		remoteWriter.FlushSync()
@@ -831,10 +853,10 @@ func runAutoDeployImage(ctx context.Context, c *client.Client, nodeCfg api.NodeC
 	// Fetch image details.
 	img, err := c.GetImage(ctx, nodeCfg.BaseImageID)
 	if err != nil {
-		return fmt.Errorf("fetch image %s: %w", nodeCfg.BaseImageID, err)
+		return Wrap(ExitImageFetch, "image_fetch", fmt.Errorf("fetch image %s: %w", nodeCfg.BaseImageID, err))
 	}
 	if img.Status != api.ImageStatusReady {
-		return fmt.Errorf("image %s is not ready (status: %s)", img.ID, img.Status)
+		return Wrap(ExitImageFetch, "image_fetch", fmt.Errorf("image %s is not ready (status: %s)", img.ID, img.Status))
 	}
 
 	deployLog.Info().Str("image", img.Name).Str("version", img.Version).
@@ -843,7 +865,7 @@ func runAutoDeployImage(ctx context.Context, c *client.Client, nodeCfg api.NodeC
 	// Resolve hardware for preflight.
 	hw, err := hardware.Discover()
 	if err != nil {
-		return fmt.Errorf("hardware discovery for preflight: %w", err)
+		return Wrap(ExitHardware, "hardware_discovery", fmt.Errorf("hardware discovery for preflight: %w", err))
 	}
 
 	// Resolve the effective disk layout using the three-level hierarchy:
@@ -867,7 +889,7 @@ func runAutoDeployImage(ctx context.Context, c *client.Client, nodeCfg api.NodeC
 
 	mountRoot, err := os.MkdirTemp("", "clonr-auto-deploy-*")
 	if err != nil {
-		return fmt.Errorf("create temp mount root: %w", err)
+		return Wrap(ExitGeneric, "setup", fmt.Errorf("create temp mount root: %w", err))
 	}
 	defer os.RemoveAll(mountRoot)
 
@@ -883,7 +905,7 @@ func runAutoDeployImage(ctx context.Context, c *client.Client, nodeCfg api.NodeC
 	reporter.StartPhase("preflight", 0)
 	if err := deployer.Preflight(ctx, effectiveLayout, *hw); err != nil {
 		reporter.EndPhase(err.Error())
-		return fmt.Errorf("preflight: %w", err)
+		return Wrap(ExitHardware, "preflight", fmt.Errorf("preflight: %w", err))
 	}
 	reporter.EndPhase("")
 
@@ -928,14 +950,11 @@ func runAutoDeployImage(ctx context.Context, c *client.Client, nodeCfg api.NodeC
 	if err := deployer.Deploy(ctx, opts, progressFn); err != nil {
 		fmt.Fprintln(os.Stderr)
 		deployLog.Error().Err(err).Msg("image deploy failed")
-		// Report failure to server so the node transitions to NodeStateFailed
-		// and the admin can see it needs attention.
-		reportCtx, reportCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if reportErr := c.ReportDeployFailed(reportCtx, nodeCfg.ID); reportErr != nil {
-			deployLog.Warn().Err(reportErr).Msg("deploy-failed report to server failed (non-fatal)")
-		}
-		reportCancel()
-		return fmt.Errorf("deploy: %w", err)
+		// Classify the failure. The deployer runs partition, format, download, and
+		// extract phases internally. We surface ExitDownload here since a blob stream
+		// or checksum failure is the most common path; partition/format errors from
+		// the underlying deployer will still surface via the error message.
+		return Wrap(ExitDownload, "deploy", fmt.Errorf("deploy: %w", err))
 	}
 	elapsed := time.Since(start).Round(time.Second)
 	fmt.Fprintf(os.Stderr, "\n    Image written in %s\n", elapsed)
@@ -946,13 +965,7 @@ func runAutoDeployImage(ctx context.Context, c *client.Client, nodeCfg api.NodeC
 	if err := deployer.Finalize(ctx, nodeCfg, mountRoot); err != nil {
 		deployLog.Error().Err(err).Msg("finalize failed")
 		reporter.EndPhase(err.Error())
-		// Report failure so admin can see the node is in a bad state.
-		reportCtx, reportCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if reportErr := c.ReportDeployFailed(reportCtx, nodeCfg.ID); reportErr != nil {
-			deployLog.Warn().Err(reportErr).Msg("deploy-failed report to server failed (non-fatal)")
-		}
-		reportCancel()
-		return fmt.Errorf("finalize: %w", err)
+		return Wrap(ExitFinalize, "finalize", fmt.Errorf("finalize: %w", err))
 	}
 	deployLog.Info().Str("hostname", nodeCfg.Hostname).Msg("node configuration applied")
 	reporter.EndPhase("")
