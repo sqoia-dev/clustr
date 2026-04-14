@@ -832,6 +832,23 @@ log "log server: httpd :9999 (pid \$HTTPPID), nc :9998"
 # os/exec.LookPath to fail silently, returning no disks.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export CLONR_SERVER="\${CLONR_SERVER:-http://10.99.0.1:8080}"
+
+# Parse clonr.token from /proc/cmdline — the PXE boot handler embeds a fresh
+# node-scoped API key here at PXE-serve time. The deploy agent reads it via
+# CLONR_TOKEN so that GetImage and DownloadBlob calls are authenticated.
+# Bail out loudly if no token is present; silent unauthenticated fallback is
+# exactly how we ended up with the v0.1.0 auth gap — do not allow it.
+CLONR_TOKEN_RAW=\$(cat /proc/cmdline | tr ' ' '\n' | grep '^clonr.token=' | cut -d= -f2- | tr -d '[:space:]')
+if [ -z "\$CLONR_TOKEN_RAW" ]; then
+    log "FATAL: clonr.token not found in /proc/cmdline — refusing to deploy without auth"
+    log "cmdline: \$(cat /proc/cmdline)"
+    log "This node needs a fresh PXE boot from a server running clonr v0.2.0+ which"
+    log "embeds a node-scoped token at PXE-serve time."
+    while true; do sleep 3600; done
+fi
+export CLONR_TOKEN="\$CLONR_TOKEN_RAW"
+log "clonr.token parsed from cmdline (length=\${#CLONR_TOKEN_RAW})"
+
 log "PATH: \$PATH"
 log "lsblk location: \$(which lsblk 2>&1 || echo NOT_FOUND)"
 
@@ -849,6 +866,7 @@ if [ -f /tmp/clonr-deploy-success ]; then
     while [ \$RETRY -lt 5 ]; do
         HTTP_STATUS=\$(curl -s -o /dev/null -w "%{http_code}" -X POST \
             -H "Content-Type: application/json" \
+            -H "Authorization: Bearer \${CLONR_TOKEN}" \
             "\${CLONR_SERVER}/api/v1/nodes/\${NODE_ID}/deploy-complete" 2>/dev/null)
         log "deploy-complete retry \${RETRY}: HTTP \${HTTP_STATUS}"
         if [ "\${HTTP_STATUS}" = "200" ] || [ "\${HTTP_STATUS}" = "204" ] || [ "\${HTTP_STATUS}" = "201" ]; then
@@ -866,9 +884,9 @@ if [ -f /tmp/clonr-deploy-success ]; then
     fi
 fi
 
-log "running: /usr/bin/clonr deploy --auto --server \${CLONR_SERVER}"
+log "running: /usr/bin/clonr deploy --auto --server \${CLONR_SERVER} --token <redacted>"
 
-/usr/bin/clonr deploy --auto --server "\${CLONR_SERVER}" 2>&1 >> "\$LOG"
+/usr/bin/clonr deploy --auto --server "\${CLONR_SERVER}" --token "\${CLONR_TOKEN}" 2>&1 >> "\$LOG"
 CLONR_EXIT=\$?
 
 log "clonr exit: \$CLONR_EXIT"
