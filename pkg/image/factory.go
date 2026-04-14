@@ -1635,3 +1635,121 @@ func (f *Factory) buildFromISOFile(
 	return rootfsPath, sizeBytes, checksum, nil
 }
 
+// ─── Resume support (Feature F2) ─────────────────────────────────────────────
+
+// ResumeFromPhase re-enters the ISO build pipeline at the given phase,
+// reusing cached artifacts where possible. Runs asynchronously.
+//
+// Phase routing:
+//   - "extracting"   → re-run ExtractViaSubprocess against existing disk.raw
+//   - "finalizing"   → re-run sha256 + FinalizeBaseImage
+//   - anything else  → restart full download + install
+func (f *Factory) ResumeFromPhase(imageID string, img api.BaseImage, phase string) {
+	ctx := context.Background()
+
+	var ph BuildHandle
+	if f.BuildProgress != nil {
+		ph = f.BuildProgress.Start(imageID)
+	} else {
+		ph = noopBuildHandle{}
+	}
+
+	failResume := func(msg string, err error) {
+		fullMsg := msg
+		if err != nil {
+			fullMsg = fmt.Sprintf("%s: %v", msg, err)
+		}
+		ph.Fail(fullMsg)
+		_ = f.Store.UpdateBaseImageStatus(ctx, imageID, api.ImageStatusError, fullMsg)
+	}
+
+	imageRoot := filepath.Join(f.ImageDir, imageID)
+	rootfsPath := filepath.Join(imageRoot, "rootfs")
+
+	f.Logger.Info().
+		Str("image_id", imageID).
+		Str("phase", phase).
+		Msg("factory: resuming build")
+
+	switch phase {
+	case "extracting":
+		diskRaw := filepath.Join(imageRoot, "disk.raw")
+		if _, err := os.Stat(diskRaw); err != nil {
+			f.Logger.Warn().Str("image_id", imageID).Msg("factory: resume extracting — disk.raw not found, restarting from top")
+			f.resumeFromDownload(ctx, imageID, img, ph, failResume)
+			return
+		}
+		ph.SetPhase("extracting")
+		if err := os.MkdirAll(rootfsPath, 0o755); err != nil {
+			failResume("create rootfs dir", err)
+			return
+		}
+		extractOpts := isoinstaller.ExtractOptions{
+			RawDiskPath:   diskRaw,
+			RootfsDestDir: rootfsPath,
+		}
+		if err := isoinstaller.ExtractViaSubprocess(imageID, extractOpts, ph.AddSerialLine, ph.AddStderrLine); err != nil {
+			failResume("extract rootfs", err)
+			return
+		}
+		f.resumeFinalize(ctx, imageID, imageRoot, rootfsPath, ph, failResume)
+
+	case "finalizing":
+		if _, err := os.Stat(rootfsPath); err != nil {
+			failResume("rootfs not found for finalizing resume", err)
+			return
+		}
+		f.resumeFinalize(ctx, imageID, imageRoot, rootfsPath, ph, failResume)
+
+	default:
+		f.resumeFromDownload(ctx, imageID, img, ph, failResume)
+	}
+}
+
+// resumeFinalize performs scrub → checksum → finalize, shared between resume paths.
+func (f *Factory) resumeFinalize(ctx context.Context, imageID, imageRoot, rootfsPath string, ph BuildHandle, failBuild func(string, error)) {
+	diskLayout := f.detectDiskLayout(rootfsPath)
+	if err := f.Store.UpdateDiskLayout(ctx, imageID, diskLayout); err != nil {
+		f.Logger.Warn().Err(err).Str("image_id", imageID).Msg("factory: update disk layout (non-fatal)")
+	}
+
+	ph.SetPhase("scrubbing")
+	if err := ScrubNodeIdentity(rootfsPath); err != nil {
+		f.Logger.Warn().Err(err).Str("image_id", imageID).Msg("factory: scrub had warnings (continuing)")
+	}
+
+	ph.SetPhase("finalizing")
+	size, checksum, err := checksumDir(rootfsPath)
+	if err != nil {
+		failBuild("checksum rootfs", err)
+		return
+	}
+	if err := f.Store.SetBlobPath(ctx, imageID, rootfsPath); err != nil {
+		failBuild("set blob path", err)
+		return
+	}
+	if err := f.Store.FinalizeBaseImage(ctx, imageID, size, checksum); err != nil {
+		failBuild("finalize image", err)
+		return
+	}
+	_ = writeBuildManifest(imageRoot, imageID, "", nil, size, checksum, 0)
+	ph.Complete()
+	f.Logger.Info().
+		Str("image_id", imageID).Int64("size_bytes", size).Str("checksum", checksum).
+		Msg("factory: resume finalize complete — image is ready")
+}
+
+// resumeFromDownload re-runs the full ISO download + install pipeline.
+func (f *Factory) resumeFromDownload(_ context.Context, imageID string, img api.BaseImage, _ BuildHandle, failBuild func(string, error)) {
+	if img.SourceURL == "" {
+		failBuild("cannot resume: source_url is empty on image record", nil)
+		return
+	}
+	req := api.BuildFromISORequest{
+		URL:  img.SourceURL,
+		Name: img.Name,
+	}
+	distro, _ := isoinstaller.DetectDistro(req.URL, "")
+	f.buildISOAsync(imageID, req, distro)
+}
+

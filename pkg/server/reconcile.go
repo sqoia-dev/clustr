@@ -14,17 +14,16 @@ import (
 // ReconcileStuckBuilds finds all images in "building" state in the database and
 // determines whether they have a real build process behind them. Since build
 // goroutines are in-process, any "building" image after a server restart has no
-// corresponding goroutine — it will never progress. This pass marks them failed.
+// corresponding goroutine — it will never progress. This pass marks them
+// interrupted and resumable (Feature F3) rather than hard-failing them.
 //
 // Decision logic per image:
-//  1. If build-state.json (written by the progress store on each update) shows
-//     the last known phase was "complete", the final DB commit must have failed;
-//     attempt to finalize from disk.
+//  1. If build-state.json shows the last known phase, set resume_from_phase to
+//     that phase so the resume endpoint can re-enter at the right point.
 //  2. If <imagedir>/<id>/rootfs/ exists and is non-empty, the installer finished
-//     but the process died during finalization — mark failed so the admin can
-//     delete and retry.
-//  3. All other cases (no rootfs, partial work, no files at all) — mark failed
-//     with "build interrupted — server was restarted before completion".
+//     but the process died during finalization — mark resumable at "finalizing".
+//  3. All other cases — mark interrupted/resumable at "downloading_iso" so the
+//     operator can resume from scratch via the Resume button.
 //
 // Call this once at startup, after db.Open() and before ListenAndServe().
 func (s *Server) ReconcileStuckBuilds(ctx context.Context) error {
@@ -38,38 +37,62 @@ func (s *Server) ReconcileStuckBuilds(ctx context.Context) error {
 
 	reconciled := 0
 	for _, img := range images {
-		reason := s.classifyStuckBuild(img.ID)
+		phase := s.classifyStuckPhase(img.ID)
 		log.Warn().
 			Str("image_id", img.ID).
 			Str("image_name", img.Name).
-			Str("reason", reason).
-			Msg("reconcile: marking stuck build as failed")
+			Str("resume_from_phase", phase).
+			Msg("reconcile: marking stuck build as interrupted/resumable")
 
-		if err := s.db.UpdateBaseImageStatus(ctx, img.ID,
-			api.ImageStatusError, reason); err != nil {
+		if err := s.db.SetImageResumable(ctx, img.ID, phase); err != nil {
 			log.Error().Err(err).Str("image_id", img.ID).
-				Msg("reconcile: failed to update image status")
+				Msg("reconcile: failed to set image resumable")
 			continue
 		}
 
-		// Synthesise a failed entry in the in-memory BuildProgressStore so that
+		// Synthesise an interrupted entry in the in-memory BuildProgressStore so that
 		// any UI client that happens to poll immediately after startup gets a
 		// sensible response instead of a 404.
 		h := s.buildProgress.Start(img.ID)
-		h.Fail(reason)
+		h.Fail("build interrupted — server was restarted; use Resume to continue")
 
 		reconciled++
 	}
 
 	if reconciled > 0 {
-		log.Info().Int("count", reconciled).Msg("reconcile: marked stuck builds as failed")
+		log.Info().Int("count", reconciled).Msg("reconcile: marked stuck builds as interrupted/resumable")
 	}
 	return nil
 }
 
-// classifyStuckBuild inspects the image directory to determine why the build
-// is stuck and return an appropriate human-readable error message.
-func (s *Server) classifyStuckBuild(imageID string) string {
+// AutoResumeBuilds is called at startup when CLONR_BUILD_AUTO_RESUME=1 is set.
+// It scans for resumable=true builds and re-submits them to the factory.
+// The factory field is injected so this function doesn't import pkg/image (would be circular).
+func (s *Server) AutoResumeBuilds(ctx context.Context, resumeFn func(imageID, phase string)) error {
+	images, err := s.db.ListResumableImages(ctx)
+	if err != nil {
+		return err
+	}
+	if len(images) == 0 {
+		return nil
+	}
+	for _, img := range images {
+		phase, resumable, err := s.db.GetImageResumePhase(ctx, img.ID)
+		if err != nil || !resumable {
+			continue
+		}
+		log.Info().
+			Str("image_id", img.ID).
+			Str("phase", phase).
+			Msg("auto-resume: re-submitting interrupted build")
+		resumeFn(img.ID, phase)
+	}
+	return nil
+}
+
+// classifyStuckPhase inspects the image directory to determine what phase the
+// build was in, returning the best phase to resume from.
+func (s *Server) classifyStuckPhase(imageID string) string {
 	imageDir := filepath.Join(s.cfg.ImageDir, imageID)
 
 	// Check persisted build-state.json for the last known phase before restart.
@@ -77,28 +100,24 @@ func (s *Server) classifyStuckBuild(imageID string) string {
 	if data, err := os.ReadFile(stateFile); err == nil {
 		var state api.BuildState
 		if json.Unmarshal(data, &state) == nil {
-			if state.Phase == PhaseComplete {
-				// Rare: build finished but DB finalize call didn't commit.
-				return "build completed but server restarted before database record could be finalized — delete and retry"
-			}
 			if state.Phase != "" && state.Phase != PhaseFailed && state.Phase != PhaseCanceled {
-				return "build interrupted — server was restarted during phase: " + state.Phase
+				return state.Phase
 			}
 		}
 	}
 
 	// Check if build.json (the successful build manifest) already exists.
 	if _, err := os.Stat(filepath.Join(imageDir, "build.json")); err == nil {
-		return "build completed but server restarted before database record could be finalized — delete and retry"
+		return PhaseFinalizing
 	}
 
 	// Check if rootfs directory exists and is non-empty (extraction finished).
 	rootfsDir := filepath.Join(imageDir, "rootfs")
 	if entries, err := os.ReadDir(rootfsDir); err == nil && len(entries) > 0 {
-		return "build interrupted — server was restarted after rootfs extraction but before finalization — delete and retry"
+		return PhaseFinalizing
 	}
 
-	return "build interrupted — server was restarted before completion"
+	return PhaseDownloadingISO
 }
 
 // buildStateOnDisk is the structure persisted to <imagedir>/<id>/build-state.json
