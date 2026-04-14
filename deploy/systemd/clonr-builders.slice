@@ -21,8 +21,20 @@ IOWeight=100
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_MKNOD CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN CAP_NET_BIND_SERVICE
 
 # Allow access to loop devices so losetup --find --partscan works.
+# block-loop covers major-7 block nodes (/dev/loop0, /dev/loop0p1, etc.).
+# /dev/loop-control is a char device (major 10, minor 237) — NOT covered by
+# block-loop — required by losetup -f to find a free device via ioctl.
 DeviceAllow=block-loop rw
 DeviceAllow=/dev/loop-control rw
+
+# QEMU (KVM-accelerated installer VM) requires /dev/kvm.
+# /dev/kvm is a char device (major 10, minor 232). DeviceAllow must be
+# explicit here because child scopes do not inherit the parent service's
+# DeviceAllow rules — each scope/slice cgroup has its own device policy.
+DeviceAllow=/dev/kvm rwm
+
+# /dev/net/tun required by QEMU virtio-net (user mode networking).
+DeviceAllow=/dev/net/tun rwm
 
 # Extraction needs real block device access and kernel module use (loop, ext4, xfs).
 PrivateDevices=no
