@@ -855,15 +855,27 @@ const Pages = {
         const kernel = info && info.kernel_version ? escHtml(info.kernel_version) : '—';
 
         const historyRows = (info && info.history && info.history.length > 0)
-            ? info.history.map(h => `<tr>
+            ? info.history.map(h => {
+                // Attribution: use label if present, fall back to key prefix, then "session".
+                const by = h.triggered_by_label ? escHtml(h.triggered_by_label)
+                         : h.triggered_by_prefix && h.triggered_by_prefix !== 'session' ? escHtml(h.triggered_by_prefix)
+                         : 'session';
+                const isFailed = h.outcome !== 'success' && h.outcome !== 'pending';
+                const delBtn = isFailed
+                    ? `<button class="btn btn-xs" style="padding:2px 6px;font-size:11px;color:var(--error);background:transparent;border:1px solid var(--error);border-radius:4px;cursor:pointer;line-height:1.2"
+                         onclick="Pages.deleteInitramfsHistory('${escHtml(h.id)}')" title="Delete this entry">×</button>`
+                    : '';
+                return `<tr>
                 <td class="text-mono text-sm">${escHtml(h.sha256 ? h.sha256.slice(0,16)+'…' : '—')}</td>
                 <td class="text-sm">${escHtml(h.kernel_version || '—')}</td>
                 <td class="text-sm">${fmtBytes(h.size_bytes)}</td>
                 <td class="text-sm"><span class="badge ${h.outcome === 'success' ? 'badge-ready' : h.outcome === 'pending' ? 'badge-building' : 'badge-error'}">${escHtml(h.outcome)}</span></td>
                 <td class="text-dim text-sm">${fmtRelative(h.started_at)}</td>
-                <td class="text-dim text-sm">${escHtml(h.triggered_by_prefix || '—')}</td>
-            </tr>`).join('')
-            : `<tr><td colspan="6" class="text-dim text-sm" style="text-align:center;padding:12px">No rebuild history</td></tr>`;
+                <td class="text-dim text-sm">${by}</td>
+                <td style="width:40px;text-align:center">${delBtn}</td>
+            </tr>`;
+            }).join('')
+            : `<tr><td colspan="7" class="text-dim text-sm" style="text-align:center;padding:12px">No rebuild history</td></tr>`;
 
         return `<div class="card" style="margin-bottom:20px;border-left:3px solid var(--accent)">
             <div class="card-header">
@@ -894,9 +906,9 @@ const Pages = {
                     </div>
                 </div>
                 <div class="table-wrap">
-                    <table style="font-size:13px">
+                    <table id="initramfs-history-table" style="font-size:13px">
                         <thead><tr>
-                            <th>SHA256</th><th>Kernel</th><th>Size</th><th>Outcome</th><th>When</th><th>By</th>
+                            <th>SHA256</th><th>Kernel</th><th>Size</th><th>Outcome</th><th>When</th><th>By</th><th></th>
                         </tr></thead>
                         <tbody>${historyRows}</tbody>
                     </table>
@@ -969,6 +981,28 @@ const Pages = {
                 resultDiv.innerHTML = `<div class="alert alert-error" style="background:rgba(239,68,68,0.1);border:1px solid var(--error);border-radius:6px;padding:12px;color:var(--error)">Rebuild failed: ${escHtml(e.message)}</div>`;
             }
             if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
+        }
+    },
+
+    // ── Delete a single initramfs history entry ────────────────────────────
+
+    async deleteInitramfsHistory(id) {
+        if (!confirm('Delete this failed history entry?')) return;
+        try {
+            await API.system.deleteInitramfsHistory(id);
+            // Remove the row from the DOM immediately without a full page reload.
+            const rows = document.querySelectorAll('#initramfs-history-table tbody tr');
+            rows.forEach(row => {
+                // The delete button's onclick contains the ID; find the row by checking its button.
+                const btn = row.querySelector('button');
+                if (btn && btn.getAttribute('onclick') && btn.getAttribute('onclick').includes(id)) {
+                    row.remove();
+                }
+            });
+            // Refresh the system card to pick up the updated table.
+            Pages.images();
+        } catch (e) {
+            alert('Failed to delete: ' + e.message);
         }
     },
 

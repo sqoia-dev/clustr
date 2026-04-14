@@ -344,6 +344,7 @@ func (s *Server) buildRouter() chi.Router {
 			// System initramfs management (F1).
 			r.Get("/system/initramfs", initramfsH.GetInitramfs)
 			r.Post("/system/initramfs/rebuild", initramfsH.RebuildInitramfs)
+			r.Delete("/system/initramfs/history/{id}", initramfsH.DeleteInitramfsHistory)
 
 			// Shell sessions
 			r.Post("/images/{id}/shell-session", factory.OpenShellSession)

@@ -262,9 +262,10 @@ const API = {
         rotate(id)            { return API.post(`/admin/api-keys/${id}/rotate`, {}); },
     },
     system: {
-        // initramfs — GET current status + history, POST to rebuild.
-        initramfs()           { return API.get('/system/initramfs'); },
-        rebuildInitramfs()    { return API.post('/system/initramfs/rebuild', {}); },
+        // initramfs — GET current status + history, POST to rebuild, DELETE history entry.
+        initramfs()               { return API.get('/system/initramfs'); },
+        rebuildInitramfs()        { return API.post('/system/initramfs/rebuild', {}); },
+        deleteInitramfsHistory(id){ return API.del(`/system/initramfs/history/${encodeURIComponent(id)}`); },
     },
     resume: {
         // resume — POST to resume an interrupted image build.

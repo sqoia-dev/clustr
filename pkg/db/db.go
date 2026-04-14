@@ -1792,14 +1792,15 @@ func (db *DB) GetImageResumePhase(ctx context.Context, id string) (string, bool,
 
 // InitramfsBuildRecord is a row in the initramfs_builds table.
 type InitramfsBuildRecord struct {
-	ID               string     `json:"id"`
-	StartedAt        time.Time  `json:"started_at"`
-	FinishedAt       *time.Time `json:"finished_at,omitempty"`
-	SHA256           string     `json:"sha256"`
-	SizeBytes        int64      `json:"size_bytes"`
-	KernelVersion    string     `json:"kernel_version"`
-	TriggeredByPrefix string    `json:"triggered_by_prefix"`
-	Outcome          string     `json:"outcome"`
+	ID                string     `json:"id"`
+	StartedAt         time.Time  `json:"started_at"`
+	FinishedAt        *time.Time `json:"finished_at,omitempty"`
+	SHA256            string     `json:"sha256"`
+	SizeBytes         int64      `json:"size_bytes"`
+	KernelVersion     string     `json:"kernel_version"`
+	TriggeredByPrefix string     `json:"triggered_by_prefix"`
+	TriggeredByLabel  string     `json:"triggered_by_label,omitempty"` // human label from api_keys.label; empty for session auth
+	Outcome           string     `json:"outcome"`
 }
 
 // CreateInitramfsBuild inserts a new initramfs build record.
@@ -1830,10 +1831,23 @@ func (db *DB) FinishInitramfsBuild(ctx context.Context, id string, sha256 string
 }
 
 // ListInitramfsBuilds returns the last N initramfs build records, newest first.
+// triggered_by_label is resolved by joining api_keys on the key prefix: we look
+// for a key whose hash starts with the stored 8-char prefix. When the build was
+// triggered via a browser session (no API key) the prefix is "session" and no
+// label is available; in that case TriggeredByLabel is left empty.
 func (db *DB) ListInitramfsBuilds(ctx context.Context, limit int) ([]InitramfsBuildRecord, error) {
 	rows, err := db.sql.QueryContext(ctx, `
-		SELECT id, started_at, finished_at, sha256, size_bytes, kernel_version, triggered_by_prefix, outcome
-		FROM initramfs_builds ORDER BY started_at DESC LIMIT ?
+		SELECT ib.id, ib.started_at, ib.finished_at, ib.sha256, ib.size_bytes,
+		       ib.kernel_version, ib.triggered_by_prefix, ib.outcome,
+		       COALESCE(ak.label, '') AS triggered_by_label
+		FROM initramfs_builds ib
+		LEFT JOIN api_keys ak
+		       ON ib.triggered_by_prefix != 'session'
+		      AND ak.label IS NOT NULL
+		      AND ak.revoked_at IS NULL
+		      AND SUBSTR(ak.key_hash, 1, 8) = ib.triggered_by_prefix
+		ORDER BY ib.started_at DESC
+		LIMIT ?
 	`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("db: list initramfs builds: %w", err)
@@ -1846,7 +1860,8 @@ func (db *DB) ListInitramfsBuilds(ctx context.Context, limit int) ([]InitramfsBu
 		var startedAtUnix int64
 		var finishedAtUnix sql.NullInt64
 		if err := rows.Scan(&r.ID, &startedAtUnix, &finishedAtUnix,
-			&r.SHA256, &r.SizeBytes, &r.KernelVersion, &r.TriggeredByPrefix, &r.Outcome); err != nil {
+			&r.SHA256, &r.SizeBytes, &r.KernelVersion, &r.TriggeredByPrefix,
+			&r.Outcome, &r.TriggeredByLabel); err != nil {
 			return nil, fmt.Errorf("db: scan initramfs build: %w", err)
 		}
 		r.StartedAt = time.Unix(startedAtUnix, 0).UTC()
@@ -1867,6 +1882,31 @@ func (db *DB) TrimInitramfsBuilds(ctx context.Context, keep int) error {
 		)
 	`, keep)
 	return err
+}
+
+// DeleteInitramfsBuild deletes a single build record by ID.
+func (db *DB) DeleteInitramfsBuild(ctx context.Context, id string) error {
+	_, err := db.sql.ExecContext(ctx, `DELETE FROM initramfs_builds WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("db: delete initramfs build: %w", err)
+	}
+	return nil
+}
+
+// LatestSuccessfulInitramfsBuildID returns the ID of the most recent build with
+// outcome = 'success'. Returns ("", sql.ErrNoRows) when none exists.
+func (db *DB) LatestSuccessfulInitramfsBuildID(ctx context.Context) (string, error) {
+	var id string
+	err := db.sql.QueryRowContext(ctx, `
+		SELECT id FROM initramfs_builds
+		WHERE outcome = 'success'
+		ORDER BY started_at DESC
+		LIMIT 1
+	`).Scan(&id)
+	if err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 // nullableTimestamp converts *time.Time to a SQLite-compatible nullable int64.
