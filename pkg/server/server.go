@@ -231,6 +231,11 @@ func (s *Server) buildRouter() chi.Router {
 		InitramfsPath: s.cfg.PXE.BootDir + "/initramfs-clonr.img",
 		ClonrBinPath:  s.cfg.ClonrBinPath, // abs path to clonr CLI binary; defaults to /usr/local/bin/clonr
 	}
+	// Prime the in-memory sha256 cache from the on-disk initramfs (if present).
+	// Non-fatal: if the file does not yet exist the cache stays empty and the
+	// live-entry guard in DeleteInitramfsHistory simply skips the check until
+	// the first successful rebuild.
+	initramfsH.InitLiveSHA256()
 	logs := &handlers.LogsHandler{DB: s.db, Broker: s.broker}
 	s.logsHandler = logs
 	progress := &handlers.ProgressHandler{Store: s.progress}

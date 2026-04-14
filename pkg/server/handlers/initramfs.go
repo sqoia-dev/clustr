@@ -34,8 +34,31 @@ type InitramfsHandler struct {
 	InitramfsPath string // final output path (e.g. /var/lib/clonr/boot/initramfs-clonr.img)
 	ClonrBinPath  string // path to the clonr static binary passed to the script
 
-	mu      sync.Mutex // serialises concurrent rebuild requests
-	running bool
+	mu          sync.Mutex // serialises concurrent rebuild requests
+	running     bool
+	liveSHA256  string // sha256 of the on-disk initramfs; cached to avoid per-request file reads
+}
+
+// InitLiveSHA256 computes and caches the sha256 of the current on-disk initramfs.
+// Call this once at startup (non-fatal if the file does not yet exist).
+func (h *InitramfsHandler) InitLiveSHA256() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.liveSHA256 = computeFileSHA256(h.InitramfsPath)
+}
+
+// computeFileSHA256 returns the hex sha256 of the file at path, or "" on error.
+func computeFileSHA256(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(hasher.Sum(nil))
 }
 
 // InitramfsBuildInfo is the shape returned by GET /api/v1/system/initramfs.
@@ -57,14 +80,12 @@ func (h *InitramfsHandler) GetInitramfs(w http.ResponseWriter, r *http.Request) 
 		info.SizeBytes = stat.Size()
 		mtime := stat.ModTime().UTC()
 		info.BuildTime = &mtime
-		// Compute sha256 of current file.
-		if f, err := os.Open(h.InitramfsPath); err == nil {
-			hasher := sha256.New()
-			if _, err := io.Copy(hasher, f); err == nil {
-				info.SHA256 = hex.EncodeToString(hasher.Sum(nil))
-			}
-			f.Close()
-		}
+		// Use the cached live sha256 — avoids a 27 MB synchronous file read per
+		// request.  The cache is populated at startup and after each successful
+		// rebuild, so it is always current.
+		h.mu.Lock()
+		info.SHA256 = h.liveSHA256
+		h.mu.Unlock()
 	}
 
 	// Load history.
@@ -205,6 +226,11 @@ func (h *InitramfsHandler) RebuildInitramfs(w http.ResponseWriter, r *http.Reque
 		writeError(w, err)
 		return
 	}
+
+	// Update the in-memory live sha256 cache now that the new image is on disk.
+	h.mu.Lock()
+	h.liveSHA256 = scriptSHA256
+	h.mu.Unlock()
 
 	// Finalize DB record — use a background context so a slow or disconnected
 	// HTTP client does not cancel the write after a successful build.
@@ -417,32 +443,27 @@ func (h *InitramfsHandler) DeleteInitramfsHistory(w http.ResponseWriter, r *http
 
 	ctx := r.Context()
 
-	// Compute sha256 of the live on-disk initramfs.  If the file does not exist
-	// we skip the live guard (no live image means nothing is protected).
-	var liveSHA256 string
-	if f, err := os.Open(h.InitramfsPath); err == nil {
-		hasher := sha256.New()
-		if _, err := io.Copy(hasher, f); err == nil {
-			liveSHA256 = hex.EncodeToString(hasher.Sum(nil))
-		}
-		f.Close()
+	// Fetch the target entry's sha256 from history.
+	history, err := h.DB.ListInitramfsBuilds(ctx, 20)
+	if err != nil {
+		writeError(w, err)
+		return
 	}
 
-	// Fetch the target entry to get its sha256.
+	// Compare against the cached live sha256 — no synchronous file read required.
+	// liveSHA256 is set at startup and updated after every successful rebuild.
+	h.mu.Lock()
+	liveSHA256 := h.liveSHA256
+	h.mu.Unlock()
+
 	if liveSHA256 != "" {
-		rows, err := h.DB.SQL().QueryContext(ctx,
-			`SELECT sha256 FROM initramfs_builds WHERE id = ? LIMIT 1`, id)
-		if err == nil {
-			defer rows.Close()
-			if rows.Next() {
-				var entrySHA256 string
-				if rows.Scan(&entrySHA256) == nil && entrySHA256 == liveSHA256 {
-					writeJSON(w, http.StatusConflict, api.ErrorResponse{
-						Error: "cannot delete the live initramfs entry — its sha256 matches the file currently on disk",
-						Code:  "live_entry_cannot_delete",
-					})
-					return
-				}
+		for _, rec := range history {
+			if rec.ID == id && rec.SHA256 == liveSHA256 {
+				writeJSON(w, http.StatusConflict, api.ErrorResponse{
+					Error: "cannot delete the live initramfs entry — its sha256 matches the file currently on disk",
+					Code:  "live_entry_cannot_delete",
+				})
+				return
 			}
 		}
 	}
