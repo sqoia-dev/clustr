@@ -593,10 +593,11 @@ func raidMembersArePartitions(layout api.DiskLayout) bool {
 func partitionDevices(defaultDisk string, layout api.DiskLayout) []string {
 	devs := make([]string, len(layout.Partitions))
 	targetCount := make(map[string]int)
+	mdOnPartitions := raidMembersArePartitions(layout)
 	for i, p := range layout.Partitions {
 		target := resolvePartitionDisk(defaultDisk, p)
 		targetCount[target]++
-		devs[i] = partitionDevice(target, targetCount[target])
+		devs[i] = resolveFormatTargetForLayout(defaultDisk, p, targetCount[target], mdOnPartitions)
 	}
 	return devs
 }
@@ -679,6 +680,12 @@ func (d *FilesystemDeployer) partitionDisk(ctx context.Context, disk string) err
 	targetMap := make(map[string][]partEntry) // target disk path → partitions
 	for i, p := range d.layout.Partitions {
 		target := resolvePartitionDisk(disk, p)
+		// Skip md virtual devices — they are assembled AFTER partitioning raw disks
+		// and do not need to be wiped or partitioned by sgdisk. Their filesystems
+		// are created by createFilesystems once the md arrays are online.
+		if isMdDevice(target) {
+			continue
+		}
 		targetMap[target] = append(targetMap[target], partEntry{i, p})
 	}
 
@@ -863,6 +870,27 @@ func partitionDevice(disk string, num int) string {
 	return fmt.Sprintf("%s%d", disk, num)
 }
 
+// isMdDevice returns true if the device path refers to a Linux software RAID
+// (md) device, e.g. "/dev/md0", "/dev/md127". These devices are assembled by
+// mdadm AFTER raw disk partitioning and must not be treated as sgdisk targets.
+func isMdDevice(dev string) bool {
+	base := strings.TrimPrefix(dev, "/dev/")
+	if !strings.HasPrefix(base, "md") {
+		return false
+	}
+	// Must be "md" followed only by digits (e.g. "md0", "md1") not "mda" or "mdp"
+	rest := base[2:]
+	if len(rest) == 0 {
+		return false
+	}
+	for _, c := range rest {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // resolvePartitionDisk returns the block device that a PartitionSpec should be
 // created on. When spec.Device is set (e.g. "md0" or "/dev/md0"), that device
 // is used — this covers RAID-on-whole-disk layouts where the layout recommender
@@ -882,24 +910,45 @@ func resolvePartitionDisk(defaultDisk string, spec api.PartitionSpec) string {
 // partition number num (1-based) of the given spec. It calls resolvePartitionDisk
 // to pick the right parent disk then appends the partition number suffix.
 //
-// For RAID1 whole-disk layouts (spec.Device == "md0") this returns "/dev/md0p1",
-// "/dev/md0p2", etc. For single-disk layouts it returns "/dev/sda1" etc.
+// For RAID-on-whole-disk layouts (spec.Device == "md0") the md device IS
+// partitioned by sgdisk so the format target is "/dev/md0p1" etc.
+// For single-disk layouts it returns "/dev/sda1" etc.
+// For md-on-partitions layouts the md device represents an assembled array
+// that should NOT have a partition suffix — use resolveFormatTargetForLayout.
 func resolveFormatTarget(defaultDisk string, spec api.PartitionSpec, num int) string {
 	disk := resolvePartitionDisk(defaultDisk, spec)
+	return partitionDevice(disk, num)
+}
+
+// resolveFormatTargetForLayout returns the format target path, taking topology
+// into account. For md-on-partitions layouts, md devices (md0, md1, md2) are
+// assembled RAID arrays whose filesystems land on the device itself, not on a
+// partition. For RAID-on-whole-disk, the md device is partitioned by sgdisk so
+// the partition number suffix applies normally.
+func resolveFormatTargetForLayout(defaultDisk string, spec api.PartitionSpec, num int, mdOnPartitions bool) string {
+	disk := resolvePartitionDisk(defaultDisk, spec)
+	if mdOnPartitions && isMdDevice(disk) {
+		// md device is the assembled RAID array — format it directly.
+		return disk
+	}
 	return partitionDevice(disk, num)
 }
 
 // createFilesystems creates the appropriate filesystem on each partition.
 // Returns a slice of resolved partition device paths in layout order.
 //
-// When PartitionSpec.Device is set (e.g. "md0"), the format target is derived
-// from that device (e.g. /dev/md0p1) rather than the raw disk. This is the
-// correct behaviour for RAID-on-whole-disk layouts where partitions live on top
-// of an assembled md array. The raw member disks (sda, sdb) are already held by
-// mdadm and must not be formatted directly.
+// For md-on-partitions layouts the Partition entries for md0/md1/md2 represent
+// the assembled md arrays themselves. For md-on-partitions layouts the md device
+// entries (md0, md1, md2) are formatted directly without a partition suffix.
+// For RAID-on-whole-disk layouts the md device is partitioned by sgdisk and
+// filesystems land on /dev/md0p1, /dev/md0p2, etc.
 func (d *FilesystemDeployer) createFilesystems(ctx context.Context, disk string) ([]string, error) {
 	log := logger()
 	devs := make([]string, len(d.layout.Partitions))
+
+	// Detect md-on-partitions topology so resolveFormatTargetForLayout can
+	// return the md device path directly (no partition suffix).
+	mdOnPartitions := raidMembersArePartitions(d.layout)
 
 	// Compute per-target local partition numbers. sgdisk numbers partitions
 	// starting from 1 per target disk. When all partitions share the same target
@@ -910,7 +959,7 @@ func (d *FilesystemDeployer) createFilesystems(ctx context.Context, disk string)
 		target := resolvePartitionDisk(disk, p)
 		targetCount[target]++
 		localNum := targetCount[target]
-		dev := partitionDevice(target, localNum)
+		dev := resolveFormatTargetForLayout(disk, p, localNum, mdOnPartitions)
 		devs[i] = dev
 
 		var mkfsArgs []string
