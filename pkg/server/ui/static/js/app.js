@@ -135,6 +135,7 @@ const App = {
             else Pages.nodeDetail(parts[2]);
         });
         Router.register('/logs',    ()    => Pages.logs());
+        Router.register('/settings', ()   => Pages.settings());
     },
 
     render(html) {
@@ -159,8 +160,34 @@ const App = {
                 if (label) { label.textContent = 'offline'; }
             }
         };
+
+        // Session expiry warning: poll /auth/me every 60s; if TTL < 600s show banner.
+        const checkSession = async () => {
+            const banner = document.getElementById('session-expiry-banner');
+            if (!banner) return;
+            try {
+                const me = await fetch('/api/v1/auth/me', { credentials: 'same-origin' });
+                if (!me.ok) { banner.style.display = 'none'; return; }
+                const data = await me.json();
+                if (!data.expires_at) { banner.style.display = 'none'; return; }
+                const expiresAt = new Date(data.expires_at);
+                const ttlSecs = Math.floor((expiresAt - Date.now()) / 1000);
+                if (ttlSecs < 600) {
+                    const mins = Math.max(1, Math.ceil(ttlSecs / 60));
+                    banner.textContent = `Session expires in ${mins} minute${mins === 1 ? '' : 's'} — click to extend`;
+                    banner.style.display = 'block';
+                } else {
+                    banner.style.display = 'none';
+                }
+            } catch (_) {
+                if (banner) banner.style.display = 'none';
+            }
+        };
+
         check();
+        checkSession();
         setInterval(check, 30000);
+        setInterval(checkSession, 60000);
     },
 };
 
@@ -6143,6 +6170,208 @@ const Pages = {
             }
         }
     },
+
+    // ── Settings ───────────────────────────────────────────────────────────
+
+    _settingsTab: 'api-keys', // tracks active tab
+
+    async settings() {
+        App.render(loading('Loading settings…'));
+        await Pages._settingsRender(Pages._settingsTab);
+    },
+
+    async _settingsRender(tab) {
+        Pages._settingsTab = tab;
+        const tabs = ['api-keys', 'server-info', 'about'];
+        const tabBar = tabs.map(t => {
+            const active = t === tab ? 'style="border-bottom:2px solid var(--accent);color:var(--accent);"' : '';
+            const label  = { 'api-keys': 'API Keys', 'server-info': 'Server Info', 'about': 'About' }[t];
+            return `<button class="btn btn-ghost" ${active} onclick="Pages._settingsRender('${t}')">${label}</button>`;
+        }).join('');
+
+        let body = loading('Loading…');
+        if (tab === 'api-keys') {
+            body = await Pages._settingsAPIKeysTab();
+        } else if (tab === 'server-info') {
+            body = `<div class="card"><div class="card-header"><span class="card-title">Server Info</span></div><p class="text-secondary" style="padding:16px">Server information will appear here in a future update.</p></div>`;
+        } else {
+            body = `<div class="card"><div class="card-header"><span class="card-title">About clonr</span></div><p class="text-secondary" style="padding:16px">clonr — open-source node cloning and image management for HPC clusters.</p></div>`;
+        }
+
+        App.render(`
+            <div class="page-header">
+                <div>
+                    <div class="page-title">Settings</div>
+                    <div class="page-subtitle">Server and API key management</div>
+                </div>
+            </div>
+            <div style="display:flex;gap:8px;margin-bottom:20px;border-bottom:1px solid var(--border);padding-bottom:0;">
+                ${tabBar}
+            </div>
+            ${body}
+        `);
+    },
+
+    async _settingsAPIKeysTab() {
+        try {
+            const resp = await API.apiKeys.list();
+            const keys = (resp && resp.api_keys) ? resp.api_keys : [];
+
+            const rows = keys.length === 0
+                ? `<tr><td colspan="7" style="text-align:center;color:var(--text-secondary);padding:24px">No active API keys</td></tr>`
+                : keys.map(k => {
+                    const expires = k.expires_at ? fmtDate(k.expires_at) : '<span class="text-dim">never</span>';
+                    const lastUsed = k.last_used_at ? fmtRelative(k.last_used_at) : '<span class="text-dim">never</span>';
+                    const label = k.label || '<span class="text-dim">—</span>';
+                    const scopeBadge = k.scope === 'admin'
+                        ? `<span class="badge badge-info">admin</span>`
+                        : `<span class="badge badge-neutral">node</span>`;
+                    return `<tr>
+                        <td class="text-mono text-sm">${escHtml(k.hash_prefix)}…</td>
+                        <td>${scopeBadge}</td>
+                        <td>${escHtml(k.label || '—')}</td>
+                        <td class="text-sm text-secondary">${lastUsed}</td>
+                        <td class="text-sm text-secondary">${expires}</td>
+                        <td class="text-sm text-secondary">${escHtml(k.created_by || '—')}</td>
+                        <td>
+                            <div style="display:flex;gap:6px;">
+                                <button class="btn btn-secondary btn-sm" onclick="Pages._settingsRotateKey('${k.id}')">Rotate</button>
+                                <button class="btn btn-danger btn-sm" onclick="Pages._settingsRevokeKey('${k.id}', '${escHtml(k.label || k.hash_prefix)}')">Revoke</button>
+                            </div>
+                        </td>
+                    </tr>`;
+                }).join('');
+
+            return `
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">API Keys</span>
+                        <button class="btn btn-primary btn-sm" onclick="Pages._settingsCreateKeyModal()">+ Create Key</button>
+                    </div>
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Hash Prefix</th><th>Scope</th><th>Label</th>
+                                <th>Last Used</th><th>Expires</th><th>Created By</th><th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>`;
+        } catch (err) {
+            return alertBox('Failed to load API keys: ' + err.message);
+        }
+    },
+
+    _settingsCreateKeyModal() {
+        const modal = document.createElement('div');
+        modal.id = 'create-key-modal';
+        modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:1000;';
+        modal.innerHTML = `
+            <div class="card" style="width:480px;max-width:95vw;">
+                <div class="card-header">
+                    <span class="card-title">Create API Key</span>
+                    <button class="btn btn-ghost btn-sm" onclick="document.getElementById('create-key-modal').remove()">×</button>
+                </div>
+                <div style="padding:16px;display:flex;flex-direction:column;gap:12px;">
+                    <label class="form-label">Scope
+                        <select id="ckm-scope" class="form-input" style="margin-top:4px;">
+                            <option value="admin">admin — full access</option>
+                            <option value="node">node — deploy agent only</option>
+                        </select>
+                    </label>
+                    <label class="form-label">Label (e.g. "ci-runner", "robert-laptop")
+                        <input id="ckm-label" class="form-input" type="text" placeholder="ci-runner" style="margin-top:4px;">
+                    </label>
+                    <label class="form-label" id="ckm-nodeid-row" style="display:none;">Node ID (required for node scope)
+                        <input id="ckm-nodeid" class="form-input" type="text" placeholder="node UUID" style="margin-top:4px;">
+                    </label>
+                    <label class="form-label">Expires (ISO8601, optional)
+                        <input id="ckm-expires" class="form-input" type="datetime-local" style="margin-top:4px;">
+                    </label>
+                    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;">
+                        <button class="btn btn-secondary" onclick="document.getElementById('create-key-modal').remove()">Cancel</button>
+                        <button class="btn btn-primary" onclick="Pages._settingsCreateKeySubmit()">Create</button>
+                    </div>
+                </div>
+            </div>`;
+        document.body.appendChild(modal);
+
+        document.getElementById('ckm-scope').addEventListener('change', (e) => {
+            document.getElementById('ckm-nodeid-row').style.display = e.target.value === 'node' ? '' : 'none';
+        });
+    },
+
+    async _settingsCreateKeySubmit() {
+        const scope    = document.getElementById('ckm-scope').value;
+        const label    = document.getElementById('ckm-label').value.trim();
+        const nodeID   = document.getElementById('ckm-nodeid').value.trim();
+        const expiresV = document.getElementById('ckm-expires').value;
+
+        if (scope === 'node' && !nodeID) {
+            App.toast('Node ID is required for node-scoped keys', 'error');
+            return;
+        }
+
+        let expiresAt = '';
+        if (expiresV) {
+            expiresAt = new Date(expiresV).toISOString();
+        }
+
+        try {
+            const resp = await API.apiKeys.create({ scope, label, node_id: nodeID, expires_at: expiresAt });
+            document.getElementById('create-key-modal').remove();
+            Pages._settingsShowRawKey(resp.key, 'New API Key Created');
+        } catch (err) {
+            App.toast('Create failed: ' + err.message, 'error');
+        }
+    },
+
+    async _settingsRotateKey(id) {
+        if (!confirm('Rotate this key? The old key will stop working immediately.')) return;
+        try {
+            const resp = await API.apiKeys.rotate(id);
+            Pages._settingsShowRawKey(resp.key, 'Key Rotated');
+        } catch (err) {
+            App.toast('Rotate failed: ' + err.message, 'error');
+        }
+    },
+
+    async _settingsRevokeKey(id, label) {
+        if (!confirm(`Revoke key "${label}"? This cannot be undone.`)) return;
+        try {
+            await API.apiKeys.revoke(id);
+            App.toast('Key revoked', 'success');
+            Pages._settingsRender('api-keys');
+        } catch (err) {
+            App.toast('Revoke failed: ' + err.message, 'error');
+        }
+    },
+
+    _settingsShowRawKey(rawKey, title) {
+        const modal = document.createElement('div');
+        modal.id = 'rawkey-modal';
+        modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:1001;';
+        modal.innerHTML = `
+            <div class="card" style="width:560px;max-width:95vw;">
+                <div class="card-header">
+                    <span class="card-title">${escHtml(title)}</span>
+                </div>
+                <div style="padding:16px;">
+                    <div class="alert alert-warning" style="margin-bottom:12px;">
+                        <strong>Save this key now.</strong> It will not be shown again.
+                    </div>
+                    <div style="background:var(--bg-primary);border:1px solid var(--border);border-radius:6px;padding:12px;font-family:var(--font-mono);font-size:13px;word-break:break-all;margin-bottom:12px;">
+                        ${escHtml(rawKey)}
+                    </div>
+                    <div style="display:flex;gap:8px;justify-content:flex-end;">
+                        <button class="btn btn-secondary" onclick="navigator.clipboard.writeText(${JSON.stringify(rawKey)}).then(()=>App.toast('Copied','success'))">Copy to clipboard</button>
+                        <button class="btn btn-primary" onclick="document.getElementById('rawkey-modal').remove();Pages._settingsRender('api-keys')">Done</button>
+                    </div>
+                </div>
+            </div>`;
+        document.body.appendChild(modal);
+    },
 };
 
 // ─── ProgressStream ───────────────────────────────────────────────────────
@@ -6228,6 +6457,18 @@ const Auth = {
         }
         try { localStorage.removeItem('clonr_admin_key'); } catch (_) {}
         window.location.href = '/login';
+    },
+
+    // extendSession re-validates the session (GET /auth/me with valid cookie slides it).
+    async extendSession() {
+        try {
+            await fetch('/api/v1/auth/me', { credentials: 'same-origin' });
+            const banner = document.getElementById('session-expiry-banner');
+            if (banner) banner.style.display = 'none';
+            App.toast('Session extended', 'success');
+        } catch (_) {
+            window.location.href = '/login';
+        }
     },
 
     // boot verifies the session via GET /api/v1/auth/me.

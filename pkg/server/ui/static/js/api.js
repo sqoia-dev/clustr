@@ -235,6 +235,15 @@ const API = {
     health: {
         get()                 { return API.get('/health'); },
     },
+    auth: {
+        me()                  { return API.get('/auth/me'); },
+    },
+    apiKeys: {
+        list()                { return API.get('/admin/api-keys'); },
+        create(body)          { return API.post('/admin/api-keys', body); },
+        revoke(id)            { return API.del(`/admin/api-keys/${id}`); },
+        rotate(id)            { return API.post(`/admin/api-keys/${id}/rotate`, {}); },
+    },
     system: {
         // initramfs — GET current status + history, POST to rebuild.
         initramfs()           { return API.get('/system/initramfs'); },
