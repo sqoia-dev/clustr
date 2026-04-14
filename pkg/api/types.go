@@ -20,10 +20,11 @@ const (
 type ImageStatus string
 
 const (
-	ImageStatusBuilding ImageStatus = "building"
-	ImageStatusReady    ImageStatus = "ready"
-	ImageStatusError    ImageStatus = "error"
-	ImageStatusArchived ImageStatus = "archived"
+	ImageStatusBuilding     ImageStatus = "building"
+	ImageStatusReady        ImageStatus = "ready"
+	ImageStatusError        ImageStatus = "error"
+	ImageStatusArchived     ImageStatus = "archived"
+	ImageStatusInterrupted  ImageStatus = "interrupted" // F2/F3: build interrupted, resumable
 )
 
 // ImageFormat describes how the image blob is stored on disk.

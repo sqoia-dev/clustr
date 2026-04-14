@@ -59,6 +59,12 @@ func (db *DB) Close() error {
 	return db.sql.Close()
 }
 
+// SQL returns the underlying *sql.DB for advanced queries not covered by typed methods.
+// Use sparingly — prefer typed methods where possible.
+func (db *DB) SQL() *sql.DB {
+	return db.sql
+}
+
 // migrate applies all SQL migration files in order. Each file is applied once;
 // applied migrations are tracked in the schema_migrations table.
 func (db *DB) migrate() error {
@@ -1353,6 +1359,160 @@ func scanNodeGroup(s scanner) (api.NodeGroup, error) {
 		}
 	}
 	return g, nil
+}
+
+// ─── Image build resumable fields ───────────────────────────────────────────
+
+// SetImageResumable marks an image as interrupted and resumable, recording the
+// last phase it reached. Called by ReconcileStuckBuilds (F2/F3 feature).
+func (db *DB) SetImageResumable(ctx context.Context, id, fromPhase string) error {
+	res, err := db.sql.ExecContext(ctx, `
+		UPDATE base_images
+		SET status = 'interrupted', resumable = 1, resume_from_phase = ?,
+		    error_message = 'build interrupted — server was restarted'
+		WHERE id = ?
+	`, fromPhase, id)
+	if err != nil {
+		return fmt.Errorf("db: set image resumable: %w", err)
+	}
+	return requireOneRow(res, "base_images", id)
+}
+
+// ClearImageResumable clears the resumable flag, e.g. on successful resume or delete.
+func (db *DB) ClearImageResumable(ctx context.Context, id string) error {
+	_, err := db.sql.ExecContext(ctx, `
+		UPDATE base_images SET resumable = 0, resume_from_phase = '' WHERE id = ?
+	`, id)
+	return err
+}
+
+// ListResumableImages returns all images with resumable=1.
+func (db *DB) ListResumableImages(ctx context.Context) ([]api.BaseImage, error) {
+	rows, err := db.sql.QueryContext(ctx, `
+		SELECT id, name, version, os, arch, status, format, firmware, size_bytes, checksum,
+		       blob_path, disk_layout, tags, source_url, notes, error_message,
+		       built_for_roles, build_method, created_at, finalized_at
+		FROM base_images WHERE resumable = 1 ORDER BY created_at DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("db: list resumable images: %w", err)
+	}
+	defer rows.Close()
+
+	var images []api.BaseImage
+	for rows.Next() {
+		img, err := scanBaseImage(rows)
+		if err != nil {
+			return nil, err
+		}
+		images = append(images, img)
+	}
+	return images, rows.Err()
+}
+
+// GetImageResumePhase returns the resume_from_phase for an image.
+func (db *DB) GetImageResumePhase(ctx context.Context, id string) (string, bool, error) {
+	var phase string
+	var resumable int
+	err := db.sql.QueryRowContext(ctx,
+		`SELECT resume_from_phase, resumable FROM base_images WHERE id = ?`, id,
+	).Scan(&phase, &resumable)
+	if err == sql.ErrNoRows {
+		return "", false, api.ErrNotFound
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("db: get image resume phase: %w", err)
+	}
+	return phase, resumable != 0, nil
+}
+
+// ─── Initramfs build history ─────────────────────────────────────────────────
+
+// InitramfsBuildRecord is a row in the initramfs_builds table.
+type InitramfsBuildRecord struct {
+	ID               string     `json:"id"`
+	StartedAt        time.Time  `json:"started_at"`
+	FinishedAt       *time.Time `json:"finished_at,omitempty"`
+	SHA256           string     `json:"sha256"`
+	SizeBytes        int64      `json:"size_bytes"`
+	KernelVersion    string     `json:"kernel_version"`
+	TriggeredByPrefix string    `json:"triggered_by_prefix"`
+	Outcome          string     `json:"outcome"`
+}
+
+// CreateInitramfsBuild inserts a new initramfs build record.
+func (db *DB) CreateInitramfsBuild(ctx context.Context, r InitramfsBuildRecord) error {
+	_, err := db.sql.ExecContext(ctx, `
+		INSERT INTO initramfs_builds (id, started_at, finished_at, sha256, size_bytes, kernel_version, triggered_by_prefix, outcome)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, r.ID, r.StartedAt.Unix(), nullableTimestamp(r.FinishedAt), r.SHA256, r.SizeBytes,
+		r.KernelVersion, r.TriggeredByPrefix, r.Outcome)
+	if err != nil {
+		return fmt.Errorf("db: create initramfs build: %w", err)
+	}
+	return nil
+}
+
+// FinishInitramfsBuild updates a build record on completion.
+func (db *DB) FinishInitramfsBuild(ctx context.Context, id string, sha256 string, sizeBytes int64, kernelVersion, outcome string) error {
+	now := time.Now().Unix()
+	_, err := db.sql.ExecContext(ctx, `
+		UPDATE initramfs_builds
+		SET finished_at = ?, sha256 = ?, size_bytes = ?, kernel_version = ?, outcome = ?
+		WHERE id = ?
+	`, now, sha256, sizeBytes, kernelVersion, outcome, id)
+	if err != nil {
+		return fmt.Errorf("db: finish initramfs build: %w", err)
+	}
+	return nil
+}
+
+// ListInitramfsBuilds returns the last N initramfs build records, newest first.
+func (db *DB) ListInitramfsBuilds(ctx context.Context, limit int) ([]InitramfsBuildRecord, error) {
+	rows, err := db.sql.QueryContext(ctx, `
+		SELECT id, started_at, finished_at, sha256, size_bytes, kernel_version, triggered_by_prefix, outcome
+		FROM initramfs_builds ORDER BY started_at DESC LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("db: list initramfs builds: %w", err)
+	}
+	defer rows.Close()
+
+	var records []InitramfsBuildRecord
+	for rows.Next() {
+		var r InitramfsBuildRecord
+		var startedAtUnix int64
+		var finishedAtUnix sql.NullInt64
+		if err := rows.Scan(&r.ID, &startedAtUnix, &finishedAtUnix,
+			&r.SHA256, &r.SizeBytes, &r.KernelVersion, &r.TriggeredByPrefix, &r.Outcome); err != nil {
+			return nil, fmt.Errorf("db: scan initramfs build: %w", err)
+		}
+		r.StartedAt = time.Unix(startedAtUnix, 0).UTC()
+		if finishedAtUnix.Valid {
+			t := time.Unix(finishedAtUnix.Int64, 0).UTC()
+			r.FinishedAt = &t
+		}
+		records = append(records, r)
+	}
+	return records, rows.Err()
+}
+
+// TrimInitramfsBuilds deletes old records keeping only the most recent `keep` rows.
+func (db *DB) TrimInitramfsBuilds(ctx context.Context, keep int) error {
+	_, err := db.sql.ExecContext(ctx, `
+		DELETE FROM initramfs_builds WHERE id NOT IN (
+			SELECT id FROM initramfs_builds ORDER BY started_at DESC LIMIT ?
+		)
+	`, keep)
+	return err
+}
+
+// nullableTimestamp converts *time.Time to a SQLite-compatible nullable int64.
+func nullableTimestamp(t *time.Time) interface{} {
+	if t == nil {
+		return nil
+	}
+	return t.Unix()
 }
 
 // marshalDiskLayoutOverride serialises a *DiskLayout to JSON for storage.
