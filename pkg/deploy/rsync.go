@@ -571,6 +571,123 @@ func (d *FilesystemDeployer) Finalize(ctx context.Context, cfg api.NodeConfig, m
 		}
 	}
 
+	// Install the UEFI bootloader if the layout includes an ESP partition.
+	// This branch is mutually exclusive with hasBIOSGrub in practice (a layout is
+	// either BIOS or UEFI), but both checks run independently so a misconfigured
+	// layout that somehow has both flags will attempt both paths.
+	//
+	// Steps:
+	//   1. Confirm the ESP is mounted at <mountRoot>/boot/efi.
+	//   2. If grubx64.efi is absent, install grub2-efi-x64 + shim-x64 via dnf
+	//      inside the chroot (the RPM %post scriptlet copies grubx64.efi to the
+	//      mounted ESP under /boot/efi/EFI/rocky/).
+	//   3. Run grub2-install --target=x86_64-efi to write the EFI binary and
+	//      GRUB module set. --removable also writes the fallback path
+	//      \EFI\BOOT\BOOTX64.EFI which OVMF uses when NVRAM entries are absent.
+	//   4. Verify grubx64.efi is present post-install (fatal if missing).
+	//   5. Create/repair the NVRAM boot entry via efibootmgr.
+	//
+	// All steps are FATAL — a UEFI node with no EFI binary cannot boot.
+	hasESP := false
+	espPartNum := 0
+	{
+		// Find the ESP partition and its 1-based partition number on d.targetDisk.
+		// Use the same per-target counter logic as partitionDevices/createFilesystems
+		// so the number matches what was actually written to the GPT.
+		targetCount := make(map[string]int)
+		for _, p := range d.layout.Partitions {
+			target := resolvePartitionDisk(d.targetDisk, p)
+			targetCount[target]++
+			for _, flag := range p.Flags {
+				if flag == "esp" || flag == "boot" {
+					if target == d.targetDisk {
+						hasESP = true
+						espPartNum = targetCount[target]
+					}
+					break
+				}
+			}
+		}
+	}
+	if hasESP {
+		log := logger()
+		efiDir := filepath.Join(mountRoot, "boot", "efi")
+		bootDir := filepath.Join(mountRoot, "boot")
+		grubx64Path := filepath.Join(efiDir, "EFI", "rocky", "grubx64.efi")
+
+		log.Info().Str("disk", d.targetDisk).Int("esp_part", espPartNum).
+			Str("efi_dir", efiDir).Msg("finalize: UEFI ESP detected — installing EFI bootloader")
+
+		// Confirm the ESP is actually mounted. mountPartitions already ran above
+		// but we verify here so a misconfigured layout fails loudly.
+		if _, err := os.Stat(efiDir); err != nil {
+			return fmt.Errorf("deploy: finalize: UEFI ESP mount point %s not accessible: %w", efiDir, err)
+		}
+
+		// Step 2: if grubx64.efi is absent on the ESP, install the EFI packages
+		// via dnf inside the chroot. The RPM %post scriptlets write the binary to
+		// the mounted ESP at /boot/efi/EFI/rocky/grubx64.efi.
+		if _, err := os.Stat(grubx64Path); os.IsNotExist(err) {
+			log.Info().Str("path", grubx64Path).
+				Msg("finalize: grubx64.efi absent on ESP — installing grub2-efi-x64 + shim-x64 via chroot dnf")
+			if err := installEFIBootloaderInChroot(ctx, mountRoot); err != nil {
+				return &BootloaderError{
+					Targets: []string{d.targetDisk},
+					Cause:   fmt.Errorf("UEFI: installEFIBootloaderInChroot: %w", err),
+				}
+			}
+		} else {
+			log.Info().Str("path", grubx64Path).
+				Msg("finalize: grubx64.efi already present on ESP — skipping dnf install")
+		}
+
+		// Step 3: run grub2-install --target=x86_64-efi.
+		// --removable writes \EFI\BOOT\BOOTX64.EFI (OVMF fallback path).
+		// --boot-directory points at <mountRoot>/boot so GRUB finds grub.cfg.
+		// --efi-directory points at the mounted ESP.
+		grubEFIArgs := []string{
+			"--target=x86_64-efi",
+			"--efi-directory=" + efiDir,
+			"--boot-directory=" + bootDir,
+			"--bootloader-id=rocky",
+			"--removable",
+			"--recheck",
+		}
+		log.Info().Str("disk", d.targetDisk).Strs("args", grubEFIArgs).
+			Msg("finalize: running grub2-install --target=x86_64-efi")
+		if err := runAndLog(ctx, "grub2-install-efi", exec.CommandContext(ctx, "grub2-install", grubEFIArgs...)); err != nil {
+			return &BootloaderError{
+				Targets: []string{d.targetDisk},
+				Cause:   fmt.Errorf("UEFI: grub2-install --target=x86_64-efi: %w", err),
+			}
+		}
+		log.Info().Msg("finalize: grub2-install --target=x86_64-efi succeeded")
+
+		// Step 4: verify grubx64.efi exists post-install. grub2-install can exit 0
+		// but silently skip writing the binary in some edge cases (missing modules,
+		// wrong chroot state). A missing binary means OVMF will loop at the picker.
+		if _, err := os.Stat(grubx64Path); err != nil {
+			return &BootloaderError{
+				Targets: []string{d.targetDisk},
+				Cause: fmt.Errorf("UEFI: grub2-install exited 0 but %s is missing: %w",
+					grubx64Path, err),
+			}
+		}
+		log.Info().Str("path", grubx64Path).Msg("finalize: grubx64.efi verified on ESP")
+
+		// Step 5: create/repair the NVRAM boot entry so OVMF knows to load our EFI
+		// binary. FixEFIBoot removes stale "Rocky Linux" entries and creates a fresh
+		// one pointing to \EFI\rocky\grubx64.efi on the ESP.
+		if err := FixEFIBoot(ctx, d.targetDisk, espPartNum, "Rocky Linux", `\EFI\rocky\grubx64.efi`); err != nil {
+			return &BootloaderError{
+				Targets: []string{d.targetDisk},
+				Cause:   fmt.Errorf("UEFI: FixEFIBoot: %w", err),
+			}
+		}
+		log.Info().Str("disk", d.targetDisk).Int("esp_part", espPartNum).
+			Msg("finalize: UEFI NVRAM boot entry created/repaired — EFI bootloader install complete")
+	}
+
 	// If the layout includes RAID arrays, write /etc/mdadm.conf BEFORE running
 	// applyBootConfig so that the single dracut invocation in applyBootConfig
 	// picks up the conf and bakes it into the initramfs. GenerateMdadmConf no
