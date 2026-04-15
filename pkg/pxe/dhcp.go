@@ -208,15 +208,25 @@ func bootFilename(req *dhcpv4.DHCPv4, isIPXE bool, serverIP net.IP, httpPort str
 	}
 
 	// Read option 93 -- client system architecture.
+	// Values defined by RFC 4578 and IANA PXE Client Architecture Types:
+	//   0x0000 = BIOS x86
+	//   0x0006 = EFI IA32
+	//   0x0007 = EFI x86-64 (standard)
+	//   0x0009 = EFI x86-64 (alternate, used by some firmware)
+	//   0x000a = EFI ARM 32-bit
+	//   0x000b = EFI ARM 64-bit
+	//   0x0010 = UEFI HTTP boot x86-64 (HTTPClient, e.g. OVMF with HTTP Boot enabled)
 	archOpt := req.Options.Get(dhcpv4.OptionClientSystemArchitectureType)
 	if len(archOpt) >= 2 {
 		archType := uint16(archOpt[0])<<8 | uint16(archOpt[1])
 		switch archType {
-		case 7, 9: // UEFI x86-64
+		case 6, 7, 9, 16: // EFI IA32 / EFI x86-64 / UEFI HTTP boot x86-64
+			// 0x0010 (16) is "UEFI HTTP Boot x86-64" — OVMF with HTTP Boot sends
+			// this when its user-agent contains "HTTPClient:Arch:00016". These clients
+			// must receive an EFI binary (ipxe.efi), not a BIOS chainloader. Sending
+			// undionly.kpxe to an HTTP boot client causes silent chainload failure.
 			return "ipxe.efi"
-		case 6: // UEFI 32-bit
-			return "ipxe.efi"
-		case 10: // UEFI ARM64
+		case 10, 11: // EFI ARM 32-bit / EFI ARM 64-bit
 			return "ipxe.efi"
 		}
 	}

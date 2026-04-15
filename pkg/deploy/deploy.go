@@ -190,6 +190,10 @@ type Deployer interface {
 	// Finalize applies node-specific identity (hostname, network, SSH keys)
 	// to the freshly deployed filesystem rooted at mountRoot.
 	Finalize(ctx context.Context, cfg api.NodeConfig, mountRoot string) error
+
+	// ResolvedDisk returns the target disk path resolved by Preflight, e.g.
+	// /dev/sda or /dev/nvme0n1. Returns "" if Preflight has not been called.
+	ResolvedDisk() string
 }
 
 // runCmd executes a command and streams its output through the package logger.

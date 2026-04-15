@@ -29,6 +29,10 @@ type BlockDeployer struct {
 	targetDisk string
 }
 
+// ResolvedDisk returns the target disk path resolved by Preflight.
+// Returns "" if Preflight has not been called yet.
+func (d *BlockDeployer) ResolvedDisk() string { return d.targetDisk }
+
 // Preflight validates that a suitable target disk exists and resolves its path.
 func (d *BlockDeployer) Preflight(ctx context.Context, layout api.DiskLayout, hw hardware.SystemInfo) error {
 	target, err := selectTargetDisk(layout, hw)

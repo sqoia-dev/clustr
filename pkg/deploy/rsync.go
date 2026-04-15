@@ -32,6 +32,10 @@ type FilesystemDeployer struct {
 	targetDisk string
 }
 
+// ResolvedDisk returns the target disk path resolved by Preflight.
+// Returns "" if Preflight has not been called yet.
+func (d *FilesystemDeployer) ResolvedDisk() string { return d.targetDisk }
+
 // Preflight validates disk size and resolves the target disk.
 func (d *FilesystemDeployer) Preflight(ctx context.Context, layout api.DiskLayout, hw hardware.SystemInfo) error {
 	target, err := selectTargetDisk(layout, hw)

@@ -979,27 +979,77 @@ func runAutoDeployImage(ctx context.Context, c *client.Client, nodeCfg api.NodeC
 	deployLog.Info().Str("hostname", nodeCfg.Hostname).Msg("node configuration applied")
 	reporter.EndPhase("")
 
-	// ── EFI BootOrder: ensure PXE is first (UEFI images only) ────────────────
+	// ── EFI boot setup (UEFI images only) ────────────────────────────────────
 	// For BIOS images, there are no NVRAM EFI variables — efibootmgr is not
 	// applicable and calling it would produce a misleading warning. The PXE
 	// boot routing for BIOS nodes is controlled by DHCP/TFTP + iPXE exit alone.
 	if img.Firmware == "bios" {
 		deployLog.Info().Str("firmware", "bios").
-			Msg("EFI BootOrder: skipping SetPXEBootFirst — BIOS image has no EFI NVRAM")
+			Msg("EFI boot setup: skipping — BIOS image has no EFI NVRAM")
 	} else {
-		// After grub2-install runs inside the chroot during finalize, the firmware
-		// NVRAM BootOrder may promote the new OS entry to position 0. On the next
-		// reboot the node would boot straight to disk, bypassing clonr's PXE server.
-		// SetPXEBootFirst reorders BootOrder so the PXE entry is first and the OS
-		// entry is second.
-		efiCtx, efiCancel := context.WithTimeout(context.Background(), 15*time.Second)
-		if efiErr := deploy.SetPXEBootFirst(efiCtx); efiErr != nil {
-			deployLog.Warn().Err(efiErr).
-				Msg("EFI BootOrder: SetPXEBootFirst failed (non-fatal — BIOS system or no PXE entry in NVRAM)")
-		} else {
-			deployLog.Info().Msg("EFI BootOrder: PXE entry promoted to first position in NVRAM BootOrder")
+		// Step 1: Create the OS NVRAM boot entry pointing at grubx64.efi on the ESP.
+		//
+		// This step was previously missing in auto-deploy mode. Without it, OVMF/EDK2
+		// has no OS boot entry in NVRAM and falls through to network boot on every
+		// restart, making the deployment loop infinitely.
+		//
+		// FixEFIBoot calls `efibootmgr --create` which writes directly to
+		// /sys/firmware/efi/efivars on the running (UEFI-booted) initramfs host.
+		// efivarfs is available here because the deploy initramfs itself boots via
+		// UEFI — the firmware exposes efivars at /sys/firmware/efi/efivars and the
+		// initramfs kernel mounts efivarfs there automatically.
+		//
+		// efibootmgr does NOT run inside the nspawn chroot, so no bind mount of
+		// /sys/firmware/efi is needed — it runs directly on the host (initramfs).
+		targetDisk := deployer.ResolvedDisk()
+		if targetDisk == "" {
+			targetDisk = "/dev/sda" // safe fallback: single-disk nodes
 		}
-		efiCancel()
+		// Find the ESP partition number from the layout (1-indexed).
+		// Default to 1 — ESP is almost always the first partition on UEFI layouts.
+		espPartNum := 1
+		for i, p := range effectiveLayout.Partitions {
+			for _, flag := range p.Flags {
+				if flag == "esp" || flag == "boot" {
+					espPartNum = i + 1
+					break
+				}
+			}
+		}
+		label := img.Name
+		deployLog.Info().
+			Str("disk", targetDisk).
+			Int("esp_part", espPartNum).
+			Str("label", label).
+			Msg("EFI boot setup: creating NVRAM OS boot entry via efibootmgr")
+		efiBootCtx, efiBootCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if efiErr := deploy.FixEFIBoot(efiBootCtx, targetDisk, espPartNum, label, `\EFI\rocky\grubx64.efi`); efiErr != nil {
+			efiBootCancel()
+			// Fatal for UEFI deploys: without an NVRAM entry pointing to grubx64.efi,
+			// OVMF has no OS to boot and falls through to PXE on every restart,
+			// looping forever. The node cannot be left in this state.
+			return Wrap(ExitBootloader, "efi_boot_entry", fmt.Errorf("efibootmgr --create failed: %w", efiErr))
+		}
+		efiBootCancel()
+		deployLog.Info().Str("label", label).Msg("EFI boot setup: NVRAM OS boot entry created")
+
+		// Step 2: Reorder BootOrder so PXE is first (before the new OS entry).
+		//
+		// After FixEFIBoot creates the OS entry, it becomes the next boot target.
+		// We must put the PXE entry back at position 0 so that clonr's PXE server
+		// gets to route the next boot (confirming deploy-complete state before
+		// handing off to disk). The OS entry remains second: after the PXE server
+		// sees NodeStateDeployed it returns an iPXE `sanboot --drive 0x80` which
+		// explicitly boots disk, so boot order position 2 is never actually reached
+		// in normal operation.
+		efiOrderCtx, efiOrderCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if efiErr := deploy.SetPXEBootFirst(efiOrderCtx); efiErr != nil {
+			deployLog.Warn().Err(efiErr).
+				Msg("EFI boot setup: SetPXEBootFirst failed (non-fatal — PXE may not be in NVRAM yet)")
+		} else {
+			deployLog.Info().Msg("EFI boot setup: PXE entry promoted to first position in NVRAM BootOrder")
+		}
+		efiOrderCancel()
 	}
 	// ──────────────────────────────────────────────────────────────────────
 
