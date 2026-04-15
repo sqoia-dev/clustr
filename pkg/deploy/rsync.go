@@ -388,6 +388,35 @@ func (d *FilesystemDeployer) Deploy(ctx context.Context, opts DeployOpts, progre
 		opts.Reporter.EndPhase("")
 	}
 
+	// Debug: log ESP contents immediately after extract to confirm whether
+	// grubx64.efi landed on the mounted ESP or was skipped (empty directory stub).
+	espEFIDir := filepath.Join(opts.MountRoot, "boot", "efi", "EFI")
+	if entries, readErr := os.ReadDir(espEFIDir); readErr == nil {
+		var espNames []string
+		for _, e := range entries {
+			espNames = append(espNames, e.Name())
+		}
+		logger().Debug().Strs("esp_efi_dirs", espNames).
+			Str("path", espEFIDir).
+			Msg("post-extract ESP EFI/ contents (debug: verifying grubx64.efi landed on mounted partition)")
+	} else {
+		logger().Debug().Str("path", espEFIDir).Err(readErr).
+			Msg("post-extract ESP EFI/ dir not found — /boot/efi was likely not mounted (empty directory stub in rootfs)")
+	}
+	rockyEFIDir := filepath.Join(opts.MountRoot, "boot", "efi", "EFI", "rocky")
+	if entries, readErr := os.ReadDir(rockyEFIDir); readErr == nil {
+		var rockyNames []string
+		for _, e := range entries {
+			rockyNames = append(rockyNames, e.Name())
+		}
+		logger().Debug().Strs("esp_rocky_files", rockyNames).
+			Str("path", rockyEFIDir).
+			Msg("post-extract ESP EFI/rocky/ contents (debug: grubx64.efi should appear here)")
+	} else {
+		logger().Debug().Str("path", rockyEFIDir).
+			Msg("post-extract ESP EFI/rocky/ dir absent — ESP is empty, UEFI boot will fail without grubx64.efi install")
+	}
+
 	// Deployment succeeded — remove the rollback backup.
 	if rollbackPath != "" {
 		os.Remove(rollbackPath)

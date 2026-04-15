@@ -672,6 +672,77 @@ func installKernelInChroot(ctx context.Context, mountRoot, targetDisk string) er
 	return nil
 }
 
+// installEFIBootloaderInChroot installs grub2-efi-x64 and shim-x64 inside the
+// deployed chroot via dnf. This is required for UEFI images built from ISO where
+// the tar archive only contains empty /boot/efi/EFI/rocky/ stub directories —
+// the actual EFI binaries (grubx64.efi, shimx64.efi) live on the ESP partition
+// of the source system and are never included in the rootfs capture.
+//
+// After this function returns, /boot/efi/EFI/rocky/grubx64.efi will be present
+// on the mounted ESP so that FixEFIBoot's NVRAM entry can point to a real binary.
+func installEFIBootloaderInChroot(ctx context.Context, mountRoot string) error {
+	log := logger()
+
+	// Bind-mount virtual filesystems required by dnf/rpm scriptlets.
+	type bindMount struct{ src, dst string }
+	binds := []bindMount{
+		{"/proc", filepath.Join(mountRoot, "proc")},
+		{"/sys", filepath.Join(mountRoot, "sys")},
+		{"/dev", filepath.Join(mountRoot, "dev")},
+		{"/dev/pts", filepath.Join(mountRoot, "dev", "pts")},
+	}
+	for _, b := range binds {
+		if err := os.MkdirAll(b.dst, 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", b.dst, err)
+		}
+		if out, err := exec.CommandContext(ctx, "mount", "--bind", b.src, b.dst).CombinedOutput(); err != nil {
+			return fmt.Errorf("bind-mount %s → %s: %w\n%s", b.src, b.dst, err, string(out))
+		}
+	}
+	defer func() {
+		for i := len(binds) - 1; i >= 0; i-- {
+			_ = exec.Command("umount", "-l", binds[i].dst).Run()
+		}
+	}()
+
+	// Copy /etc/resolv.conf so dnf can reach package mirrors.
+	resolvDst := filepath.Join(mountRoot, "etc", "resolv.conf")
+	if data, err := os.ReadFile("/etc/resolv.conf"); err == nil {
+		_ = os.WriteFile(resolvDst, data, 0o644)
+	}
+
+	// Ensure /tmp is writable — required by dnf for its download cache.
+	if err := os.MkdirAll(filepath.Join(mountRoot, "tmp"), 0o1777); err != nil {
+		log.Warn().Err(err).Msg("finalize/boot: could not create /tmp in chroot (non-fatal)")
+	}
+
+	// Ensure the ESP mount point directory exists.
+	espDir := filepath.Join(mountRoot, "boot", "efi")
+	if err := os.MkdirAll(espDir, 0o700); err != nil {
+		log.Warn().Err(err).Str("path", espDir).Msg("finalize/boot: could not create /boot/efi in chroot (non-fatal)")
+	}
+
+	// Install grub2-efi-x64 and shim-x64. Their %post scriptlets run grub2-install
+	// or copy the EFI binary to /boot/efi/EFI/rocky/grubx64.efi. We also install
+	// grub2-efi-x64-modules so grub2-mkconfig can reference them.
+	// Only baseos and appstream are enabled — no external mirrors needed.
+	packages := []string{"grub2-efi-x64", "shim-x64", "grub2-efi-x64-modules"}
+	log.Info().Strs("packages", packages).Msg("finalize/boot: installing EFI bootloader packages via chroot dnf")
+	chrootDnfArgs := append([]string{
+		mountRoot, "dnf", "-y",
+		"--setopt=install_weak_deps=False",
+		"--disablerepo=*",
+		"--enablerepo=baseos",
+		"--enablerepo=appstream",
+		"install",
+	}, packages...)
+	if err := runAndLog(ctx, "chroot-dnf-efi-install", exec.CommandContext(ctx, "chroot", chrootDnfArgs...)); err != nil {
+		return fmt.Errorf("chroot dnf install grub2-efi-x64 shim-x64: %w", err)
+	}
+	log.Info().Msg("finalize/boot: EFI bootloader packages installed")
+	return nil
+}
+
 // applyBootConfig performs the post-install steps required to produce a bootable
 // deployed filesystem. It must be called after grub2-install has written the
 // bootloader to the MBR/bios-boot partition and after the full tar extraction is
@@ -691,6 +762,64 @@ func installKernelInChroot(ctx context.Context, mountRoot, targetDisk string) er
 // partDevs must be in the same order as layout.Partitions (index i → device i+1).
 func applyBootConfig(ctx context.Context, mountRoot, targetDisk string, layout api.DiskLayout, partDevs []string) error {
 	log := logger()
+
+	// ── 0. UEFI EFI binary install (UEFI layouts only) ──────────────────────
+	// Rocky Linux ISO-based images are captured from a rootfs where /boot/efi is
+	// a mount point stub. The actual EFI binaries (grubx64.efi, shimx64.efi) live
+	// on the ESP partition — they are never in the rootfs tar archive. When we
+	// partition fresh and format a new ESP, the partition is empty. OVMF then
+	// creates a valid NVRAM entry via FixEFIBoot pointing at \EFI\rocky\grubx64.efi,
+	// finds nothing on the ESP, and falls back to the boot picker.
+	//
+	// Fix: if this layout has an ESP (firmware=uefi) and grubx64.efi is absent
+	// from the mounted ESP, install grub2-efi-x64 and shim-x64 inside the chroot
+	// so their %post scriptlets populate /boot/efi/EFI/rocky/.
+	hasESP := false
+	for _, p := range layout.Partitions {
+		for _, flag := range p.Flags {
+			if flag == "esp" || flag == "boot" {
+				hasESP = true
+				break
+			}
+		}
+	}
+	hasBIOSGrubPartition := false
+	for _, p := range layout.Partitions {
+		for _, flag := range p.Flags {
+			if flag == "bios_grub" || flag == "biosboot" {
+				hasBIOSGrubPartition = true
+				break
+			}
+		}
+	}
+	isUEFI := hasESP && !hasBIOSGrubPartition
+	if isUEFI {
+		grubx64Path := filepath.Join(mountRoot, "boot", "efi", "EFI", "rocky", "grubx64.efi")
+		if _, err := os.Stat(grubx64Path); os.IsNotExist(err) {
+			log.Warn().Str("path", grubx64Path).
+				Msg("finalize/boot: grubx64.efi missing from ESP — ESP was empty after extract; installing grub2-efi-x64 + shim-x64 via dnf in chroot")
+			if err := installEFIBootloaderInChroot(ctx, mountRoot); err != nil {
+				// Fatal: without grubx64.efi on the ESP, OVMF cannot boot the OS.
+				return fmt.Errorf("finalize/boot: EFI bootloader install: %w", err)
+			}
+			// Log what is now on the ESP.
+			espDir := filepath.Join(mountRoot, "boot", "efi", "EFI")
+			if entries, readErr := os.ReadDir(espDir); readErr == nil {
+				var names []string
+				for _, e := range entries {
+					names = append(names, e.Name())
+				}
+				log.Info().Strs("esp_efi_dirs", names).Msg("finalize/boot: ESP EFI/ contents after grub2-efi install")
+			}
+			// Verify grubx64.efi actually landed.
+			if _, err := os.Stat(grubx64Path); os.IsNotExist(err) {
+				return fmt.Errorf("finalize/boot: grubx64.efi still absent after grub2-efi-x64 install — dnf scriptlet may have failed")
+			}
+			log.Info().Str("path", grubx64Path).Msg("finalize/boot: grubx64.efi installed on ESP")
+		} else {
+			log.Info().Str("path", grubx64Path).Msg("finalize/boot: grubx64.efi already present on ESP — skipping dnf install")
+		}
+	}
 
 	// ── 1. grub2-mkconfig ────────────────────────────────────────────────────
 	// grub2-mkconfig probes /proc and /sys for bootable kernels — it must run
