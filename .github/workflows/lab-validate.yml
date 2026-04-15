@@ -1,0 +1,118 @@
+# lab-validate.yml — Proxmox lab validation gate
+#
+# INTENTIONALLY workflow_dispatch ONLY.
+#
+# Do NOT add `on: push` or `on: tag` until ADR-0009's UEFI refactor lands and
+# VM201/VM202 UEFI boot path is confirmed green. Adding tag triggers before that
+# would make every release tag immediately red due to the known UEFI NVRAM issue
+# from Sprint 2. Enable on-tag once the UEFI path is verified across 3 consecutive
+# lab runs. See docs/adr/0009-content-only-images.md and validation-strategy.md.
+#
+# When enabled on tags, the release.yml workflow must add:
+#   needs: [lab-validate]
+# to block tag publication on lab gate failure.
+
+name: lab-validate
+
+on:
+  workflow_dispatch:
+    inputs:
+      boot_timeout:
+        description: "Seconds to wait per VM for login prompt"
+        required: false
+        default: "300"
+      vm_ids:
+        description: "Comma-separated VMIDs to test (default: 201,202,206,207)"
+        required: false
+        default: "201,202,206,207"
+
+jobs:
+  lab-validate:
+    name: Proxmox Lab Validation Gate
+    # Switch to a self-hosted runner once one is provisioned on the Proxmox host.
+    # Until then this job uses SSH from GitHub-hosted runners to reach the lab.
+    # Self-hosted is cleaner (no NAT/tunnel needed) but SSH-from-GitHub is faster
+    # to stand up and avoids runner registration overhead for a lab that isn't
+    # internet-accessible by default.
+    #
+    # To switch: replace `runs-on: ubuntu-22.04` with `runs-on: [self-hosted, proxmox-lab]`
+    # and remove the SSH tunnel setup step below.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build clonr-serverd
+        run: |
+          GOTOOLCHAIN=auto CGO_ENABLED=0 go build -o /tmp/clonr-serverd ./cmd/clonr-serverd
+
+      - name: Install SSH keys
+        env:
+          PROXMOX_SSH_KEY_B64: ${{ secrets.LAB_PROXMOX_SSH_KEY_B64 }}
+          LAB_SERVER_SSH_KEY_B64: ${{ secrets.LAB_SERVER_SSH_KEY_B64 }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$PROXMOX_SSH_KEY_B64" | base64 -d > ~/.ssh/proxmox_key
+          echo "$LAB_SERVER_SSH_KEY_B64" | base64 -d > ~/.ssh/lab_server_key
+          chmod 0600 ~/.ssh/proxmox_key ~/.ssh/lab_server_key
+          # Add Proxmox and lab server to known_hosts to avoid interactive prompt
+          ssh-keyscan -H ${{ secrets.LAB_PROXMOX_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -H ${{ secrets.LAB_SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Run lab validation
+        env:
+          CLONR_SERVER_URL: ${{ secrets.LAB_CLONR_SERVER_URL }}
+          CLONR_ADMIN_KEY: ${{ secrets.LAB_CLONR_ADMIN_KEY }}
+          PROXMOX_HOST: ${{ secrets.LAB_PROXMOX_HOST }}
+          PROXMOX_SSH_KEY: ~/.ssh/proxmox_key
+          LAB_SSH_KEY: ~/.ssh/lab_server_key
+          LAB_SERVER_IP: ${{ secrets.LAB_SERVER_IP }}
+          ARTIFACT_DIR: /tmp/lab-validate-artifacts
+          BOOT_TIMEOUT: ${{ github.event.inputs.boot_timeout || '300' }}
+        run: |
+          chmod +x scripts/ci/lab-validate.sh
+          # Override VM_IDS if specified
+          export VM_IDS_INPUT="${{ github.event.inputs.vm_ids || '201,202,206,207' }}"
+          # Convert comma-separated to bash array format expected by the script
+          export OVERRIDE_VM_IDS="$VM_IDS_INPUT"
+          bash scripts/ci/lab-validate.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lab-validate-artifacts-${{ github.run_id }}
+          path: /tmp/lab-validate-artifacts/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Post summary
+        if: always()
+        run: |
+          echo "## Lab Validation Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f /tmp/lab-validate-artifacts/timings.json ]; then
+            echo "### Boot Timings" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat /tmp/lab-validate-artifacts/timings.json >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Serial Console Captures" >> $GITHUB_STEP_SUMMARY
+          for vmid in 201 202 206 207; do
+            if [ -f "/tmp/lab-validate-artifacts/serial-vm${vmid}.log" ]; then
+              lines=$(wc -l < "/tmp/lab-validate-artifacts/serial-vm${vmid}.log")
+              login_found=$(grep -c 'login:' "/tmp/lab-validate-artifacts/serial-vm${vmid}.log" 2>/dev/null || echo 0)
+              echo "- VM${vmid}: ${lines} lines captured, login prompt: $([ "$login_found" -gt 0 ] && echo 'YES' || echo 'NO')" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- VM${vmid}: no serial capture" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
