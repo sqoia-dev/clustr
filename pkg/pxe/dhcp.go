@@ -220,11 +220,17 @@ func bootFilename(req *dhcpv4.DHCPv4, isIPXE bool, serverIP net.IP, httpPort str
 	if len(archOpt) >= 2 {
 		archType := uint16(archOpt[0])<<8 | uint16(archOpt[1])
 		switch archType {
-		case 6, 7, 9, 16: // EFI IA32 / EFI x86-64 / UEFI HTTP boot x86-64
-			// 0x0010 (16) is "UEFI HTTP Boot x86-64" — OVMF with HTTP Boot sends
-			// this when its user-agent contains "HTTPClient:Arch:00016". These clients
-			// must receive an EFI binary (ipxe.efi), not a BIOS chainloader. Sending
-			// undionly.kpxe to an HTTP boot client causes silent chainload failure.
+		case 16: // UEFI HTTP boot x86-64 (HTTPClient:Arch:00016)
+			// For HTTP boot clients, the boot file must be a full HTTP URL, not a
+			// bare filename. OVMF with HTTP Boot enabled treats Option 67 as a URL
+			// when the vendor class is "HTTPClient". Sending just "ipxe.efi" causes
+			// the firmware to attempt a TFTP transfer (or silently fail) because it
+			// looks like a TFTP path, not an HTTP URL. The full URL causes OVMF to
+			// fetch ipxe.efi over HTTP, which then chainloads into iPXE.
+			return fmt.Sprintf("http://%s:%s/api/v1/boot/ipxe.efi", serverIP, httpPort)
+		case 6, 7, 9: // EFI IA32 / EFI x86-64 (standard TFTP-based PXE)
+			// Standard UEFI PXE clients use TFTP. Return the bare filename;
+			// the TFTP server serves it from the tftpboot directory.
 			return "ipxe.efi"
 		case 10, 11: // EFI ARM 32-bit / EFI ARM 64-bit
 			return "ipxe.efi"

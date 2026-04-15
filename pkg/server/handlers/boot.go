@@ -1,13 +1,16 @@
 package handlers
 
 import (
+	"bytes"
 	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/rs/zerolog/log"
 	"github.com/sqoia-dev/clonr/pkg/api"
+	"github.com/sqoia-dev/clonr/pkg/bootassets"
 	"github.com/sqoia-dev/clonr/pkg/db"
 	"github.com/sqoia-dev/clonr/pkg/pxe"
 )
@@ -149,8 +152,19 @@ func (h *BootHandler) ServeInitramfs(w http.ResponseWriter, r *http.Request) {
 }
 
 // ServeIPXEEFI handles GET /api/v1/boot/ipxe.efi.
+//
+// Serves the embedded iPXE UEFI binary (x86-64) to OVMF/UEFI HTTP boot clients.
+// This is the chainloader that UEFI HTTP boot downloads before executing the
+// clonr boot script. It is intentionally served from an embedded binary so that
+// the route works out-of-the-box without any on-disk file placement — the UEFI
+// HTTP boot client hits 404 and loops forever if this route returns an error.
+//
+// The embedded binary takes precedence. A future operator override could be
+// added by checking for an on-disk file in TFTPDir first, but for now the
+// embedded binary is canonical and sufficient for x86-64 UEFI HTTP boot.
 func (h *BootHandler) ServeIPXEEFI(w http.ResponseWriter, r *http.Request) {
-	h.serveFile(w, r, filepath.Join(h.TFTPDir, "ipxe.efi"), "application/octet-stream")
+	w.Header().Set("Content-Type", "application/efi")
+	http.ServeContent(w, r, "ipxe.efi", time.Time{}, bytes.NewReader(bootassets.IPXEEFI))
 }
 
 // ServeUndionlyKPXE handles GET /api/v1/boot/undionly.kpxe.
