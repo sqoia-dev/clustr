@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/sqoia-dev/clonr/pkg/image/isoinstaller"
@@ -141,6 +142,43 @@ func TestExtractViaSubprocess_MissingBinary(t *testing.T) {
 		t.Fatal("expected error from ExtractViaSubprocess with nonexistent disk, got nil")
 	}
 	t.Logf("got expected error: %v", err)
+}
+
+// TestContentOnlyExcludes_Coverage verifies that ContentOnlyExcludes() is
+// non-empty and contains each of the critical layout-specific paths that
+// must be absent from a content-only image (ADR-0009).  Static check — no
+// filesystem operations required.
+func TestContentOnlyExcludes_Coverage(t *testing.T) {
+	excl := isoinstaller.ContentOnlyExcludes()
+	if len(excl) == 0 {
+		t.Fatal("ContentOnlyExcludes is empty — no layout paths will be excluded")
+	}
+
+	// Each entry must begin with "--exclude=" (rsync flag form).
+	for i, e := range excl {
+		if len(e) < len("--exclude=") || e[:len("--exclude=")] != "--exclude=" {
+			t.Errorf("entry %d %q does not start with --exclude=", i, e)
+		}
+	}
+
+	// Critical paths that ADR-0009 mandates must be excluded.
+	criticalPatterns := []string{
+		"/etc/fstab",
+		"/etc/machine-id",
+		"/var/lib/dbus/machine-id",
+		"/boot/loader/entries/*.conf",
+		"/boot/grub2/grub.cfg",
+		"/boot/grub2/grubenv",
+		"/boot/grub2/i386-pc/**",
+		"/boot/grub2/x86_64-efi/**",
+		"/boot/efi/EFI/BOOT/**",
+	}
+	joined := strings.Join(excl, "\n")
+	for _, pat := range criticalPatterns {
+		if !strings.Contains(joined, pat) {
+			t.Errorf("critical exclude pattern missing: %s", pat)
+		}
+	}
 }
 
 // TestExtractTarOutput exercises rsyncExtracted indirectly by verifying that
