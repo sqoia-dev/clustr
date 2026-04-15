@@ -92,11 +92,11 @@
             border: 1px solid var(--border);
             border-radius: var(--radius-sm);
             font-size: 13px;
-            font-family: var(--font-mono);
             background: var(--bg-input);
             color: var(--text-primary);
             outline: none;
             transition: border-color var(--transition);
+            box-sizing: border-box;
         }
 
         .login-field input:focus {
@@ -141,18 +141,30 @@
 
     <div class="login-card">
         <div class="login-title">Sign in</div>
-        <div class="login-sub">Enter your admin API key to access the dashboard.</div>
+        <div class="login-sub">Enter your username and password to access the dashboard.</div>
 
-        <form id="login-form" autocomplete="off">
+        <form id="login-form" autocomplete="on">
             <div class="login-field">
-                <label for="api-key">Admin API key</label>
+                <label for="username">Username</label>
                 <input
-                    id="api-key"
-                    type="password"
-                    placeholder="clonr-admin-…"
-                    autocomplete="current-password"
+                    id="username"
+                    type="text"
+                    placeholder="clonr"
+                    autocomplete="username"
                     spellcheck="false"
                     autofocus
+                    required
+                >
+            </div>
+
+            <div class="login-field">
+                <label for="password">Password</label>
+                <input
+                    id="password"
+                    type="password"
+                    placeholder="••••••••"
+                    autocomplete="current-password"
+                    required
                 >
             </div>
 

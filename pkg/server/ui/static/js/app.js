@@ -214,6 +214,14 @@ function badge(status) {
 }
 
 function nodeBadge(node) {
+    // ADR-0008: two-phase deploy states. Check the new fields directly in addition
+    // to the legacy _deployStatus shorthand computed from last_deploy_succeeded_at.
+    if (node.deploy_verified_booted_at)
+        return `<span class="badge badge-deployed" title="OS phoned home — bootloader, kernel, and systemd confirmed">Verified</span>`;
+    if (node.deploy_verify_timeout_at)
+        return `<span class="badge badge-error" title="OS never phoned home within verify timeout. Possible bootloader or kernel failure.">Verify Timeout</span>`;
+    if (node.deploy_completed_preboot_at && !node.last_deploy_succeeded_at)
+        return `<span class="badge badge-warning" title="clonr-static completed successfully. Waiting for OS boot confirmation.">Deploy Unverified</span>`;
     if (node._deployStatus === 'success') return `<span class="badge badge-deployed">Deployed</span>`;
     if (node._deployStatus === 'error')   return `<span class="badge badge-error">Failed</span>`;
     if (node.base_image_id)               return `<span class="badge badge-info">Configured</span>`;
@@ -2838,6 +2846,21 @@ const Pages = {
 
                 <!-- Overview tab — inline editable -->
                 <div id="tab-overview" class="tab-panel active">
+                    ${node.deploy_verify_timeout_at ? `
+                    <div class="alert alert-error" style="margin-bottom:12px">
+                        <strong>Verification timeout.</strong>
+                        Deploy succeeded pre-boot but the OS never phoned home
+                        (timeout at ${fmtDate(node.deploy_verify_timeout_at)}).
+                        Node may not be bootable — possible causes: bootloader failure, kernel panic,
+                        network misconfiguration, or <code>/etc/clonr/node-token</code> not written correctly.
+                        Attach serial console to investigate or <button class="btn btn-secondary btn-sm" style="margin-left:4px" onclick="Pages._nodeActionsTriggerReimage('${node.id}', '${escHtml(displayName)}')">Re-deploy</button>
+                    </div>` : ''}
+                    ${(node.deploy_completed_preboot_at && !node.deploy_verified_booted_at && !node.deploy_verify_timeout_at) ? `
+                    <div class="alert alert-warning" style="margin-bottom:12px">
+                        <strong>Awaiting boot confirmation.</strong>
+                        This node has not confirmed boot. clonr-static completed successfully, but the OS has not phoned home yet.
+                        Attach serial console to verify if the deploy is stalled.
+                    </div>` : ''}
                     <div id="tab-save-bar-overview" class="tab-save-bar" style="display:none">
                         <span class="save-status modified" id="tab-save-status-overview">Unsaved changes</span>
                         <button class="btn btn-secondary btn-sm" onclick="Pages._tabRevert('overview')" id="tab-revert-overview">Revert</button>
@@ -2908,6 +2931,10 @@ const Pages = {
                                 </div></div>
                                 <div class="kv-item"><div class="kv-key">Last Deploy OK</div><div class="kv-value">${node.last_deploy_succeeded_at ? fmtDate(node.last_deploy_succeeded_at) : '—'}</div></div>
                                 <div class="kv-item"><div class="kv-key">Last Deploy Failed</div><div class="kv-value">${node.last_deploy_failed_at ? fmtDate(node.last_deploy_failed_at) : '—'}</div></div>
+                                <div class="kv-item"><div class="kv-key">Deploy Complete (pre-boot)</div><div class="kv-value" title="Set when clonr-static finishes in the PXE initramfs. Proves rootfs written; not that OS boots.">${node.deploy_completed_preboot_at ? fmtRelative(node.deploy_completed_preboot_at) : '—'}</div></div>
+                                <div class="kv-item"><div class="kv-key">Boot Verified</div><div class="kv-value" title="Set when the deployed OS phones home post-boot. Proves bootloader, kernel, and systemd all started.">${node.deploy_verified_booted_at ? fmtRelative(node.deploy_verified_booted_at) : (node.deploy_completed_preboot_at ? '<span class="badge badge-warning">Pending</span>' : '—')}</div></div>
+                                ${node.deploy_verify_timeout_at ? `<div class="kv-item" style="grid-column:1/-1"><div class="kv-key">Verify Timeout</div><div class="kv-value text-danger">${fmtDate(node.deploy_verify_timeout_at)}</div></div>` : ''}
+                                ${node.last_seen_at ? `<div class="kv-item"><div class="kv-key">Last Seen</div><div class="kv-value">${fmtRelative(node.last_seen_at)}</div></div>` : ''}
                                 <div class="kv-item"><div class="kv-key">Created</div><div class="kv-value">${fmtDate(node.created_at)}</div></div>
                                 <div class="kv-item"><div class="kv-key">Updated</div><div class="kv-value">${fmtDate(node.updated_at)}</div></div>
                             </div>
@@ -6524,16 +6551,21 @@ const Pages = {
 
     async _settingsRender(tab) {
         Pages._settingsTab = tab;
-        const tabs = ['api-keys', 'server-info', 'about'];
+        const isAdmin = Auth._role === 'admin';
+        const tabs = isAdmin
+            ? ['api-keys', 'users', 'server-info', 'about']
+            : ['api-keys', 'server-info', 'about'];
         const tabBar = tabs.map(t => {
             const active = t === tab ? 'style="border-bottom:2px solid var(--accent);color:var(--accent);"' : '';
-            const label  = { 'api-keys': 'API Keys', 'server-info': 'Server Info', 'about': 'About' }[t];
+            const label  = { 'api-keys': 'API Keys', 'users': 'Users', 'server-info': 'Server Info', 'about': 'About' }[t];
             return `<button class="btn btn-ghost" ${active} onclick="Pages._settingsRender('${t}')">${label}</button>`;
         }).join('');
 
         let body = loading('Loading…');
         if (tab === 'api-keys') {
             body = await Pages._settingsAPIKeysTab();
+        } else if (tab === 'users') {
+            body = await Pages._settingsUsersTab();
         } else if (tab === 'server-info') {
             body = `<div class="card"><div class="card-header"><span class="card-title">Server Info</span></div><p class="text-secondary" style="padding:16px">Server information will appear here in a future update.</p></div>`;
         } else {
@@ -6602,6 +6634,165 @@ const Pages = {
                 </div>`;
         } catch (err) {
             return alertBox('Failed to load API keys: ' + err.message);
+        }
+    },
+
+    // ── Users tab ────────────────────────────────────────────────────────────
+
+    async _settingsUsersTab() {
+        try {
+            const resp = await API.users.list();
+            const users = (resp && resp.users) ? resp.users : [];
+
+            const adminCount = users.filter(u => u.role === 'admin' && !u.disabled).length;
+
+            const rows = users.length === 0
+                ? `<tr><td colspan="6" style="text-align:center;color:var(--text-secondary);padding:24px">No users</td></tr>`
+                : users.map(u => {
+                    const roleBadge = u.role === 'admin'
+                        ? `<span class="badge badge-info">admin</span>`
+                        : u.role === 'operator'
+                            ? `<span class="badge badge-neutral">operator</span>`
+                            : `<span class="badge" style="background:var(--bg-secondary);color:var(--text-secondary)">readonly</span>`;
+                    const disabledBadge = u.disabled ? `<span class="badge" style="background:#fee2e2;color:#dc2626;margin-left:4px">disabled</span>` : '';
+                    const lastLogin = u.last_login_at ? fmtRelative(u.last_login_at) : '<span class="text-dim">never</span>';
+                    const mustChange = u.must_change_password ? '<span title="Must change password" style="color:var(--warning)">&#9888;</span>' : '';
+                    // Disable delete/disable for the last admin.
+                    const isLastAdmin = u.role === 'admin' && !u.disabled && adminCount <= 1;
+                    const actionDisabled = isLastAdmin ? 'disabled title="Cannot disable/delete the last admin"' : '';
+                    return `<tr>
+                        <td>${escHtml(u.username)} ${mustChange}</td>
+                        <td>${roleBadge}${disabledBadge}</td>
+                        <td class="text-sm text-secondary">${fmtDate(u.created_at)}</td>
+                        <td class="text-sm text-secondary">${lastLogin}</td>
+                        <td>
+                            <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                                <button class="btn btn-secondary btn-sm" onclick="Pages._settingsResetUserPassword('${u.id}')">Reset PW</button>
+                                <button class="btn btn-secondary btn-sm" onclick="Pages._settingsChangeUserRole('${u.id}','${u.role}')">Role</button>
+                                <button class="btn btn-danger btn-sm" onclick="Pages._settingsDisableUser('${u.id}','${escHtml(u.username)}')" ${!u.disabled ? actionDisabled : 'disabled title="Already disabled"'}>${u.disabled ? 'Disabled' : 'Disable'}</button>
+                            </div>
+                        </td>
+                    </tr>`;
+                }).join('');
+
+            return `
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Users</span>
+                        <button class="btn btn-primary btn-sm" onclick="Pages._settingsCreateUserModal()">+ Create User</button>
+                    </div>
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Username</th><th>Role</th><th>Created</th><th>Last Login</th><th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>`;
+        } catch (err) {
+            return alertBox('Failed to load users: ' + err.message);
+        }
+    },
+
+    _settingsCreateUserModal() {
+        const modal = document.createElement('div');
+        modal.id = 'create-user-modal';
+        modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:1000;';
+        modal.innerHTML = `
+            <div class="card" style="width:480px;max-width:95vw;">
+                <div class="card-header">
+                    <span class="card-title">Create User</span>
+                    <button class="btn btn-ghost btn-sm" onclick="document.getElementById('create-user-modal').remove()">×</button>
+                </div>
+                <div style="padding:16px;display:flex;flex-direction:column;gap:12px;">
+                    <label class="form-label">Username
+                        <input id="cum-username" class="form-input" type="text" placeholder="alice" style="margin-top:4px;">
+                    </label>
+                    <label class="form-label">Password (min 8 chars)
+                        <input id="cum-password" class="form-input" type="password" style="margin-top:4px;">
+                    </label>
+                    <label class="form-label">Role
+                        <select id="cum-role" class="form-input" style="margin-top:4px;">
+                            <option value="admin">admin — full access</option>
+                            <option value="operator" selected>operator — nodes/deploys, no user management</option>
+                            <option value="readonly">readonly — read-only access</option>
+                        </select>
+                    </label>
+                    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;">
+                        <button class="btn btn-secondary" onclick="document.getElementById('create-user-modal').remove()">Cancel</button>
+                        <button class="btn btn-primary" onclick="Pages._settingsCreateUserSubmit()">Create</button>
+                    </div>
+                </div>
+            </div>`;
+        document.body.appendChild(modal);
+    },
+
+    async _settingsCreateUserSubmit() {
+        const username = document.getElementById('cum-username').value.trim();
+        const password = document.getElementById('cum-password').value;
+        const role     = document.getElementById('cum-role').value;
+
+        if (!username || !password) {
+            App.toast('Username and password are required', 'error');
+            return;
+        }
+        if (password.length < 8) {
+            App.toast('Password must be at least 8 characters', 'error');
+            return;
+        }
+
+        try {
+            await API.users.create({ username, password, role });
+            document.getElementById('create-user-modal').remove();
+            App.toast('User created', 'success');
+            Pages._settingsRender('users');
+        } catch (err) {
+            App.toast('Create failed: ' + err.message, 'error');
+        }
+    },
+
+    async _settingsResetUserPassword(id) {
+        const pw = prompt('Enter a temporary password for this user (min 8 chars):');
+        if (!pw) return;
+        if (pw.length < 8) {
+            App.toast('Password must be at least 8 characters', 'error');
+            return;
+        }
+        try {
+            await API.users.resetPassword(id, pw);
+            App.toast('Password reset — user must change on next login', 'success');
+        } catch (err) {
+            App.toast('Reset failed: ' + err.message, 'error');
+        }
+    },
+
+    async _settingsChangeUserRole(id, currentRole) {
+        const roles = ['admin', 'operator', 'readonly'];
+        const next = roles.filter(r => r !== currentRole);
+        const choice = prompt(`Change role (current: ${currentRole}). Enter new role:\n  ${next.join(', ')}`);
+        if (!choice) return;
+        if (!roles.includes(choice.trim())) {
+            App.toast('Invalid role. Must be admin, operator, or readonly.', 'error');
+            return;
+        }
+        try {
+            await API.users.update(id, { role: choice.trim() });
+            App.toast('Role updated', 'success');
+            Pages._settingsRender('users');
+        } catch (err) {
+            App.toast('Update failed: ' + err.message, 'error');
+        }
+    },
+
+    async _settingsDisableUser(id, username) {
+        if (!confirm(`Disable user "${username}"? They will not be able to log in.`)) return;
+        try {
+            await API.users.update(id, { disabled: true });
+            App.toast('User disabled', 'success');
+            Pages._settingsRender('users');
+        } catch (err) {
+            App.toast('Disable failed: ' + err.message, 'error');
         }
     },
 
@@ -6814,9 +7005,14 @@ const Auth = {
     },
 
     // boot verifies the session via GET /api/v1/auth/me.
-    // Valid session → start the app.
+    // Valid session → start the app (unless force-password-change is set).
     // No session / expired → redirect to /login.
     async boot() {
+        // If the server flagged a forced password change, redirect immediately.
+        if (document.cookie.split(';').some(c => c.trim().startsWith('clonr_force_password_change='))) {
+            window.location.href = '/set-password';
+            return;
+        }
         try {
             const resp = await fetch('/api/v1/auth/me', {
                 credentials: 'same-origin',
@@ -6825,11 +7021,16 @@ const Auth = {
                 window.location.href = '/login';
                 return;
             }
+            // Also check the response — if the session is key-based, role may be missing.
+            const me = await resp.json().catch(() => ({}));
+            Auth._role = me.role || 'admin';
         } catch (_) {
             // Network error — still try to start the app; api.js will redirect on 401.
         }
         App.init();
     },
+
+    _role: 'admin', // cached role from /auth/me, used for UI gating
 };
 
 // ─── Boot ─────────────────────────────────────────────────────────────────

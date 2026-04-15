@@ -226,6 +226,14 @@ func runServer(cmd *cobra.Command, args []string) error {
 			Msg("PXE server enabled")
 	}
 
+	// Bootstrap first-run user account (ADR-0007). Must run before BootstrapAdminKey
+	// so the UI flow (username+password) is set up even on brand-new installs.
+	if !cfg.AuthDevMode {
+		if err := server.BootstrapDefaultUser(ctx, database); err != nil {
+			return fmt.Errorf("failed to bootstrap default user: %w", err)
+		}
+	}
+
 	// Bootstrap initial admin API key if none exists.
 	// Prints the raw key to stdout ONCE — operator must capture it.
 	if !cfg.AuthDevMode {

@@ -456,10 +456,14 @@ func nullableString(s string) interface{} {
 
 // nodeConfigCols is the canonical SELECT column list for node_configs.
 // Update this constant whenever columns are added or removed.
+// ADR-0008: deploy_completed_preboot_at, deploy_verified_booted_at,
+//           deploy_verify_timeout_at, and last_seen_at added in migration 022.
 const nodeConfigCols = `id, hostname, hostname_auto, fqdn, primary_mac, interfaces, ssh_keys, kernel_args,
 	       groups, custom_vars, base_image_id, hardware_profile, bmc_config, ib_config,
 	       power_provider, reimage_pending, last_deploy_succeeded_at, last_deploy_failed_at,
-	       created_at, updated_at, group_id, disk_layout_override, extra_mounts`
+	       created_at, updated_at, group_id, disk_layout_override, extra_mounts,
+	       deploy_completed_preboot_at, deploy_verified_booted_at,
+	       deploy_verify_timeout_at, last_seen_at`
 
 // GetNodeConfig retrieves a NodeConfig by its UUID.
 func (db *DB) GetNodeConfig(ctx context.Context, id string) (api.NodeConfig, error) {
@@ -591,20 +595,101 @@ func (db *DB) SetReimagePending(ctx context.Context, nodeID string, pending bool
 	return requireOneRow(res, "node_configs", nodeID)
 }
 
-// RecordDeploySucceeded marks a node's last deployment as successful.
-// Sets last_deploy_succeeded_at = now() and clears reimage_pending.
-// Called by the deploy-complete HTTP callback from the node after finalize.
+// RecordDeploySucceeded marks a node's last deployment as pre-boot successful.
+// ADR-0008: Sets deploy_completed_preboot_at = now() (the canonical new field) and
+// also dual-writes last_deploy_succeeded_at for back-compat (removed in v1.0).
+// Also clears all ADR-0008 verification fields from any prior deploy cycle so the
+// node enters the deployed_preboot state cleanly.
+// Clears reimage_pending. Called by the deploy-complete callback from the
+// pre-reboot PXE initramfs — NOT from the deployed OS itself.
 func (db *DB) RecordDeploySucceeded(ctx context.Context, nodeID string) error {
 	now := time.Now().Unix()
 	res, err := db.sql.ExecContext(ctx, `
 		UPDATE node_configs
-		SET last_deploy_succeeded_at = ?, reimage_pending = 0, updated_at = ?
+		SET last_deploy_succeeded_at      = ?,
+		    deploy_completed_preboot_at   = ?,
+		    deploy_verified_booted_at     = NULL,
+		    deploy_verify_timeout_at      = NULL,
+		    reimage_pending               = 0,
+		    updated_at                    = ?
 		WHERE id = ?
-	`, now, now, nodeID)
+	`, now, now, now, nodeID)
 	if err != nil {
 		return fmt.Errorf("db: record deploy succeeded: %w", err)
 	}
 	return requireOneRow(res, "node_configs", nodeID)
+}
+
+// RecordVerifyBooted marks a node as verified-booted after the deployed OS phones
+// home via POST /api/v1/nodes/{id}/verify-boot. ADR-0008.
+//
+// Sets deploy_verified_booted_at = now() only if it is not already set (idempotent
+// on first call — subsequent boots only update last_seen_at).
+// Always updates last_seen_at = now() (heartbeat semantic).
+func (db *DB) RecordVerifyBooted(ctx context.Context, nodeID string) error {
+	now := time.Now().Unix()
+	res, err := db.sql.ExecContext(ctx, `
+		UPDATE node_configs
+		SET deploy_verified_booted_at = CASE
+		        WHEN deploy_verified_booted_at IS NULL THEN ?
+		        ELSE deploy_verified_booted_at
+		    END,
+		    last_seen_at = ?,
+		    updated_at   = ?
+		WHERE id = ?
+	`, now, now, now, nodeID)
+	if err != nil {
+		return fmt.Errorf("db: record verify booted: %w", err)
+	}
+	return requireOneRow(res, "node_configs", nodeID)
+}
+
+// RecordVerifyTimeout sets deploy_verify_timeout_at = now() for nodes that did
+// not phone home within CLONR_VERIFY_TIMEOUT after deploy_completed_preboot_at.
+// Called by the background scanner goroutine. ADR-0008.
+func (db *DB) RecordVerifyTimeout(ctx context.Context, nodeID string) error {
+	now := time.Now().Unix()
+	res, err := db.sql.ExecContext(ctx, `
+		UPDATE node_configs
+		SET deploy_verify_timeout_at = ?,
+		    updated_at               = ?
+		WHERE id = ?
+	`, now, now, nodeID)
+	if err != nil {
+		return fmt.Errorf("db: record verify timeout: %w", err)
+	}
+	return requireOneRow(res, "node_configs", nodeID)
+}
+
+// ListNodesAwaitingVerification returns all nodes that are in deployed_preboot
+// state (deploy_completed_preboot_at IS NOT NULL, deploy_verified_booted_at IS NULL,
+// deploy_verify_timeout_at IS NULL) AND whose deploy_completed_preboot_at is
+// older than the given cutoff time. Used by the background scanner. ADR-0008.
+func (db *DB) ListNodesAwaitingVerification(ctx context.Context, olderThan time.Time) ([]api.NodeConfig, error) {
+	rows, err := db.sql.QueryContext(ctx,
+		`SELECT `+nodeConfigCols+` FROM node_configs
+		 WHERE deploy_completed_preboot_at IS NOT NULL
+		   AND deploy_verified_booted_at IS NULL
+		   AND deploy_verify_timeout_at IS NULL
+		   AND reimage_pending = 0
+		   AND deploy_completed_preboot_at <= ?
+		 ORDER BY deploy_completed_preboot_at ASC`,
+		olderThan.Unix(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("db: list nodes awaiting verification: %w", err)
+	}
+	defer rows.Close()
+
+	var cfgs []api.NodeConfig
+	for rows.Next() {
+		cfg, err := scanNodeConfig(rows)
+		if err != nil {
+			return nil, err
+		}
+		cfgs = append(cfgs, cfg)
+	}
+	return cfgs, rows.Err()
 }
 
 // RecordDeployFailed marks a node's last deployment as failed.
@@ -944,25 +1029,30 @@ func scanBaseImage(s scanner) (api.BaseImage, error) {
 
 func scanNodeConfig(s scanner) (api.NodeConfig, error) {
 	var (
-		cfg                      api.NodeConfig
-		hostnameAuto             int
-		interfacesJSON           string
-		sshKeysJSON              string
-		groupsJSON               string
-		customVarsJSON           string
-		baseImageID              sql.NullString
-		hwProfileJSON            string
-		bmcConfigJSON            string
-		ibConfigJSON             string
-		powerProviderJSON        string
-		reimagePending           int
-		lastDeploySucceededAtVal sql.NullInt64
-		lastDeployFailedAtVal    sql.NullInt64
-		createdAtUnix            int64
-		updatedAtUnix            int64
-		groupID                  sql.NullString
-		diskLayoutOverrideJSON   string
-		extraMountsJSON          string
+		cfg                          api.NodeConfig
+		hostnameAuto                 int
+		interfacesJSON               string
+		sshKeysJSON                  string
+		groupsJSON                   string
+		customVarsJSON               string
+		baseImageID                  sql.NullString
+		hwProfileJSON                string
+		bmcConfigJSON                string
+		ibConfigJSON                 string
+		powerProviderJSON            string
+		reimagePending               int
+		lastDeploySucceededAtVal     sql.NullInt64
+		lastDeployFailedAtVal        sql.NullInt64
+		createdAtUnix                int64
+		updatedAtUnix                int64
+		groupID                      sql.NullString
+		diskLayoutOverrideJSON       string
+		extraMountsJSON              string
+		// ADR-0008: two-phase deploy verification columns (migration 022).
+		deployCompletedPrebootAtVal  sql.NullInt64
+		deployVerifiedBootedAtVal    sql.NullInt64
+		deployVerifyTimeoutAtVal     sql.NullInt64
+		lastSeenAtVal                sql.NullInt64
 	)
 
 	err := s.Scan(
@@ -974,6 +1064,8 @@ func scanNodeConfig(s scanner) (api.NodeConfig, error) {
 		&lastDeploySucceededAtVal, &lastDeployFailedAtVal,
 		&createdAtUnix, &updatedAtUnix,
 		&groupID, &diskLayoutOverrideJSON, &extraMountsJSON,
+		&deployCompletedPrebootAtVal, &deployVerifiedBootedAtVal,
+		&deployVerifyTimeoutAtVal, &lastSeenAtVal,
 	)
 	if err == sql.ErrNoRows {
 		return api.NodeConfig{}, api.ErrNotFound
@@ -1008,6 +1100,24 @@ func scanNodeConfig(s scanner) (api.NodeConfig, error) {
 	if lastDeployFailedAtVal.Valid {
 		t := time.Unix(lastDeployFailedAtVal.Int64, 0).UTC()
 		cfg.LastDeployFailedAt = &t
+	}
+
+	// ADR-0008: two-phase deploy verification timestamps.
+	if deployCompletedPrebootAtVal.Valid {
+		t := time.Unix(deployCompletedPrebootAtVal.Int64, 0).UTC()
+		cfg.DeployCompletedPrebootAt = &t
+	}
+	if deployVerifiedBootedAtVal.Valid {
+		t := time.Unix(deployVerifiedBootedAtVal.Int64, 0).UTC()
+		cfg.DeployVerifiedBootedAt = &t
+	}
+	if deployVerifyTimeoutAtVal.Valid {
+		t := time.Unix(deployVerifyTimeoutAtVal.Int64, 0).UTC()
+		cfg.DeployVerifyTimeoutAt = &t
+	}
+	if lastSeenAtVal.Valid {
+		t := time.Unix(lastSeenAtVal.Int64, 0).UTC()
+		cfg.LastSeenAt = &t
 	}
 
 	cfg.CreatedAt = time.Unix(createdAtUnix, 0).UTC()

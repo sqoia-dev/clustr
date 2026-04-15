@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
+	"golang.org/x/crypto/bcrypt"
 	"github.com/sqoia-dev/clonr/pkg/api"
 	"github.com/sqoia-dev/clonr/pkg/db"
 )
@@ -23,6 +24,44 @@ func generateRawKey() (string, error) {
 		return "", fmt.Errorf("generate key: %w", err)
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// BootstrapDefaultUser creates the default clonr/clonr admin account on first run
+// (ADR-0007). Only runs when the users table is completely empty.
+// Logs a SECURITY warning to stderr — operator must change the password on first login.
+func BootstrapDefaultUser(ctx context.Context, database *db.DB) error {
+	count, err := database.CountUsers(ctx)
+	if err != nil {
+		return fmt.Errorf("bootstrap default user: count: %w", err)
+	}
+	if count > 0 {
+		return nil // users already exist; do not re-create
+	}
+
+	// Hash "clonr" with bcrypt cost 12.
+	hash, err := bcrypt.GenerateFromPassword([]byte("clonr"), 12)
+	if err != nil {
+		return fmt.Errorf("bootstrap default user: bcrypt: %w", err)
+	}
+
+	rec := db.UserRecord{
+		ID:                 uuid.New().String(),
+		Username:           "clonr",
+		PasswordHash:       string(hash),
+		Role:               db.UserRoleAdmin,
+		MustChangePassword: true,
+		CreatedAt:          time.Now(),
+	}
+	if err := database.CreateUser(ctx, rec); err != nil {
+		return fmt.Errorf("bootstrap default user: insert: %w", err)
+	}
+
+	log.Warn().
+		Str("username", "clonr").
+		Str("role", "admin").
+		Msg("SECURITY: default credentials clonr/clonr are active — change password on first login")
+
+	return nil
 }
 
 // BootstrapAdminKey checks whether any admin key exists in the database.

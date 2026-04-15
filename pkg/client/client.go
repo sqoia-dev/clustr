@@ -266,6 +266,40 @@ func (c *Client) ReportDeployFailed(ctx context.Context, nodeID string, payload 
 	return c.post(ctx, "/api/v1/nodes/"+nodeID+"/deploy-failed", payload, nil)
 }
 
+// BuildVerifyBootPayload constructs a VerifyBootRequest from the provided system
+// information fields. ADR-0008.
+//
+// This helper is a stub for use by the future systemd oneshot unit
+// (clonr-verify-boot.service) that will be injected into the deployed rootfs
+// during the finalize phase. The HTTP POST itself is NOT wired here — that
+// requires the content-only image refactor (N3-01/N3-02 critical path) to
+// inject the unit and its environment before this function can be called.
+//
+// Callers should marshal the returned struct to JSON and POST it to
+// POST /api/v1/nodes/{nodeID}/verify-boot with the node-scoped Bearer token
+// read from /etc/clonr/node-token.
+func BuildVerifyBootPayload(hostname, kernelVersion, systemctlState, osRelease string, uptimeSeconds float64) api.VerifyBootRequest {
+	return api.VerifyBootRequest{
+		Hostname:       hostname,
+		KernelVersion:  kernelVersion,
+		UptimeSeconds:  uptimeSeconds,
+		SystemctlState: systemctlState,
+		OSRelease:      osRelease,
+	}
+}
+
+// ReportVerifyBoot calls POST /api/v1/nodes/:id/verify-boot with the given payload.
+// ADR-0008: Intended for use by the deployed OS post-boot oneshot unit.
+//
+// NOTE: This method is a stub — the systemd oneshot that calls it is NOT yet
+// written into the deployed rootfs. That injection depends on the content-only
+// image refactor (N3-01/N3-02) landing first. Once that critical-path work
+// merges, the finalize phase will write clonr-verify-boot.service into the image
+// using this payload builder.
+func (c *Client) ReportVerifyBoot(ctx context.Context, nodeID string, payload api.VerifyBootRequest) error {
+	return c.post(ctx, "/api/v1/nodes/"+nodeID+"/verify-boot", payload, nil)
+}
+
 // Health checks the server's health endpoint.
 func (c *Client) Health(ctx context.Context) (*api.HealthResponse, error) {
 	var h api.HealthResponse

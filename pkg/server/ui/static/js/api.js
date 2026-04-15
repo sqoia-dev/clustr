@@ -261,6 +261,13 @@ const API = {
         revoke(id)            { return API.del(`/admin/api-keys/${id}`); },
         rotate(id)            { return API.post(`/admin/api-keys/${id}/rotate`, {}); },
     },
+    users: {
+        list()                        { return API.get('/admin/users'); },
+        create(body)                  { return API.post('/admin/users', body); },
+        update(id, body)              { return API.put(`/admin/users/${id}`, body); },
+        resetPassword(id, password)   { return API.post(`/admin/users/${id}/reset-password`, { password }); },
+        disable(id)                   { return API.del(`/admin/users/${id}`); },
+    },
     system: {
         // initramfs — GET current status + history, POST to rebuild, DELETE history entry.
         initramfs()               { return API.get('/system/initramfs'); },

@@ -34,6 +34,12 @@ type ctxKeyKeyID struct{}
 // Used for audit attribution (created_by on newly minted keys).
 type ctxKeyKeyLabel struct{}
 
+// ctxKeyUserID is the context key for the users.id of the session-authenticated user.
+type ctxKeyUserID struct{}
+
+// ctxKeyUserRole is the context key for the role of the session-authenticated user.
+type ctxKeyUserRole struct{}
+
 // scopeFromContext returns the KeyScope stored in the request context, or "".
 func scopeFromContext(ctx context.Context) api.KeyScope {
 	v, _ := ctx.Value(ctxKeyScope{}).(api.KeyScope)
@@ -58,6 +64,30 @@ func keyIDFromContext(ctx context.Context) string {
 func keyLabelFromContext(ctx context.Context) string {
 	v, _ := ctx.Value(ctxKeyKeyLabel{}).(string)
 	return v
+}
+
+// userIDFromContext returns the users.id of the session-authenticated user, or "".
+func userIDFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(ctxKeyUserID{}).(string)
+	return v
+}
+
+// userRoleFromContext returns the role of the session-authenticated user, or "".
+func userRoleFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(ctxKeyUserRole{}).(string)
+	return v
+}
+
+// actorLabel returns a human-readable actor for audit log attribution.
+// Returns "user:<userID>" for session auth, "key:<label>" for Bearer auth.
+func actorLabel(ctx context.Context) string {
+	if uid := userIDFromContext(ctx); uid != "" {
+		return "user:" + uid
+	}
+	if label := keyLabelFromContext(ctx); label != "" {
+		return "key:" + label
+	}
+	return "unknown"
 }
 
 // apiKeyAuth returns a middleware that resolves the auth scope from either:
@@ -103,7 +133,18 @@ func apiKeyAuth(database *db.DB, devMode bool, sessionSecret []byte, sessionSecu
 								})
 							}
 						}
-						ctx := context.WithValue(r.Context(), ctxKeyScope{}, api.KeyScope(result.payload.Scope))
+						// Map the user role to a scope for existing requireScope middleware.
+						// admin → admin scope; operator/readonly → admin scope (read path)
+						// Fine-grained gating uses requireRole middleware.
+						roleScope := api.KeyScopeAdmin
+						if result.payload.Role == "readonly" {
+							// readonly maps to a sentinel string that requireScope(adminOnly=true) will block.
+							// We keep the real role in ctxKeyUserRole for requireRole checks.
+							roleScope = api.KeyScope("readonly")
+						}
+						ctx := context.WithValue(r.Context(), ctxKeyScope{}, roleScope)
+						ctx = context.WithValue(ctx, ctxKeyUserID{}, result.payload.Sub)
+						ctx = context.WithValue(ctx, ctxKeyUserRole{}, result.payload.Role)
 						next.ServeHTTP(w, r.WithContext(ctx))
 						return
 					}
@@ -198,14 +239,57 @@ func requireScope(adminOnly bool) func(http.Handler) http.Handler {
 			}
 			// Valid scope but insufficient level → 403 Forbidden.
 			if adminOnly && scope != api.KeyScopeAdmin {
-				writeForbidden(w, "this route requires an admin-scope API key")
+				writeForbidden(w, "this route requires an admin-scope API key or admin/operator user")
 				return
 			}
-			if scope != api.KeyScopeAdmin && scope != api.KeyScopeNode {
+			if scope != api.KeyScopeAdmin && scope != api.KeyScopeNode && scope != api.KeyScope("readonly") {
 				writeForbidden(w, "unrecognized scope")
 				return
 			}
 			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// requireRole returns a middleware that enforces a minimum user role.
+// Role hierarchy: admin > operator > readonly.
+// API-key Bearer auth (non-session) is treated as admin for backward compat
+// unless the key carries an explicit scope that doesn't qualify.
+//
+// minimum: "admin" | "operator" | "readonly"
+func requireRole(minimum string) func(http.Handler) http.Handler {
+	roleRank := map[string]int{
+		"readonly": 1,
+		"operator": 2,
+		"admin":    3,
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			scope := scopeFromContext(r.Context())
+			if scope == "" {
+				writeUnauthorized(w, "authentication required")
+				return
+			}
+
+			// Session cookie path: if a user role is set, enforce it strictly.
+			// The scope for operators is mapped to KeyScopeAdmin for requireScope compat,
+			// but requireRole must use the real role, not the mapped scope.
+			if role := userRoleFromContext(r.Context()); role != "" {
+				if roleRank[role] < roleRank[minimum] {
+					writeForbidden(w, "insufficient role: requires "+minimum+" or higher")
+					return
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Bearer token path: admin-scoped API keys always pass.
+			if scope == api.KeyScopeAdmin {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			writeForbidden(w, "insufficient permissions")
 		})
 	}
 }

@@ -460,6 +460,59 @@ func (h *NodesHandler) DeployFailed(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// VerifyBoot handles POST /api/v1/nodes/:id/verify-boot. ADR-0008.
+//
+// Called by the deployed OS on first boot (via clonr-verify-boot.service systemd
+// oneshot). Proves the bootloader, kernel, and systemd all started successfully.
+//
+// Auth: node-scoped token only. The token's bound node_id must match the URL {id}.
+// Admin-scoped keys are NOT accepted here — enforced by requireNodeOwnership
+// middleware in the router registration. This ensures only the node itself can
+// report its own boot (the token written to /etc/clonr/node-token at finalize time
+// is node-scoped and bound to that specific node's ID).
+//
+// State transitions:
+//   deploy_completed_preboot_at set, deploy_verified_booted_at NULL
+//   → deploy_verified_booted_at = now()  (first call)
+//   → deploy_verified_booted_at unchanged (subsequent calls; only last_seen_at updates)
+//
+// Returns 204 No Content on success.
+func (h *NodesHandler) VerifyBoot(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	// Parse the phone-home payload. Tolerate a missing body gracefully.
+	var payload api.VerifyBootRequest
+	if r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			log.Warn().Err(err).Str("node_id", id).Msg("verify-boot: could not parse payload (ignored)")
+		}
+	}
+
+	// Confirm node exists before updating.
+	if _, err := h.DB.GetNodeConfig(r.Context(), id); err != nil {
+		writeError(w, err)
+		return
+	}
+
+	if err := h.DB.RecordVerifyBooted(r.Context(), id); err != nil {
+		log.Error().Err(err).Str("node_id", id).Msg("verify-boot: db update failed")
+		writeError(w, err)
+		return
+	}
+
+	log.Info().
+		Str("node_id", id).
+		Str("hostname", payload.Hostname).
+		Str("kernel_version", payload.KernelVersion).
+		Str("systemctl_state", payload.SystemctlState).
+		Str("os_release", payload.OSRelease).
+		Float64("uptime_seconds", payload.UptimeSeconds).
+		Msgf("verify-boot: node %s (%s) verified booted: kernel=%s, systemctl=%s",
+			id, payload.Hostname, payload.KernelVersion, payload.SystemctlState)
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // extractNodeIdentity parses the hardware profile JSON to find the primary MAC
 // and hostname. Returns empty strings on any parse failure.
 func extractNodeIdentity(profile []byte) (mac, hostname string) {

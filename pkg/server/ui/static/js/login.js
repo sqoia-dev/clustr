@@ -1,15 +1,19 @@
-// login.js — handles the /login page form submission.
+// login.js — handles the /login page form submission (ADR-0007).
+//
+// Sends username+password to POST /api/v1/auth/login.
+// On force_password_change=true, redirects to /set-password.
 
 (function () {
-    const form   = document.getElementById('login-form');
-    const input  = document.getElementById('api-key');
-    const btn    = document.getElementById('login-btn');
-    const errEl  = document.getElementById('login-error');
+    const form      = document.getElementById('login-form');
+    const usernameEl = document.getElementById('username');
+    const passwordEl = document.getElementById('password');
+    const btn       = document.getElementById('login-btn');
+    const errEl     = document.getElementById('login-error');
 
     function showError(msg) {
         errEl.textContent = msg;
         errEl.classList.add('visible');
-        input.focus();
+        usernameEl.focus();
     }
 
     function clearError() {
@@ -21,39 +25,52 @@
         e.preventDefault();
         clearError();
 
-        const key = input.value.trim();
-        if (!key) {
-            showError('Please enter your admin API key.');
+        const username = (usernameEl.value || '').trim();
+        const password = passwordEl.value || '';
+
+        if (!username) {
+            showError('Please enter your username.');
+            return;
+        }
+        if (!password) {
+            showError('Please enter your password.');
             return;
         }
 
         btn.disabled = true;
-        btn.textContent = 'Signing in…';
+        btn.textContent = 'Signing in\u2026';
 
         try {
             const resp = await fetch('/api/v1/auth/login', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ key }),
+                body: JSON.stringify({ username, password }),
                 credentials: 'same-origin',
             });
 
             if (resp.ok) {
-                // Session cookie is now set. Redirect to main UI.
+                let body = {};
+                try { body = await resp.json(); } catch (_) {}
+
                 // Clear any legacy localStorage key from the old modal flow.
                 try { localStorage.removeItem('clonr_admin_key'); } catch (_) {}
-                window.location.href = '/';
+
+                if (body.force_password_change) {
+                    window.location.href = '/set-password';
+                } else {
+                    window.location.href = '/';
+                }
                 return;
             }
 
-            let msg = 'Invalid API key.';
+            let msg = 'Invalid username or password.';
             try {
                 const body = await resp.json();
                 if (body && body.error) msg = body.error;
             } catch (_) {}
             showError(msg);
         } catch (err) {
-            showError('Network error — could not reach the server.');
+            showError('Network error \u2014 could not reach the server.');
         } finally {
             btn.disabled = false;
             btn.textContent = 'Sign in';
