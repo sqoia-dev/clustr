@@ -24,12 +24,14 @@ const (
 	sessionSlideMin = 30 * time.Minute
 )
 
-// sessionPayload is the signed JSON body of a browser session token.
+// sessionPayload is the signed JSON body of a browser session token (ADR-0007).
+//
+// Breaking change from ADR-0006: Kid+Scope replaced by Sub+Role. Any
+// outstanding session cookies from before ADR-0007 will fail HMAC verification
+// (different payload structure), requiring operators to log in once after upgrade.
 type sessionPayload struct {
-	// Kid is the first 8 characters of the raw admin key used to log in.
-	// Used for debugging only — never used for key lookup.
-	Kid   string `json:"kid"`
-	Scope string `json:"scope"`
+	Sub   string `json:"sub"`   // user UUID (users.id)
+	Role  string `json:"role"`  // "admin" | "operator" | "readonly"
 	IAT   int64  `json:"iat"`   // issued-at (unix)
 	EXP   int64  `json:"exp"`   // absolute expiry (unix)
 	Slide int64  `json:"slide"` // last-activity timestamp (unix)
@@ -90,12 +92,26 @@ func validateSessionToken(secret []byte, token string) (sessionResult, error) {
 	return sessionResult{payload: p, needsReissue: needsReissue}, nil
 }
 
-// newSessionPayload builds a fresh sessionPayload for the given admin key prefix.
-func newSessionPayload(keyPrefix string) sessionPayload {
+// newSessionPayload builds a fresh sessionPayload for a user login.
+func newSessionPayload(userID, role string) sessionPayload {
 	now := time.Now().Unix()
 	return sessionPayload{
-		Kid:   keyPrefix,
-		Scope: "admin",
+		Sub:   userID,
+		Role:  role,
+		IAT:   now,
+		EXP:   now + int64(sessionTTL.Seconds()),
+		Slide: now,
+	}
+}
+
+// newSessionPayloadForKey builds a session payload for the legacy API-key login
+// path (deprecated, one-release transition). Uses "admin" role and the key hash
+// prefix as the sub so audit logs can still show a useful actor label.
+func newSessionPayloadForKey(keyPrefix string) sessionPayload {
+	now := time.Now().Unix()
+	return sessionPayload{
+		Sub:   "key:" + keyPrefix,
+		Role:  "admin",
 		IAT:   now,
 		EXP:   now + int64(sessionTTL.Seconds()),
 		Slide: now,

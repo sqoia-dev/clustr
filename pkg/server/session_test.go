@@ -9,7 +9,7 @@ func testSecret() []byte { return []byte("test-secret-key-for-unit-tests-32b") }
 
 func TestSignAndValidate_HappyPath(t *testing.T) {
 	secret := testSecret()
-	p := newSessionPayload("abcd1234")
+	p := newSessionPayload("user-uuid-1234", "admin")
 
 	token, err := signSessionToken(secret, p)
 	if err != nil {
@@ -23,11 +23,11 @@ func TestSignAndValidate_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	if result.payload.Scope != "admin" {
-		t.Errorf("scope: got %q, want admin", result.payload.Scope)
+	if result.payload.Role != "admin" {
+		t.Errorf("role: got %q, want admin", result.payload.Role)
 	}
-	if result.payload.Kid != "abcd1234" {
-		t.Errorf("kid: got %q, want abcd1234", result.payload.Kid)
+	if result.payload.Sub != "user-uuid-1234" {
+		t.Errorf("sub: got %q, want user-uuid-1234", result.payload.Sub)
 	}
 	if result.needsReissue {
 		t.Error("fresh token should not need reissue")
@@ -36,7 +36,7 @@ func TestSignAndValidate_HappyPath(t *testing.T) {
 
 func TestValidate_TamperedSignature(t *testing.T) {
 	secret := testSecret()
-	p := newSessionPayload("abcd1234")
+	p := newSessionPayload("user-uuid-1234", "admin")
 
 	token, err := signSessionToken(secret, p)
 	if err != nil {
@@ -53,7 +53,7 @@ func TestValidate_TamperedSignature(t *testing.T) {
 
 func TestValidate_ExpiredToken(t *testing.T) {
 	secret := testSecret()
-	p := newSessionPayload("abcd1234")
+	p := newSessionPayload("user-uuid-1234", "admin")
 	// Back-date the expiry.
 	p.EXP = time.Now().Add(-1 * time.Hour).Unix()
 
@@ -70,7 +70,7 @@ func TestValidate_ExpiredToken(t *testing.T) {
 
 func TestValidate_SlidingReissue(t *testing.T) {
 	secret := testSecret()
-	p := newSessionPayload("abcd1234")
+	p := newSessionPayload("user-uuid-1234", "admin")
 	// Set slide to >30m ago so it triggers a reissue.
 	p.Slide = time.Now().Add(-45 * time.Minute).Unix()
 
@@ -89,7 +89,7 @@ func TestValidate_SlidingReissue(t *testing.T) {
 }
 
 func TestSlideSessionPayload(t *testing.T) {
-	p := newSessionPayload("abcd1234")
+	p := newSessionPayload("user-uuid-1234", "operator")
 	// Back-date Slide and EXP by 1 hour so slideSessionPayload must advance them.
 	p.Slide = time.Now().Add(-1 * time.Hour).Unix()
 	p.EXP = time.Now().Add(-1 * time.Hour).Unix()
@@ -104,13 +104,16 @@ func TestSlideSessionPayload(t *testing.T) {
 	if slid.EXP <= oldEXP {
 		t.Error("expiry should have advanced after slide")
 	}
-	if slid.Scope != p.Scope {
-		t.Error("scope should be unchanged after slide")
+	if slid.Role != p.Role {
+		t.Error("role should be unchanged after slide")
+	}
+	if slid.Sub != p.Sub {
+		t.Error("sub should be unchanged after slide")
 	}
 }
 
 func TestValidate_WrongSecret(t *testing.T) {
-	p := newSessionPayload("abcd1234")
+	p := newSessionPayload("user-uuid-1234", "admin")
 	token, err := signSessionToken([]byte("secret-A"), p)
 	if err != nil {
 		t.Fatalf("sign: %v", err)
