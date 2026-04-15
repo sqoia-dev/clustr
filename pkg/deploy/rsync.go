@@ -1115,23 +1115,26 @@ func (d *FilesystemDeployer) createFilesystems(ctx context.Context, disk string)
 // mounts (e.g. /) are established before child mounts (e.g. /boot). Relying
 // on layout order is not safe — RAID layouts interleave raw-disk entries with
 // md-device entries and the md entries may arrive in any order.
-func (d *FilesystemDeployer) mountPartitions(ctx context.Context, devs []string, mountRoot string) error {
-	type mp struct {
-		dev   string
-		mount string
-		fs    string
-	}
-	var mps []mp
-	for i, p := range d.layout.Partitions {
-		if p.MountPoint == "" || p.Filesystem == "swap" {
-			continue
-		}
-		mps = append(mps, mp{dev: devs[i], mount: p.MountPoint, fs: p.Filesystem})
-	}
+// mountEntry is a resolved partition-to-mountpoint mapping used by
+// mountPartitions and sortMountEntries.
+type mountEntry struct {
+	dev   string
+	mount string
+	fs    string
+}
 
-	// Sort by mountpoint depth: shorter paths mount first so / mounts before
-	// /boot, and /boot mounts before /boot/efi. Secondary sort by path string
-	// for determinism when depths are equal.
+// sortMountEntries sorts a slice of mountEntry values by mountpoint depth
+// (number of "/" characters) so that parent mountpoints are established before
+// child mountpoints. "/" (depth 1) sorts before "/boot" (depth 2), which sorts
+// before "/boot/efi" (depth 3). When two mountpoints have the same depth,
+// lexicographic order is used for determinism.
+//
+// This must run before any mount(8) calls: Linux refuses to mount a filesystem
+// at a child path if the parent filesystem has not been mounted yet, and
+// mounting in the wrong order silently hides content behind a later mount
+// (e.g. mounting /boot before / means /boot's content goes to the in-memory
+// rootfs, then the empty /boot partition shadows it).
+func sortMountEntries(mps []mountEntry) {
 	for i := 0; i < len(mps)-1; i++ {
 		for j := i + 1; j < len(mps); j++ {
 			li := strings.Count(mps[i].mount, "/")
@@ -1141,6 +1144,24 @@ func (d *FilesystemDeployer) mountPartitions(ctx context.Context, devs []string,
 			}
 		}
 	}
+}
+
+func (d *FilesystemDeployer) mountPartitions(ctx context.Context, devs []string, mountRoot string) error {
+	var mps []mountEntry
+	for i, p := range d.layout.Partitions {
+		if p.MountPoint == "" || p.Filesystem == "swap" {
+			continue
+		}
+		mps = append(mps, mountEntry{dev: devs[i], mount: p.MountPoint, fs: p.Filesystem})
+	}
+
+	// Sort by mountpoint depth so parent paths are mounted before children.
+	// This guarantees / is mounted before /boot, and /boot before /boot/efi,
+	// regardless of the order partitions appear in the layout definition.
+	// Without this sort, a tar extract would land /boot content on the root
+	// filesystem's /boot directory, then the empty /boot partition would be
+	// mounted on top, hiding the kernel from GRUB.
+	sortMountEntries(mps)
 
 	mountOrder := make([]string, len(mps))
 	for i, m := range mps {
