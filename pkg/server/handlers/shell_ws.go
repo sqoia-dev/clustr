@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
 
 	"github.com/creack/pty"
@@ -46,6 +47,36 @@ func wrapNspawnInScope(sessionID string, nspawnArgs []string) *exec.Cmd {
 	}
 	args = append(args, nspawnArgs...)
 	return exec.Command("systemd-run", args...)
+}
+
+// invalidateImageSidecar deletes the tar-sha256 sidecar file for imageID so
+// that the next blob fetch recomputes the tarball hash from scratch.
+//
+// This is a temporary hotfix for the shell-session mutation problem: when a
+// shell session writes files into the image rootfs (e.g. /root/.bash_history),
+// the stored tar-sha256 no longer matches the new tarball content. Deploy agents
+// verify the hash and fail with ExitDownload(5) when there is a mismatch.
+//
+// Proper fix: use an overlayfs-backed shell session so writes never touch the
+// base rootfs (ADR-0009 overlayfs model). Until that lands, invalidating the
+// sidecar forces a fresh hash computation on next blob fetch, which avoids the
+// mismatch at the cost of one extra full-tar pass.
+func invalidateImageSidecar(imageDir, imageID string) {
+	sidecarPath := filepath.Join(imageDir, imageID, "tar-sha256")
+	err := os.Remove(sidecarPath)
+	if err != nil && !os.IsNotExist(err) {
+		log.Warn().Err(err).
+			Str("image_id", imageID).
+			Str("path", sidecarPath).
+			Msg("shell session close: failed to remove tar-sha256 sidecar")
+		return
+	}
+	if !os.IsNotExist(err) {
+		log.Info().
+			Str("image_id", imageID).
+			Str("path", sidecarPath).
+			Msg("shell session closed — invalidated tar-sha256 sidecar; next blob fetch will recompute")
+	}
 }
 
 // wsUpgrader allows all origins for the embedded UI (same-origin in prod,
@@ -160,6 +191,15 @@ func (h *FactoryHandler) ShellWS(w http.ResponseWriter, r *http.Request) {
 		_ = cmd.Wait()
 		log.Info().Str("session_id", sessionID).Str("image_id", imageID).
 			Msg("shell ws: terminal session ended")
+		// Invalidate the tar-sha256 sidecar so the next blob fetch recomputes
+		// the tarball hash. The shell session may have written files into the
+		// rootfs (e.g. /root/.bash_history) that would cause a hash mismatch
+		// and fail the deploy agent's integrity check (ExitDownload 5).
+		//
+		// TODO(ADR-0009): remove this hotfix once the overlayfs shell model
+		// lands — overlayfs sessions write into an ephemeral upper layer and
+		// never mutate the base rootfs.
+		invalidateImageSidecar(h.ImageDir, imageID)
 	}()
 
 	// PTY → WebSocket: stream shell output to browser.
