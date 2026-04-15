@@ -266,6 +266,21 @@ const (
 	// NodeStateFailed: the most recent deploy failed and no successful deploy has
 	// occurred since. Needs admin attention.
 	NodeStateFailed NodeState = "failed"
+
+	// NodeStateDeployedPreboot: deploy-complete callback received from clonr-static
+	// inside the PXE initramfs. Rootfs written successfully. Waiting for the OS to
+	// phone home via POST /verify-boot to confirm the bootloader + kernel work.
+	// ADR-0008.
+	NodeStateDeployedPreboot NodeState = "deployed_preboot"
+
+	// NodeStateDeployedVerified: OS phoned home after first boot. Bootloader, kernel,
+	// and systemd all started. This is the terminal success state. ADR-0008.
+	NodeStateDeployedVerified NodeState = "deployed_verified"
+
+	// NodeStateDeployVerifyTimeout: verify-boot was not received within
+	// CLONR_VERIFY_TIMEOUT after deploy_completed_preboot_at. Indicates a likely
+	// bootloader, kernel, or network failure. Needs operator attention. ADR-0008.
+	NodeStateDeployVerifyTimeout NodeState = "deploy_verify_timeout"
 )
 
 // NodeConfig holds everything that makes a deployed image specific to one
@@ -305,11 +320,31 @@ type NodeConfig struct {
 	// Cleared by the deploy-complete callback once deployment finalizes.
 	ReimagePending  bool                 `json:"reimage_pending,omitempty"`
 	// LastDeploySucceededAt is the Unix timestamp of the most recent successful
-	// deployment finalize. Used by State() to determine NodeStateDeployed.
+	// deployment finalize. Back-compat alias for DeployCompletedPrebootAt (ADR-0008).
+	// Deprecated: use DeployCompletedPrebootAt. Will be removed in v1.0.
 	LastDeploySucceededAt *time.Time `json:"last_deploy_succeeded_at,omitempty"`
 	// LastDeployFailedAt is the Unix timestamp of the most recent failed deploy.
 	// Used by State() to determine NodeStateFailed.
 	LastDeployFailedAt *time.Time `json:"last_deploy_failed_at,omitempty"`
+
+	// ADR-0008: Two-Phase Deploy Success fields.
+
+	// DeployCompletedPrebootAt is set when clonr-static POSTs deploy-complete from
+	// inside the PXE initramfs. Proves the rootfs was written without error.
+	// Does NOT prove the OS boots. See ADR-0008.
+	DeployCompletedPrebootAt *time.Time `json:"deploy_completed_preboot_at,omitempty"`
+	// DeployVerifiedBootedAt is set when the deployed OS phones home via
+	// POST /api/v1/nodes/{id}/verify-boot. Proves bootloader + kernel + systemd
+	// all started. Terminal success state. See ADR-0008.
+	DeployVerifiedBootedAt *time.Time `json:"deploy_verified_booted_at,omitempty"`
+	// DeployVerifyTimeoutAt is set by the background scanner when verify-boot was
+	// not received within CLONR_VERIFY_TIMEOUT after deploy_completed_preboot_at.
+	// Indicates a likely bootloader or network failure. See ADR-0008.
+	DeployVerifyTimeoutAt *time.Time `json:"deploy_verify_timeout_at,omitempty"`
+	// LastSeenAt is updated on every verify-boot call. Acts as a heartbeat —
+	// the most recent time the deployed OS successfully contacted the server.
+	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
+
 	// HardwareProfile is the raw hardware discovery JSON from the node.
 	// Populated on auto-registration; nil when node was created manually.
 	HardwareProfile json.RawMessage      `json:"hardware_profile,omitempty"`
@@ -320,24 +355,50 @@ type NodeConfig struct {
 // State derives the current lifecycle state of this node from its stored fields.
 // This is the canonical way to determine what the PXE boot handler should return.
 //
-// Priority order (highest to lowest):
+// ADR-0008 two-phase priority order (highest to lowest):
 //  1. ReimagePending — always overrides everything else.
-//  2. LastDeployFailedAt after LastDeploySucceededAt — node is in error.
-//  3. LastDeploySucceededAt set — node is deployed and healthy.
-//  4. BaseImageID set — node is configured but never deployed.
-//  5. Otherwise — node is registered but has no image.
+//  2. LastDeployFailedAt after effective preboot timestamp — node is in error.
+//  3. DeployVerifiedBootedAt set — deployed_verified (OS phoned home post-boot).
+//  4. DeployVerifyTimeoutAt set — deploy_verify_timeout (OS never phoned home).
+//  5. DeployCompletedPrebootAt set — deployed_preboot (initramfs done, awaiting boot).
+//  6. LastDeploySucceededAt set (back-compat) — falls through to deployed_verified.
+//  7. BaseImageID set — node is configured but never deployed.
+//  8. Otherwise — node is registered but has no image.
 func (n *NodeConfig) State() NodeState {
 	if n.ReimagePending {
 		return NodeStateReimagePending
 	}
+
+	// Determine the effective "deploy succeeded" timestamp for failure comparison.
+	// Prefer the new ADR-0008 field; fall back to the legacy alias.
+	effectivePreboot := n.DeployCompletedPrebootAt
+	if effectivePreboot == nil {
+		effectivePreboot = n.LastDeploySucceededAt
+	}
+
 	if n.LastDeployFailedAt != nil {
-		if n.LastDeploySucceededAt == nil || n.LastDeployFailedAt.After(*n.LastDeploySucceededAt) {
+		if effectivePreboot == nil || n.LastDeployFailedAt.After(*effectivePreboot) {
 			return NodeStateFailed
 		}
 	}
-	if n.LastDeploySucceededAt != nil {
-		return NodeStateDeployed
+
+	// Two-phase success states (ADR-0008).
+	if n.DeployVerifiedBootedAt != nil {
+		return NodeStateDeployedVerified
 	}
+	if n.DeployVerifyTimeoutAt != nil {
+		return NodeStateDeployVerifyTimeout
+	}
+	if n.DeployCompletedPrebootAt != nil {
+		return NodeStateDeployedPreboot
+	}
+
+	// Back-compat: legacy last_deploy_succeeded_at without new ADR-0008 fields
+	// maps to deployed_verified (it implies full success from before two-phase model).
+	if n.LastDeploySucceededAt != nil {
+		return NodeStateDeployedVerified
+	}
+
 	if n.BaseImageID != "" {
 		return NodeStateConfigured
 	}
@@ -912,6 +973,25 @@ type DeployFailedPayload struct {
 	ExitName string `json:"exit_name"`
 	Phase    string `json:"phase"`
 	Message  string `json:"message"`
+}
+
+// VerifyBootRequest is the JSON body for POST /api/v1/nodes/:id/verify-boot.
+// Sent by the deployed OS on first boot (via clonr-verify-boot.service systemd
+// oneshot) to confirm the bootloader, kernel, and systemd all started correctly.
+// See ADR-0008.
+type VerifyBootRequest struct {
+	// Hostname is the OS-reported hostname (from /etc/hostname or uname -n).
+	Hostname string `json:"hostname"`
+	// KernelVersion is the running kernel version (from uname -r).
+	KernelVersion string `json:"kernel_version"`
+	// UptimeSeconds is the node uptime in seconds at call time (from /proc/uptime).
+	// Used to verify the node has just booted rather than replaying an old request.
+	UptimeSeconds float64 `json:"uptime_seconds"`
+	// SystemctlState is the output of `systemctl is-system-running`.
+	// Expected values: "running", "degraded". Other values are logged but not rejected.
+	SystemctlState string `json:"systemctl_state"`
+	// OSRelease is the OS identification string (from /etc/os-release PRETTY_NAME).
+	OSRelease string `json:"os_release"`
 }
 
 // CreateReimageRequest is the body for POST /api/v1/nodes/:id/reimage.

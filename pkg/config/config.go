@@ -21,6 +21,10 @@ type ServerConfig struct {
 	LogLevel        string        `json:"log_level"`        // debug, info, warn, error — default "info"
 	LogRetention    time.Duration `json:"log_retention"`    // from CLONR_LOG_RETENTION; default 14d
 	ClonrBinPath    string        `json:"clonr_bin_path"`   // CLONR_BIN_PATH: abs path to clonr CLI binary baked into initramfs; default /usr/local/bin/clonr
+	// VerifyTimeout is the duration after deploy_completed_preboot_at within which
+	// the deployed OS must phone home via POST /verify-boot. ADR-0008.
+	// From CLONR_VERIFY_TIMEOUT (Go duration string, e.g. "5m"). Default: 5 minutes.
+	VerifyTimeout   time.Duration `json:"verify_timeout"`   // CLONR_VERIFY_TIMEOUT; default 5m
 	PXE             PXEConfig     `json:"pxe"`
 }
 
@@ -69,8 +73,35 @@ func LoadServerConfig() ServerConfig {
 		LogLevel:      envOrDefault("CLONR_LOG_LEVEL", "info"),
 		LogRetention:  parseLogRetention(),
 		ClonrBinPath:  envOrDefault("CLONR_BIN_PATH", "/usr/local/bin/clonr"),
+		VerifyTimeout: parseVerifyTimeout(),
 		PXE:           LoadPXEConfig(),
 	}
+}
+
+// parseVerifyTimeout parses CLONR_VERIFY_TIMEOUT as a Go duration string.
+// Minimum: 2m (to allow slow hardware POST sequences). Maximum: 30m.
+// Falls back to 5m on parse error or when the env var is not set.
+// ADR-0008.
+func parseVerifyTimeout() time.Duration {
+	const defaultTimeout = 5 * time.Minute
+	const minTimeout = 2 * time.Minute
+	const maxTimeout = 30 * time.Minute
+
+	v := os.Getenv("CLONR_VERIFY_TIMEOUT")
+	if v == "" {
+		return defaultTimeout
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return defaultTimeout
+	}
+	if d < minTimeout {
+		return minTimeout
+	}
+	if d > maxTimeout {
+		return maxTimeout
+	}
+	return d
 }
 
 // parseLogRetention parses CLONR_LOG_RETENTION as a Go duration string.

@@ -125,6 +125,50 @@ func (s *Server) StartBackgroundWorkers(ctx context.Context) {
 	s.logsHandler.ServerCtx = ctx
 	go s.reimageOrchestrator.Scheduler(ctx)
 	go s.runLogPurger(ctx)
+	// ADR-0008: Post-reboot verification timeout scanner.
+	go s.runVerifyTimeoutScanner(ctx)
+}
+
+// runVerifyTimeoutScanner ticks every 60 seconds and marks as timed-out any node
+// that has deploy_completed_preboot_at set but no deploy_verified_booted_at within
+// CLONR_VERIFY_TIMEOUT. ADR-0008.
+func (s *Server) runVerifyTimeoutScanner(ctx context.Context) {
+	timeout := s.cfg.VerifyTimeout
+	if timeout == 0 {
+		timeout = 5 * time.Minute // safe default if config somehow zero
+	}
+	log.Info().Str("timeout", timeout.String()).Msg("verify-boot scanner: started — post-reboot verification timeout set to " + timeout.String())
+
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info().Msg("verify-boot scanner: stopping")
+			return
+		case <-ticker.C:
+			cutoff := time.Now().Add(-timeout)
+			nodes, err := s.db.ListNodesAwaitingVerification(ctx, cutoff)
+			if err != nil {
+				log.Error().Err(err).Msg("verify-boot scanner: ListNodesAwaitingVerification failed")
+				continue
+			}
+			for _, n := range nodes {
+				if err := s.db.RecordVerifyTimeout(ctx, n.ID); err != nil {
+					log.Error().Err(err).Str("node_id", n.ID).Str("hostname", n.Hostname).
+						Msg("verify-boot scanner: RecordVerifyTimeout failed")
+					continue
+				}
+				log.Warn().
+					Str("node_id", n.ID).
+					Str("hostname", n.Hostname).
+					Str("timeout", timeout.String()).
+					Msgf("verify-boot scanner: node %s (%s) did not phone home within %s of deploy-complete — possible bootloader failure, kernel panic, or /etc/clonr/node-token not written correctly",
+						n.ID, n.Hostname, timeout)
+			}
+		}
+	}
 }
 
 // runLogPurger ticks every hour and deletes log entries older than the
@@ -290,6 +334,13 @@ func (s *Server) buildRouter() chi.Router {
 		// running in initramfs can call them using its node-scoped key.
 		r.With(requireNodeOwnership("id")).Post("/nodes/{id}/deploy-complete", nodes.DeployComplete)
 		r.With(requireNodeOwnership("id")).Post("/nodes/{id}/deploy-failed", nodes.DeployFailed)
+
+		// ADR-0008: Post-reboot verification phone-home endpoint.
+		// Called by the deployed OS (via clonr-verify-boot.service systemd oneshot)
+		// on first boot. Node-scoped token required; admin keys are NOT accepted here.
+		// The node-scoped key written to /etc/clonr/node-token at finalize time is
+		// the same one minted during PXE enrollment and is reused post-boot.
+		r.With(requireNodeOwnership("id")).Post("/nodes/{id}/verify-boot", nodes.VerifyBoot)
 
 		// Self-read: allow a node-scoped key to read its own node record.
 		// Used by the deploy agent's state verification loop after deploy-complete.

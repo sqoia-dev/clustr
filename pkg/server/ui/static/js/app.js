@@ -214,6 +214,14 @@ function badge(status) {
 }
 
 function nodeBadge(node) {
+    // ADR-0008: two-phase deploy states. Check the new fields directly in addition
+    // to the legacy _deployStatus shorthand computed from last_deploy_succeeded_at.
+    if (node.deploy_verified_booted_at)
+        return `<span class="badge badge-deployed" title="OS phoned home — bootloader, kernel, and systemd confirmed">Verified</span>`;
+    if (node.deploy_verify_timeout_at)
+        return `<span class="badge badge-error" title="OS never phoned home within verify timeout. Possible bootloader or kernel failure.">Verify Timeout</span>`;
+    if (node.deploy_completed_preboot_at && !node.last_deploy_succeeded_at)
+        return `<span class="badge badge-warning" title="clonr-static completed successfully. Waiting for OS boot confirmation.">Deploy Unverified</span>`;
     if (node._deployStatus === 'success') return `<span class="badge badge-deployed">Deployed</span>`;
     if (node._deployStatus === 'error')   return `<span class="badge badge-error">Failed</span>`;
     if (node.base_image_id)               return `<span class="badge badge-info">Configured</span>`;
@@ -2838,6 +2846,21 @@ const Pages = {
 
                 <!-- Overview tab — inline editable -->
                 <div id="tab-overview" class="tab-panel active">
+                    ${node.deploy_verify_timeout_at ? `
+                    <div class="alert alert-error" style="margin-bottom:12px">
+                        <strong>Verification timeout.</strong>
+                        Deploy succeeded pre-boot but the OS never phoned home
+                        (timeout at ${fmtDate(node.deploy_verify_timeout_at)}).
+                        Node may not be bootable — possible causes: bootloader failure, kernel panic,
+                        network misconfiguration, or <code>/etc/clonr/node-token</code> not written correctly.
+                        Attach serial console to investigate or <button class="btn btn-secondary btn-sm" style="margin-left:4px" onclick="Pages._nodeActionsTriggerReimage('${node.id}', '${escHtml(displayName)}')">Re-deploy</button>
+                    </div>` : ''}
+                    ${(node.deploy_completed_preboot_at && !node.deploy_verified_booted_at && !node.deploy_verify_timeout_at) ? `
+                    <div class="alert alert-warning" style="margin-bottom:12px">
+                        <strong>Awaiting boot confirmation.</strong>
+                        This node has not confirmed boot. clonr-static completed successfully, but the OS has not phoned home yet.
+                        Attach serial console to verify if the deploy is stalled.
+                    </div>` : ''}
                     <div id="tab-save-bar-overview" class="tab-save-bar" style="display:none">
                         <span class="save-status modified" id="tab-save-status-overview">Unsaved changes</span>
                         <button class="btn btn-secondary btn-sm" onclick="Pages._tabRevert('overview')" id="tab-revert-overview">Revert</button>
@@ -2908,6 +2931,10 @@ const Pages = {
                                 </div></div>
                                 <div class="kv-item"><div class="kv-key">Last Deploy OK</div><div class="kv-value">${node.last_deploy_succeeded_at ? fmtDate(node.last_deploy_succeeded_at) : '—'}</div></div>
                                 <div class="kv-item"><div class="kv-key">Last Deploy Failed</div><div class="kv-value">${node.last_deploy_failed_at ? fmtDate(node.last_deploy_failed_at) : '—'}</div></div>
+                                <div class="kv-item"><div class="kv-key">Deploy Complete (pre-boot)</div><div class="kv-value" title="Set when clonr-static finishes in the PXE initramfs. Proves rootfs written; not that OS boots.">${node.deploy_completed_preboot_at ? fmtRelative(node.deploy_completed_preboot_at) : '—'}</div></div>
+                                <div class="kv-item"><div class="kv-key">Boot Verified</div><div class="kv-value" title="Set when the deployed OS phones home post-boot. Proves bootloader, kernel, and systemd all started.">${node.deploy_verified_booted_at ? fmtRelative(node.deploy_verified_booted_at) : (node.deploy_completed_preboot_at ? '<span class="badge badge-warning">Pending</span>' : '—')}</div></div>
+                                ${node.deploy_verify_timeout_at ? `<div class="kv-item" style="grid-column:1/-1"><div class="kv-key">Verify Timeout</div><div class="kv-value text-danger">${fmtDate(node.deploy_verify_timeout_at)}</div></div>` : ''}
+                                ${node.last_seen_at ? `<div class="kv-item"><div class="kv-key">Last Seen</div><div class="kv-value">${fmtRelative(node.last_seen_at)}</div></div>` : ''}
                                 <div class="kv-item"><div class="kv-key">Created</div><div class="kv-value">${fmtDate(node.created_at)}</div></div>
                                 <div class="kv-item"><div class="kv-key">Updated</div><div class="kv-value">${fmtDate(node.updated_at)}</div></div>
                             </div>
