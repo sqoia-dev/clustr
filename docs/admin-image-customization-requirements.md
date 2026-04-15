@@ -2,7 +2,9 @@
 
 **Date:** 2026-04-13
 **Author:** Gilfoyle (Infra/Platform), input to ADR-0009 "Content-only images"
-**Status:** Draft — for Richard's review before ADR-0009 is authored
+**Status:** CURRENT — incorporated into ADR-0009 (commit 9f72232). Original "Draft" header is superseded. This document is the authoritative requirements reference backing ADR-0009 §5A, §5B, and §5C.
+
+**Last Verified:** 2026-04-13 — applies to clonr main @ 034b7d9
 
 ---
 

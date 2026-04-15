@@ -1,3 +1,7 @@
+> **SUPERSEDED — Sprint 1 plan only. See [sprint-2-plan.md](sprint-2-plan.md) for Sprint 2 scope and [sprint-3-plan.md](sprint-3-plan.md) for the current active sprint. This file is kept for historical record.**
+>
+> Last Verified: 2026-04-13 — applies to clonr main @ fbccab9 (Sprint 1 baseline)
+
 # clonr Sprint Plan — v1.0 "Ready"
 
 **Last updated:** 2026-04-13

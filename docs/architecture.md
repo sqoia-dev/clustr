@@ -1,3 +1,7 @@
+> **STALE — as of 2026-04-13.** This document was written before ADR-0009 (content-only images). It describes an image model with `BaseImage.Format: filesystem|block`, disk capture via `rsync`/`partclone`, and `DiskLayout` (including `Bootloader.Type`) embedded inside `BaseImage`. ADR-0009 obsoletes all of that: images are now content-only rootfs tarballs (`rootfs.tar.zst`), bootloader artifacts are generated fresh at deploy time, and there is no format variant. The struct definitions and package layout described here DO NOT reflect the current codebase. Use ADR-0009 and `pkg/api/types.go` as the authoritative source.
+>
+> Last Verified: 2026-04-12 — applies to clonr main @ 21f82f1 (pre-ADR-0009)
+
 # clonr Architecture Design
 
 ## Project Context & Irreversibility Assessment

@@ -1,3 +1,7 @@
+> **SUPERSEDED — Sprint 2 is complete. See [sprint-3-plan.md](sprint-3-plan.md) for the current active sprint. This file is kept for historical record and exit criteria review.**
+>
+> Last Verified: 2026-04-13 — applies to clonr main @ a15d762
+
 # clonr Sprint 2 Plan — v1.0 "Ready" Path
 
 **Last updated:** 2026-04-13  
