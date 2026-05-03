@@ -265,6 +265,14 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	log.Info().Str("db", cfg.DBPath).Msg("database ready")
 
+	// #243: Bootstrap control-plane host row (idempotent, creates on first run).
+	{
+		ctx := context.Background()
+		if _, err := database.BootstrapControlPlaneHost(ctx); err != nil {
+			log.Warn().Err(err).Msg("startup: failed to bootstrap control-plane host row (non-fatal)")
+		}
+	}
+
 	// S1-15/16: Validate CLUSTR_SECRET_KEY in non-dev mode.
 	// The server hard-fails if the key is unset to prevent credentials being stored
 	// in plaintext (LDAP passwords, BMC passwords) after the encryption migrations.

@@ -356,6 +356,8 @@ func (s *Server) StartBackgroundWorkers(ctx context.Context) {
 	// #250: Periodic image blob reconciler — default 6h, configurable via
 	// CLUSTR_RECONCILE_INTERVAL (0 = disabled).
 	go s.runImageReconciler(ctx, reconcileInterval())
+	// #243: SELF-MON — control-plane host self-monitoring.
+	go s.runSelfmon(ctx)
 }
 
 // runDigestProcessor polls the notification digest queue every hour and sends
@@ -1785,6 +1787,10 @@ func (s *Server) buildRouter() chi.Router {
 			// Sprint 22 #131: per-node stats query.
 			statsH := &handlers.StatsHandler{DB: NewStatsDBAdapter(s.db)}
 			r.Get("/nodes/{id}/stats", statsH.GetNodeStats)
+
+			// #243: SELF-MON — control-plane host status endpoint.
+			cpHandler := &handlers.ControlPlaneHandler{DB: handlers.NewControlPlaneDBAdapter(s.db)}
+			r.Get("/control-plane", cpHandler.ServeHTTP)
 
 			// Sprint 22 #133: alert rule engine — query active + recent alerts.
 			if s.alertStore != nil {
