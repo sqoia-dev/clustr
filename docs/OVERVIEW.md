@@ -47,15 +47,18 @@ interact. Pair this with `README.md` (operator quick-start) and
   webhook dispatcher.
 - Distributed via **signed dnf repositories** at `pkg.sqoia.dev/clustr/{el8,el9,el10}`.
 
-**clustr is not** (yet):
+**clustr is not**:
 
-- A general-purpose cluster monitoring system. Prometheus metrics are exposed
-  at `/metrics`, but stats collection / dashboards / alerting are not part of
-  the product.
+- A general-purpose cluster monitoring system. Per-node stats collection and an
+  alert rule engine are built in (see `internal/clientd/stats/` and
+  `internal/alerts/`), but clustr is not a replacement for a full observability
+  stack. Prometheus metrics are also exposed at `/metrics`.
 - A user-job scheduler. Slurm is treated as the workload manager; clustr
   manages Slurm's lifecycle (build, install, accounting users) but is not a
   scheduler itself.
-- Cross-distro. Debian/Ubuntu are explicitly out of scope (see `PACKAGING.md`).
+- Cross-distro in the general case. EL8 / EL9 / EL10 are the primary targets;
+  Ubuntu 20.04 / 22.04 / 24.04 and Debian are supported via the `DistroDriver`
+  interface (see `internal/deploy/distro/`). SLES is not supported.
 
 ---
 
