@@ -391,6 +391,59 @@ jobs:
       - name: SHA256 checksums (packages)
         run: cd dist && sha256sum *.rpm > ../checksums-server-${{ matrix.goarch }}.txt
 
+      # Assert that every clustr-serverd RPM declares the isoinstaller runtime
+      # dependencies in its Requires list.  If someone removes a dep from nfpm.yaml
+      # without also removing the code that uses the binary, this check fails.
+      # Only run on amd64 — the dep list is arch-independent; one check is enough.
+      - name: Assert isoinstaller Requires in built RPMs (amd64)
+        if: matrix.goarch == 'amd64'
+        run: |
+          set -euo pipefail
+          # Check all three EL RPMs; pick the first one for the detailed assertion.
+          RPMS=($(ls dist/clustr-serverd-*.rpm 2>/dev/null | sort))
+          if [ "${#RPMS[@]}" -eq 0 ]; then
+            echo "ERROR: no clustr-serverd RPMs found in dist/" >&2
+            exit 1
+          fi
+
+          # Canonical list of isoinstaller runtime deps that MUST appear in Requires.
+          # Keep this in sync with the depends: block in nfpm.yaml and with
+          # EnsureDependencies() in internal/image/isoinstaller/distro.go.
+          REQUIRED_DEPS=(
+            qemu-kvm
+            qemu-img
+            genisoimage
+            p7zip
+            p7zip-plugins
+            kpartx
+            rsync
+            edk2-ovmf
+          )
+
+          PASS=1
+          for RPM in "${RPMS[@]}"; do
+            echo "--- Checking Requires in: $(basename ${RPM}) ---"
+            REQUIRES=$(rpm -q --requires -p "${RPM}" 2>/dev/null)
+            echo "${REQUIRES}"
+            for DEP in "${REQUIRED_DEPS[@]}"; do
+              if echo "${REQUIRES}" | grep -q "^${DEP}"; then
+                echo "  OK: ${DEP}"
+              else
+                echo "  FAIL: ${DEP} missing from Requires in $(basename ${RPM})" >&2
+                PASS=0
+              fi
+            done
+          done
+
+          if [ "${PASS}" -ne 1 ]; then
+            echo ""
+            echo "One or more required isoinstaller deps are missing from the RPM Requires."
+            echo "Update the 'depends:' section in nfpm.yaml and ensure it matches"
+            echo "EnsureDependencies() in internal/image/isoinstaller/distro.go."
+            exit 1
+          fi
+          echo "All isoinstaller Requires assertions passed."
+
       - uses: actions/upload-artifact@v4
         with:
           name: server-linux-${{ matrix.goarch }}

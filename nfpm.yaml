@@ -46,22 +46,61 @@ vendor: Sqoia Labs
 homepage: https://github.com/sqoia-dev/clustr
 license: MIT
 
-# systemd-container provides systemd-nspawn, required by the image-shell feature.
-# memtest86+ ships in EL8 BaseOS and EL9/EL10 AppStream — no EPEL required.
-# dropbear is in EPEL for EL8, EL9, and EL10. Required by build-initramfs.sh to
-# embed an SSH server in the initramfs for debug access at boot time.
-# screen is in EPEL for EL8, EL9, and EL10. Used by build-initramfs.sh as the
-# interactive shell wrapper for the initramfs console fallback.
-# udpcast (fleet-reimage multicast, Sprint 25 #157) is vendored: udp-sender and
-# udp-receiver are built from source in CI and bundled in the RPM. No manual
-# install required. See build/udpcast/versions.yml and LICENSE-udpcast.
-# Package names are identical across EL8, EL9, and EL10.
-# EPEL is required for dropbear and screen — see README install section.
+# Runtime dependencies — all names are identical across EL8, EL9, and EL10 unless noted.
+#
+# ── ISO auto-install pipeline (internal/image/isoinstaller) ──────────────────
+# These are required on the clustr-serverd host for the ISO build feature.
+# A fresh EL install does NOT include them; without them the first image build
+# fails immediately rather than at install time. See EnsureDependencies() in
+# internal/image/isoinstaller/distro.go and ExtractRootfs() in extract.go.
+#
+# qemu-kvm       — QEMU binary at /usr/libexec/qemu-kvm; also pulls in qemu-img.
+#                  On RHEL/Rocky/Alma EL8/9/10 the package name is qemu-kvm.
+# qemu-img       — Explicit dependency: also called directly by factory.go for
+#                  qcow2→raw conversion (independent of qemu-kvm install path).
+# genisoimage    — Writes the seed ISO (kickstart/cloud-init). The isoinfo binary
+#                  (from this package) is also used by kernelboot.go and distro.go
+#                  for ISO volume label detection and vmlinuz/initrd extraction.
+# p7zip          — Provides the 7z binary. Required by kernelboot.go extractFromISO()
+#                  and comps/comps.go ProbeComps() for reading files from ISOs without
+#                  loop-mounting. On EL8/EL9: p7zip (EPEL). On EL10: package renamed
+#                  to 7zip in EPEL10 (binary is 7zz, not 7z) — operator note: if
+#                  targeting EL10 exclusively, substitute "7zip" here.
+#                  p7zip-plugins provides the 7z command wrapper on EL8/9.
+# p7zip-plugins  — Provides /usr/bin/7z symlink on EL8/9 (p7zip provides only 7za).
+# kpartx         — Required by extract.go ExtractRootfs() to create /dev/mapper/loopNpM
+#                  device-mapper aliases for reliable partition access. Hard failure
+#                  if absent. Provided by kpartx package (same EL8/9/10).
+# rsync          — Required by extract.go rsyncExtracted() and factory.go rsyncDir()
+#                  for rootfs capture. Same package name across all EL targets.
+# edk2-ovmf      — Provides OVMF_CODE.fd + OVMF_VARS.fd at /usr/share/edk2/ovmf/.
+#                  Required by vm.go buildQEMUArgs() for UEFI firmware (default mode).
+#                  Without it, every ISO build returns: "UEFI firmware requested but
+#                  OVMF pflash files not found". Package name is edk2-ovmf on EL8/9/10.
+#
+# ── initramfs builder (scripts/build-initramfs.sh) ───────────────────────────
+# systemd-container  — provides systemd-nspawn for the image-shell feature.
+# memtest86+         — ships in EL8 BaseOS and EL9/EL10 AppStream; no EPEL needed.
+# dropbear           — EPEL. SSH server embedded in initramfs for debug access at boot.
+# screen             — EPEL. Interactive shell fallback for initramfs console.
+#
+# EPEL is required for dropbear, screen, p7zip, p7zip-plugins, and kpartx on some
+# EL targets. See README install section for the enablement command.
 depends:
-  - systemd-container
-  - memtest86+
-  - dropbear    # EPEL — SSH server embedded in initramfs for debug access at boot
-  - screen      # EPEL — interactive shell fallback in initramfs console
+  # ── ISO auto-install pipeline ─────────────────────────────────────────────
+  - qemu-kvm         # RHEL family QEMU — /usr/libexec/qemu-kvm; EL8/9/10 identical
+  - qemu-img         # qemu-img binary for disk create + qcow2 convert; EL8/9/10 identical
+  - genisoimage      # seed ISO writer + isoinfo for volume label/kernel extraction; EL8/9/10
+  - p7zip            # 7za binary (EPEL); 7z command via p7zip-plugins; EL8/9 — see note above
+  - p7zip-plugins    # provides /usr/bin/7z symlink on EL8/9 (EPEL)
+  - kpartx           # /dev/mapper loop partition mappings for ExtractRootfs; EL8/9/10 (EPEL)
+  - rsync            # rootfs capture via rsync; EL8/9/10 identical
+  - edk2-ovmf        # UEFI firmware (OVMF_CODE.fd + OVMF_VARS.fd) for ISO build VMs; EL8/9/10
+  # ── initramfs builder ─────────────────────────────────────────────────────
+  - systemd-container  # systemd-nspawn for image-shell feature
+  - memtest86+         # memtest86+ in BaseOS/AppStream; no EPEL required
+  - dropbear           # EPEL — SSH server embedded in initramfs for debug access at boot
+  - screen             # EPEL — interactive shell fallback in initramfs console
 
 rpm:
   group: System Environment/Daemons
