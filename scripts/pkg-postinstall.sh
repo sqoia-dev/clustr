@@ -71,10 +71,41 @@ chown -R root:clustr /etc/clustr
 chmod 4755 /usr/sbin/clustr-privhelper
 
 # ---------------------------------------------------------------------------
+# SELF-MON (#243): Seed /etc/clustr/rules.d/ with the built-in rule files
+# if the target files are absent.  We never overwrite operator edits.
+# ---------------------------------------------------------------------------
+RULES_SRC_DIR=/usr/share/clustr/rules
+RULES_DST_DIR=/etc/clustr/rules.d
+
+# Ensure the rules.d directory exists.
+if [ ! -d "$RULES_DST_DIR" ]; then
+    mkdir -p "$RULES_DST_DIR"
+    chown root:clustr "$RULES_DST_DIR"
+    chmod 750 "$RULES_DST_DIR"
+fi
+
+# Copy each shipped rule file only if the destination doesn't exist.
+for src in "$RULES_SRC_DIR"/*.yaml "$RULES_SRC_DIR"/*.yml; do
+    [ -f "$src" ] || continue
+    dst="$RULES_DST_DIR/$(basename "$src")"
+    if [ ! -f "$dst" ]; then
+        cp "$src" "$dst"
+        chmod 640 "$dst"
+        chown root:clustr "$dst"
+    fi
+done
+
+# Enable the selfmon watchdog timer on first install so operators don't have to
+# remember to enable it manually.  We use --now to start it immediately, but
+# suppress errors: if clustr-serverd isn't running yet, the timer will fire
+# naturally once systemd processes the new units after daemon-reload.
+# ---------------------------------------------------------------------------
 # Reload systemd unit database
 # ---------------------------------------------------------------------------
 if command -v systemctl > /dev/null 2>&1; then
     systemctl daemon-reload || true
+    # Enable selfmon watchdog timer (idempotent).
+    systemctl enable clustr-selfmon-watchdog.timer 2>/dev/null || true
 fi
 
 # ---------------------------------------------------------------------------

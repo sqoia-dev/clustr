@@ -53,6 +53,15 @@ EnvironmentFile=-/etc/clustr/secrets.env
 Restart=on-failure
 RestartSec=5s
 
+# ---------------------------------------------------------------------------
+# Watchdog (#243 SELF-MON)
+# ---------------------------------------------------------------------------
+# systemd kills clustr-serverd if it does not call sd_notify(WATCHDOG=1) within
+# WatchdogSec.  The selfmon goroutine sends the keepalive on every 30s tick.
+# If the metrics collector goroutine hangs or panics, the process is killed and
+# restarted — cp.serverd.restart.crit will fire on the next evaluation cycle.
+WatchdogSec=90
+
 # Give systemd 5 minutes to wait for a clean stop before sending SIGKILL.
 # ISO builds via QEMU take 10-15 minutes; the server's graceful shutdown
 # handler drains in-flight builds for up to 120 seconds. 300s gives the
