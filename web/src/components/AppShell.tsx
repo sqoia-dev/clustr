@@ -1,6 +1,6 @@
 import * as React from "react"
 import { Link, useRouterState, useNavigate } from "@tanstack/react-router"
-import { Server, Image, Activity, Settings, ShieldCheck, Cpu, Building2, Bell, ChevronsLeft, ChevronsRight, Command as CmdIcon, Sun, Moon, LogOut, User, WifiOff, GitCommit, ChevronDown, ChevronRight, Trash2, Check, X } from "lucide-react"
+import { Server, Image, Activity, Settings, ShieldCheck, Cpu, Building2, Bell, ChevronsLeft, ChevronsRight, Command as CmdIcon, Sun, Moon, LogOut, User, WifiOff, GitCommit, ChevronDown, ChevronRight, Trash2, Check, X, MonitorDot } from "lucide-react"
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import { Button } from "@/components/ui/button"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
@@ -21,6 +21,7 @@ const navItems = [
   { label: "Datacenter", path: "/datacenter", icon: Building2, active: true },
   { label: "Activity", path: "/activity", icon: Activity, active: true },
   { label: "Identity", path: "/identity", icon: ShieldCheck, active: true },
+  { label: "Control Plane", path: "/control-plane", icon: MonitorDot, active: true },
   { label: "Settings", path: "/settings", icon: Settings, active: true },
 ]
 
@@ -295,6 +296,57 @@ function PendingChangesDrawer({
 
 // ─── AppShell ─────────────────────────────────────────────────────────────────
 
+// ─── Control-plane status strip ──────────────────────────────────────────────
+
+interface CPStripStatus {
+  overall_status: "healthy" | "degraded" | "critical"
+  host: { hostname: string }
+}
+
+function ControlPlaneStrip() {
+  const navigate = useNavigate()
+  const { data } = useQuery<CPStripStatus>({
+    queryKey: ["cp-strip-status"],
+    queryFn: () => apiFetch("/api/v1/control-plane"),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+    // Fail silently — the strip disappears if the endpoint isn't ready yet.
+    retry: 0,
+  })
+
+  // Only show when status is not healthy (or when critical — non-dismissible).
+  if (!data || data.overall_status === "healthy") return null
+
+  const isCrit = data.overall_status === "critical"
+
+  return (
+    <div
+      role="alert"
+      className={cn(
+        "flex items-center justify-between gap-3 px-4 py-1.5 text-xs shrink-0 cursor-pointer",
+        isCrit
+          ? "bg-destructive/15 border-b border-destructive/40 text-destructive"
+          : "bg-amber-500/10 border-b border-amber-500/30 text-amber-400"
+      )}
+      onClick={() => navigate({ to: "/control-plane" })}
+    >
+      <span className="flex items-center gap-2">
+        <span className={cn("h-1.5 w-1.5 rounded-full shrink-0", isCrit ? "bg-destructive" : "bg-amber-400")} />
+        <span>
+          Control plane{" "}
+          <span className="font-semibold">{data.overall_status}</span>
+          {data.host?.hostname && <span className="text-muted-foreground ml-1">— {data.host.hostname}</span>}
+        </span>
+      </span>
+      <span className="underline underline-offset-2 hover:no-underline shrink-0">
+        View details
+      </span>
+    </div>
+  )
+}
+
+// ─── AppShell ─────────────────────────────────────────────────────────────────
+
 export function AppShell({ children }: { children: React.ReactNode }) {
   const [collapsed, setCollapsed] = React.useState(false)
   const [paletteOpen, setPaletteOpen] = React.useState(false)
@@ -389,7 +441,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const conn = paused ? connectionConfig.paused : connectionConfig[status]
 
   return (
-    <div className="flex h-full bg-background text-foreground">
+    <div className="flex flex-col h-full">
+      {/* Control-plane status strip (non-dismissible, above everything) */}
+      <ControlPlaneStrip />
+
+      <div className="flex flex-1 bg-background text-foreground min-h-0">
       {/* A11Y-1: skip-to-main link */}
       <a
         href="#main-content"
@@ -567,6 +623,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         open={changesDrawerOpen}
         onClose={() => setChangesDrawerOpen(false)}
       />
+      </div>{/* end flex row (sidebar + main) */}
     </div>
   )
 }

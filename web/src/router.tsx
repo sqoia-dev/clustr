@@ -11,6 +11,7 @@ import { IdentityPage } from "@/routes/identity"
 import { SlurmPage } from "@/routes/slurm"
 import { AlertsPage } from "@/routes/alerts"
 import { DatacenterPage } from "@/routes/datacenter"
+import { ControlPlanePage } from "@/routes/control-plane"
 import { SessionGate } from "@/components/SessionGate"
 
 const rootRoute = createRootRoute({
@@ -152,6 +153,12 @@ const datacenterRoute = createRoute({
   component: DatacenterPage,
 })
 
+const controlPlaneRoute = createRoute({
+  getParentRoute: () => protectedLayout,
+  path: "/control-plane",
+  component: ControlPlanePage,
+})
+
 const routeTree = rootRoute.addChildren([
   loginRoute,
   setupRoute,
@@ -166,6 +173,7 @@ const routeTree = rootRoute.addChildren([
     slurmRoute,
     alertsRoute,
     datacenterRoute,
+    controlPlaneRoute,
   ]),
 ])
 
