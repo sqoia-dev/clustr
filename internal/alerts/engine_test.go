@@ -54,10 +54,14 @@ notify:
 		t.Fatal(err)
 	}
 
-	r, err := loadRuleFile(path)
+	rules, err := loadRuleFile(path)
 	if err != nil {
 		t.Fatalf("loadRuleFile: %v", err)
 	}
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(rules))
+	}
+	r := rules[0]
 	if r.Name != "disk-percent" {
 		t.Errorf("Name = %q, want %q", r.Name, "disk-percent")
 	}
