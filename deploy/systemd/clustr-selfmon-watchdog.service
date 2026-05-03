@@ -1,0 +1,45 @@
+# clustr-selfmon-watchdog.service — "who watches the watcher"
+#
+# Runs every 5 minutes (via clustr-selfmon-watchdog.timer) and checks whether
+# the selfmon heartbeat file was touched within the last 3 minutes.
+#
+# If stale:
+#   - Logs to syslog at priority CRIT.
+#   - Posts to the operator-configured fallback webhook (if present).
+#
+# This is intentionally a separate process from clustr-serverd so that it fires
+# even when clustr-serverd itself is crashed, deadlocked, or has the DB locked.
+#
+# Fallback webhook: write the URL to /etc/clustr/fallback-alert-url (one URL,
+# no trailing newline).  Payload is a plain JSON object:
+#   {"event":"selfmon.stale","host":"<hostname>","age_seconds":<n>}
+
+[Unit]
+Description=clustr selfmon heartbeat watchdog
+After=clustr-serverd.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c '\
+  HEARTBEAT=/run/clustr/selfmon.heartbeat; \
+  MAX_AGE=180; \
+  if [ ! -f "$HEARTBEAT" ]; then \
+    logger -p daemon.crit -t clustr-selfmon "CRIT: heartbeat file missing ($HEARTBEAT) — selfmon goroutine may be dead"; \
+    exit 0; \
+  fi; \
+  MTIME=$(stat -c %Y "$HEARTBEAT" 2>/dev/null || echo 0); \
+  NOW=$(date +%s); \
+  AGE=$((NOW - MTIME)); \
+  if [ "$AGE" -gt "$MAX_AGE" ]; then \
+    HOST=$(hostname -s); \
+    logger -p daemon.crit -t clustr-selfmon "CRIT: selfmon heartbeat stale (${AGE}s old, max ${MAX_AGE}s) — clustr-serverd metrics collector may be hung"; \
+    FALLBACK=/etc/clustr/fallback-alert-url; \
+    if [ -f "$FALLBACK" ]; then \
+      URL=$(cat "$FALLBACK" | tr -d "[:space:]"); \
+      PAYLOAD="{\"event\":\"selfmon.stale\",\"host\":\"${HOST}\",\"age_seconds\":${AGE}}"; \
+      curl -sf -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$URL" \
+        --max-time 10 --retry 2 --retry-delay 2 2>&1 | logger -t clustr-selfmon || true; \
+    fi; \
+  fi'
+StandardOutput=null
+StandardError=journal

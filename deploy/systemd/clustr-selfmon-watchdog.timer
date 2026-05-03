@@ -1,0 +1,20 @@
+# clustr-selfmon-watchdog.timer — fires clustr-selfmon-watchdog.service every 5 minutes.
+#
+# The selfmon goroutine touches /run/clustr/selfmon.heartbeat every 30s.
+# We check every 5 minutes (10× the heartbeat interval) to give the goroutine
+# ample time to recover from transient slowness without false positives.
+#
+# Enable on package install:
+#   systemctl enable --now clustr-selfmon-watchdog.timer
+
+[Unit]
+Description=clustr selfmon heartbeat watchdog timer
+After=clustr-serverd.service
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

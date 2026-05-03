@@ -101,6 +101,8 @@ depends:
   - memtest86+         # memtest86+ in BaseOS/AppStream; no EPEL required
   - dropbear           # EPEL — SSH server embedded in initramfs for debug access at boot
   - screen             # EPEL — interactive shell fallback in initramfs console
+  # ── SELF-MON (#243) ───────────────────────────────────────────────────────
+  - chrony             # chronyc binary required by the NTP metric collector
 
 rpm:
   group: System Environment/Daemons
@@ -228,6 +230,38 @@ contents:
   # also available on-disk at /usr/share/clustr/schema/v1/ for third-party tooling.
   - src: pkg/api/schema/v1/*.json
     dst: /usr/share/clustr/schema/v1/
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+
+  # ── SELF-MON (#243) — alert rule files ───────────────────────────────────
+  # Shipped to /usr/share/clustr/rules/ (canonical, never edited by operator).
+  # pkg-postinstall.sh copies them to /etc/clustr/rules.d/ on first install.
+  - src: deploy/rules/control-plane.yaml
+    dst: /usr/share/clustr/rules/control-plane.yaml
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+
+  - dst: /usr/share/clustr/rules
+    type: dir
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+
+  # ── SELF-MON (#243) — selfmon watchdog systemd units ─────────────────────
+  - src: deploy/systemd/clustr-selfmon-watchdog.service
+    dst: /usr/lib/systemd/system/clustr-selfmon-watchdog.service
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+
+  - src: deploy/systemd/clustr-selfmon-watchdog.timer
+    dst: /usr/lib/systemd/system/clustr-selfmon-watchdog.timer
     file_info:
       mode: 0644
       owner: root
