@@ -52,6 +52,8 @@ jobs:
     steps:
       - name: Install build dependencies
         run: |
+          # busybox is in EPEL, not BaseOS/AppStream — enable it first.
+          dnf install -y epel-release
           dnf install -y --setopt=install_weak_deps=False \
             kernel-modules \
             kernel-modules-extra \
