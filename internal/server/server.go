@@ -991,6 +991,7 @@ func (s *Server) buildRouter() chi.Router {
 		WebhookDispatcher: s.webhookDispatcher,
 		ImageEvents:       s.imageEvents,
 		ImageReconciler:   s, // #251: reconcile endpoint — s implements ImageReconcilerIface
+		// Factory wired below after imgFactory is initialised.
 	}
 
 	bundlesH := &handlers.BundlesHandler{
@@ -1065,6 +1066,8 @@ func (s *Server) buildRouter() chi.Router {
 		)
 	}
 	imgFactory := s.imgFactory
+	// Wire the factory into the images handler now that imgFactory is initialised.
+	images.Factory = imgFactory
 	factory := &handlers.FactoryHandler{
 		DB:       s.db,
 		ImageDir: s.cfg.ImageDir,

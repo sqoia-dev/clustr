@@ -53,6 +53,10 @@ type ImageReconcilerIface interface {
 type ImagesHandler struct {
 	DB       *db.DB
 	ImageDir string
+	// Factory is used by FromURL to delegate URL-based image ingest through the
+	// full pipeline (pull → extract → ISO build for .iso URLs). Required for
+	// FromURL to function; returns 501 if nil.
+	Factory *image.Factory
 	// Progress is used by DeleteImage to check for active deploys.
 	// It is optional — when nil, the active-deploy guard is skipped.
 	Progress ProgressStoreIface
@@ -1233,22 +1237,24 @@ func (cw *countWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// FromURL handles POST /api/v1/images/from-url — IMG-URL-1..3.
+// FromURL handles POST /api/v1/images/from-url.
 //
 // Request body: {"url":"https://…","name":"optional","expected_sha256":"optional"}
+// (expected_sha256 is accepted for backward compatibility but ignored — the
+// Factory pipeline computes its own checksums over the extracted rootfs.)
 //
-// Returns immediately with {id, status:"building"} and kicks off an async download
-// goroutine that streams the file to disk, computes SHA256, finalises the image
-// record, and emits SSE events throughout.
+// Delegates entirely to Factory.PullImage so that .iso URLs reach the
+// qemu+kickstart build pipeline instead of being persisted as raw blobs.
+// Returns 202 immediately with {id, image_id, status:"building"}; the factory
+// transitions the record to "ready" (or "error") asynchronously.
 //
-// SSRF guard (IMG-URL-2): only http/https URLs are accepted; HEAD check is performed
-// to verify reachability and read Content-Length; private RFC-1918 IPs are rejected
-// unless CLUSTR_ALLOW_PRIVATE_IMAGE_URLS=true.
+// SSRF guard: only http/https URLs are accepted; private RFC-1918 IPs are
+// rejected unless CLUSTR_ALLOW_PRIVATE_IMAGE_URLS=true.
 func (h *ImagesHandler) FromURL(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		URL            string `json:"url"`
 		Name           string `json:"name"`
-		ExpectedSHA256 string `json:"expected_sha256"`
+		ExpectedSHA256 string `json:"expected_sha256"` // accepted, not forwarded
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeValidationError(w, "invalid JSON body")
@@ -1258,7 +1264,7 @@ func (h *ImagesHandler) FromURL(w http.ResponseWriter, r *http.Request) {
 		writeValidationError(w, "url is required")
 		return
 	}
-	// IMG-URL-2: only http/https.
+	// Only http/https allowed.
 	if !strings.HasPrefix(req.URL, "http://") && !strings.HasPrefix(req.URL, "https://") {
 		writeValidationError(w, "url must use http or https scheme")
 		return
@@ -1273,6 +1279,15 @@ func (h *ImagesHandler) FromURL(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+	}
+
+	// Input is valid; require the factory to be wired before proceeding.
+	if h.Factory == nil {
+		writeJSON(w, http.StatusNotImplemented, api.ErrorResponse{
+			Error: "image factory not configured",
+			Code:  "factory_unavailable",
+		})
+		return
 	}
 
 	// Auto-suggest name from URL filename when not provided.
@@ -1290,30 +1305,24 @@ func (h *ImagesHandler) FromURL(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	now := time.Now().UTC()
-	img := api.BaseImage{
-		ID:        uuid.New().String(),
-		Name:      name,
-		Status:    api.ImageStatusBuilding,
-		Format:    api.ImageFormatBlock,
-		SourceURL: req.URL,
-		Tags:      []string{},
-		CreatedAt: now,
-	}
-
-	if err := h.DB.CreateBaseImage(r.Context(), img); err != nil {
-		log.Error().Err(err).Msg("from-url: create image record")
+	// Delegate to the factory. PullImage creates the DB record synchronously
+	// (status=building) and dispatches the download+extract pipeline async.
+	// For .iso URLs, pullAndExtract routes to buildFromISOFile which runs an
+	// unattended QEMU install rather than treating the ISO as a raw disk.
+	img, err := h.Factory.PullImage(r.Context(), api.PullRequest{
+		URL:  req.URL,
+		Name: name,
+	})
+	if err != nil {
+		log.Error().Err(err).Msg("from-url: factory.PullImage failed")
 		writeError(w, err)
 		return
 	}
 
 	if h.ImageEvents != nil {
-		imgCopy := img
+		imgCopy := *img
 		h.ImageEvents.Publish(api.ImageEvent{Kind: api.ImageEventCreated, Image: &imgCopy, ID: img.ID})
 	}
-
-	// Launch async download.
-	go h.downloadFromURL(img.ID, req.URL, req.ExpectedSHA256)
 
 	if h.Audit != nil {
 		aID, aLabel := "", ""
@@ -1372,99 +1381,6 @@ func rejectPrivateURL(rawURL string) error {
 		return fmt.Errorf("url resolves to a private or loopback address (%s)", host)
 	}
 	return nil
-}
-
-// downloadFromURL performs the actual HTTP download in the background.
-// On completion it finalises the image record or marks it as error.
-func (h *ImagesHandler) downloadFromURL(imageID, rawURL, expectedSHA256 string) {
-	ctx, cancel := context.WithTimeout(context.Background(), blobDownloadTimeout())
-	defer cancel()
-
-	if err := os.MkdirAll(h.ImageDir, 0o755); err != nil {
-		log.Error().Err(err).Str("image_id", imageID).Msg("from-url: mkdirall")
-		h.failImageDownload(imageID, fmt.Errorf("mkdir: %w", err))
-		return
-	}
-
-	blobPath := filepath.Join(h.ImageDir, imageID+".blob")
-
-	// Use NewRequestWithContext so the download is bound to the context deadline.
-	// http.Client.Timeout fires even mid-stream (cuts a live download); context
-	// cancellation propagates through the body reader instead, which is correct
-	// for large blob transfers. //#nosec G107 — URL validated above
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		h.failImageDownload(imageID, fmt.Errorf("build request: %w", err))
-		return
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		h.failImageDownload(imageID, fmt.Errorf("http get: %w", err))
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		h.failImageDownload(imageID, fmt.Errorf("server returned %d", resp.StatusCode))
-		return
-	}
-
-	f, err := os.Create(blobPath)
-	if err != nil {
-		h.failImageDownload(imageID, fmt.Errorf("create file: %w", err))
-		return
-	}
-
-	hasher := sha256.New()
-	n, copyErr := io.Copy(f, io.TeeReader(resp.Body, hasher))
-	closeErr := f.Close()
-	if copyErr != nil {
-		_ = os.Remove(blobPath)
-		h.failImageDownload(imageID, fmt.Errorf("download: %w", copyErr))
-		return
-	}
-	if closeErr != nil {
-		_ = os.Remove(blobPath)
-		h.failImageDownload(imageID, fmt.Errorf("close file: %w", closeErr))
-		return
-	}
-
-	serverChecksum := hex.EncodeToString(hasher.Sum(nil))
-
-	// IMG-URL-3: verify expected SHA256 if provided.
-	if expectedSHA256 != "" && !strings.EqualFold(expectedSHA256, serverChecksum) {
-		_ = os.Remove(blobPath)
-		h.failImageDownload(imageID, fmt.Errorf("sha256 mismatch: expected %s, got %s", expectedSHA256, serverChecksum))
-		return
-	}
-
-	if err := h.DB.SetBlobPath(ctx, imageID, blobPath); err != nil {
-		h.failImageDownload(imageID, fmt.Errorf("set blob path: %w", err))
-		return
-	}
-	if err := h.DB.FinalizeBaseImage(ctx, imageID, n, serverChecksum); err != nil {
-		h.failImageDownload(imageID, fmt.Errorf("finalize: %w", err))
-		return
-	}
-
-	updated, err := h.DB.GetBaseImage(ctx, imageID)
-	if err == nil && h.ImageEvents != nil {
-		h.ImageEvents.Publish(api.ImageEvent{Kind: api.ImageEventFinalized, Image: &updated, ID: updated.ID})
-	}
-	log.Info().Str("image_id", imageID).Str("sha256", serverChecksum).Int64("bytes", n).Msg("from-url: download complete")
-}
-
-// failImageDownload marks the image as error and emits an SSE event.
-func (h *ImagesHandler) failImageDownload(imageID string, reason error) {
-	log.Error().Err(reason).Str("image_id", imageID).Msg("from-url: download failed")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if dbErr := h.DB.UpdateBaseImageStatus(ctx, imageID, api.ImageStatusError, reason.Error()); dbErr != nil {
-		log.Error().Err(dbErr).Str("image_id", imageID).Msg("from-url: update status failed")
-	}
-	if h.ImageEvents != nil {
-		h.ImageEvents.Publish(api.ImageEvent{Kind: api.ImageEventUpdated, ID: imageID})
-	}
 }
 
 // StreamImageEvents handles GET /api/v1/images/events — SSE-1.

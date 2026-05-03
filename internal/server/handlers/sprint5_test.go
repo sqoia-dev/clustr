@@ -26,13 +26,17 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/rs/zerolog"
 	"github.com/sqoia-dev/clustr/internal/db"
+	"github.com/sqoia-dev/clustr/internal/image"
 	"github.com/sqoia-dev/clustr/pkg/api"
 )
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 // newImagesHandler builds an ImagesHandler wired to a fresh test DB.
+// Factory is not wired — use newImagesHandlerWithFactory for tests that
+// exercise the from-url success path.
 func newImagesHandler(t *testing.T) (*ImagesHandler, *db.DB) {
 	t.Helper()
 	d := openTestDB(t)
@@ -40,6 +44,22 @@ func newImagesHandler(t *testing.T) (*ImagesHandler, *db.DB) {
 	h := &ImagesHandler{
 		DB:       d,
 		ImageDir: imageDir,
+	}
+	return h, d
+}
+
+// newImagesHandlerWithFactory builds an ImagesHandler with a real Factory wired,
+// for tests that exercise the from-url delegated-to-Factory path.
+func newImagesHandlerWithFactory(t *testing.T) (*ImagesHandler, *db.DB) {
+	t.Helper()
+	d := openTestDB(t)
+	imageDir := t.TempDir()
+	f := image.NewFactory(d, imageDir, zerolog.Nop(), nil, t.TempDir())
+	f.SetContext(context.Background())
+	h := &ImagesHandler{
+		DB:       d,
+		ImageDir: imageDir,
+		Factory:  f,
 	}
 	return h, d
 }
@@ -140,35 +160,82 @@ func TestFromURL_MissingURL(t *testing.T) {
 	}
 }
 
-// TestFromURL_Success_AsyncDownload verifies that a valid public URL returns 202
-// immediately with the image_id field.
-// We serve a tiny local HTTP server so the download has a real endpoint.
-func TestFromURL_Success_AsyncDownload(t *testing.T) {
-	// Tiny file server.
-	content := "fake iso content"
+// TestFromURL_DelegatestoFactory verifies that a valid URL returns 202 immediately
+// with the correct shape, and that the DB row was created by Factory.PullImage
+// (evidenced by format=filesystem — Factory's default — vs the old raw-download
+// path which hardcoded format=block).
+func TestFromURL_DelegatestoFactory(t *testing.T) {
+	// Serve a minimal payload so the factory has something to download.
+	// The async goroutine will attempt to process the file; we only assert the
+	// synchronous (pre-async) DB state here.
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		_, _ = io.WriteString(w, content)
+		_, _ = io.WriteString(w, "placeholder")
 	}))
 	defer ts.Close()
 
-	h, _ := newImagesHandler(t)
-	// Allow private URLs so we can use the local test server.
+	h, d := newImagesHandlerWithFactory(t)
 	t.Setenv("CLUSTR_ALLOW_PRIVATE_IMAGE_URLS", "true")
 
 	w := postJSON(h.FromURL, "/api/v1/images/from-url", map[string]string{
-		"url":  ts.URL + "/test.iso",
+		"url":  ts.URL + "/test.img",
 		"name": "test-img",
 	})
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("expected 202, got %d; body: %s", w.Code, w.Body.String())
 	}
+
+	// (a) Response shape: must have id/image_id and status fields.
 	var resp map[string]interface{}
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if resp["image_id"] == "" && resp["id"] == "" {
-		t.Errorf("expected image_id in response, got: %v", resp)
+	imageID, _ := resp["id"].(string)
+	if imageID == "" {
+		imageID, _ = resp["image_id"].(string)
+	}
+	if imageID == "" {
+		t.Fatalf("expected id/image_id in response, got: %v", resp)
+	}
+	if resp["status"] == "" {
+		t.Errorf("expected status in response, got: %v", resp)
+	}
+
+	// (b) Factory.PullImage was invoked: the DB row must exist with status=building
+	// and format=filesystem (Factory default). The old raw-download path hardcoded
+	// format=block, so format=filesystem is proof the factory code path ran.
+	img, err := d.GetBaseImage(context.Background(), imageID)
+	if err != nil {
+		t.Fatalf("GetBaseImage: %v", err)
+	}
+	if img.Status != api.ImageStatusBuilding {
+		t.Errorf("expected status=building, got %q", img.Status)
+	}
+	if img.Format != api.ImageFormatFilesystem {
+		t.Errorf("expected format=filesystem (Factory default), got %q — this means the old raw-download path ran instead of Factory", img.Format)
+	}
+	if img.SourceURL != ts.URL+"/test.img" {
+		t.Errorf("expected source_url to match request URL, got %q", img.SourceURL)
+	}
+}
+
+// TestFromURL_NoFactory_Returns501 verifies that FromURL returns 501 when the
+// Factory field is nil, but only after valid input passes validation.
+func TestFromURL_NoFactory_Returns501(t *testing.T) {
+	h, _ := newImagesHandler(t) // no factory wired
+	t.Setenv("CLUSTR_ALLOW_PRIVATE_IMAGE_URLS", "true")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer ts.Close()
+
+	w := postJSON(h.FromURL, "/api/v1/images/from-url", map[string]string{
+		"url":  ts.URL + "/test.img",
+		"name": "test",
+	})
+	if w.Code != http.StatusNotImplemented {
+		t.Errorf("expected 501 when factory is nil, got %d; body: %s", w.Code, w.Body.String())
 	}
 }
 
