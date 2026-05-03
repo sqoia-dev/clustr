@@ -1,6 +1,7 @@
 package alerts
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -206,18 +207,20 @@ func (e *Engine) reloadRulesIfChanged() {
 	sort.Strings(paths)
 
 	for _, path := range paths {
-		rule, err := loadRuleFile(path)
+		rules, err := loadRuleFile(path)
 		if err != nil {
 			log.Error().Err(err).Str("file", path).Msg("alerts: skipping malformed rule file")
 			continue
 		}
-		if _, dup := names[rule.Name]; dup {
-			log.Error().Str("rule", rule.Name).Str("file", path).
-				Msg("alerts: duplicate rule name — skipping")
-			continue
+		for _, rule := range rules {
+			if _, dup := names[rule.Name]; dup {
+				log.Error().Str("rule", rule.Name).Str("file", path).
+					Msg("alerts: duplicate rule name — skipping")
+				continue
+			}
+			names[rule.Name] = struct{}{}
+			loaded = append(loaded, rule)
 		}
-		names[rule.Name] = struct{}{}
-		loaded = append(loaded, rule)
 	}
 
 	e.mu.Lock()
@@ -228,21 +231,53 @@ func (e *Engine) reloadRulesIfChanged() {
 	log.Info().Int("count", len(loaded)).Msg("alerts: rules loaded")
 }
 
-// loadRuleFile parses a single YAML rule file.
-func loadRuleFile(path string) (*Rule, error) {
+// loadRuleFile parses one or more YAML rule documents from a single file.
+// Multi-document YAML (--- separator) is supported so that large rule sets like
+// control-plane.yaml can live in a single file without one-file-per-rule bloat.
+// Single-document files (the legacy format) are parsed identically.
+func loadRuleFile(path string) ([]*Rule, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var r Rule
-	if err := yaml.Unmarshal(data, &r); err != nil {
-		return nil, err
+	// Split into individual YAML documents on "---" separators, then parse each.
+	// This is more reliable than using the Decoder for detecting truly empty docs.
+	docs := splitYAMLDocs(data)
+	var rules []*Rule
+	for _, doc := range docs {
+		if len(bytes.TrimSpace(doc)) == 0 {
+			continue // skip blank documents (trailing --- etc.)
+		}
+		var r Rule
+		if err := yaml.Unmarshal(doc, &r); err != nil {
+			return nil, err
+		}
+		r.sourceFile = path
+		if err := r.Validate(); err != nil {
+			return nil, err
+		}
+		rules = append(rules, &r)
 	}
-	r.sourceFile = path
-	if err := r.Validate(); err != nil {
-		return nil, err
+	if len(rules) == 0 {
+		return nil, nil
 	}
-	return &r, nil
+	return rules, nil
+}
+
+// splitYAMLDocs splits a multi-document YAML byte slice on "---" document
+// separators.  The separator must appear on its own line.
+func splitYAMLDocs(data []byte) [][]byte {
+	var docs [][]byte
+	sep := []byte("\n---")
+	// Handle leading "---" at the start of the file.
+	trimmed := bytes.TrimPrefix(data, []byte("---\n"))
+	parts := bytes.Split(append([]byte("\n"), trimmed...), sep)
+	for _, p := range parts {
+		// Strip the leading newline we injected above.
+		p = bytes.TrimPrefix(p, []byte("\n"))
+		docs = append(docs, p)
+	}
+	return docs
 }
 
 // ─── evaluation ───────────────────────────────────────────────────────────────
@@ -266,8 +301,11 @@ func (e *Engine) evaluate(ctx context.Context) {
 // evaluateRule evaluates a single rule against node_stats.
 func (e *Engine) evaluateRule(ctx context.Context, r *Rule) {
 	// cluster-nodes-offline is a meta-rule that checks node presence, not stats.
+	// It only applies to cluster_node role.
 	if r.Plugin == "_meta" && r.Sensor == "node_offline" {
-		e.evaluateOfflineRule(ctx, r)
+		if r.AppliesToRole(HostRoleClusterNode) {
+			e.evaluateOfflineRule(ctx, r)
+		}
 		return
 	}
 
@@ -285,17 +323,37 @@ func (e *Engine) evaluateRule(ctx context.Context, r *Rule) {
 	e.evaluateRuleAllNodes(ctx, r, since, until)
 }
 
-// evaluateRuleAllNodes queries node_stats for all nodes that have data for
-// (plugin, sensor) in the window and runs the threshold check per-group.
+// evaluateRuleAllNodes queries node_stats for all hosts that have data for
+// (plugin, sensor) in the window, filtered by the rule's host_role selector,
+// and runs the threshold check per-group.
 func (e *Engine) evaluateRuleAllNodes(ctx context.Context, r *Rule, since, until time.Time) {
-	// Query all nodes with data for this plugin/sensor in the window.
-	// We can't pass empty node_id to QueryNodeStats (requires a specific node),
-	// so we use a raw query here to get distinct node_ids first.
+	// Build the query that filters node_ids by the rule's host role.
+	// - cluster_node: node_id must appear in node_configs (cluster nodes only)
+	// - control_plane: node_id must appear in hosts WHERE role='control_plane'
+	// - any: no role filter
+	var (
+		nodeRowsQuery string
+		nodeRowsArgs  []interface{}
+	)
+	switch r.EffectiveHostRole() {
+	case HostRoleControlPlane:
+		nodeRowsQuery = `SELECT DISTINCT ns.node_id FROM node_stats ns
+		 INNER JOIN hosts h ON h.id = ns.node_id AND h.role = 'control_plane'
+		 WHERE ns.plugin = ? AND ns.sensor = ? AND ns.ts >= ? AND ns.ts <= ?`
+		nodeRowsArgs = []interface{}{r.Plugin, r.Sensor, since.Unix(), until.Unix()}
+	case HostRoleAny:
+		nodeRowsQuery = `SELECT DISTINCT node_id FROM node_stats
+		 WHERE plugin = ? AND sensor = ? AND ts >= ? AND ts <= ?`
+		nodeRowsArgs = []interface{}{r.Plugin, r.Sensor, since.Unix(), until.Unix()}
+	default: // cluster_node
+		nodeRowsQuery = `SELECT DISTINCT ns.node_id FROM node_stats ns
+		 INNER JOIN node_configs nc ON nc.id = ns.node_id
+		 WHERE ns.plugin = ? AND ns.sensor = ? AND ns.ts >= ? AND ns.ts <= ?`
+		nodeRowsArgs = []interface{}{r.Plugin, r.Sensor, since.Unix(), until.Unix()}
+	}
+
 	type nodeEntry struct{ id string }
-	nodeRows, err := e.nodeDB.SQL().QueryContext(ctx,
-		`SELECT DISTINCT node_id FROM node_stats
-		 WHERE plugin = ? AND sensor = ? AND ts >= ? AND ts <= ?`,
-		r.Plugin, r.Sensor, since.Unix(), until.Unix())
+	nodeRows, err := e.nodeDB.SQL().QueryContext(ctx, nodeRowsQuery, nodeRowsArgs...)
 	if err != nil {
 		log.Warn().Err(err).Str("rule", r.Name).Msg("alerts: query node list failed")
 		return

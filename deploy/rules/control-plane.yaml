@@ -1,0 +1,295 @@
+# control-plane.yaml — Default alert rules for the clustr-serverd control-plane host.
+#
+# Installed by the RPM to /usr/share/clustr/rules/control-plane.yaml.
+# Copied to /etc/clustr/rules.d/ on first boot (if absent) by pkg-postinstall.sh.
+#
+# All rules use match.host_role: control_plane so they only fire against the
+# control-plane host metrics injected by the selfmon goroutine (#243).
+# Existing cluster-node rules default to host_role: cluster_node and are
+# unaffected by this file.
+
+---
+name: cp.disk.root.warn
+description: "Control-plane rootfs used > 85%"
+plugin: disks
+sensor: used_pct
+labels:
+  mount: "/"
+match:
+  host_role: control_plane
+threshold:
+  op: ">="
+  value: 85
+duration: 300s
+severity: warn
+notify:
+  webhook: true
+  email: []
+
+---
+name: cp.disk.root.crit
+description: "Control-plane rootfs used > 95%"
+plugin: disks
+sensor: used_pct
+labels:
+  mount: "/"
+match:
+  host_role: control_plane
+threshold:
+  op: ">="
+  value: 95
+duration: 60s
+severity: critical
+notify:
+  webhook: true
+  email: []
+
+---
+name: cp.disk.data.warn
+description: "clustr data volume (/var/lib/clustr) used > 85%"
+plugin: disks
+sensor: used_pct
+labels:
+  mount: "/var/lib/clustr"
+match:
+  host_role: control_plane
+threshold:
+  op: ">="
+  value: 85
+duration: 300s
+severity: warn
+notify:
+  webhook: true
+  email: []
+
+---
+name: cp.disk.data.crit
+description: "clustr data volume (/var/lib/clustr) used > 95%"
+plugin: disks
+sensor: used_pct
+labels:
+  mount: "/var/lib/clustr"
+match:
+  host_role: control_plane
+threshold:
+  op: ">="
+  value: 95
+duration: 60s
+severity: critical
+notify:
+  webhook: true
+  email: []
+
+---
+name: cp.disk.scratch.warn
+description: "Build scratch dir (/var/lib/clustr/tmp) free < 25 GB"
+plugin: disks
+sensor: free_bytes
+labels:
+  mount: "/var/lib/clustr/tmp"
+match:
+  host_role: control_plane
+threshold:
+  op: "<"
+  value: 26843545600
+duration: 300s
+severity: warn
+notify:
+  webhook: true
+  email: []
+
+---
+name: cp.disk.scratch.crit
+description: "Build scratch dir (/var/lib/clustr/tmp) free < 10 GB — today's incident catcher"
+plugin: disks
+sensor: free_bytes
+labels:
+  mount: "/var/lib/clustr/tmp"
+match:
+  host_role: control_plane
+threshold:
+  op: "<"
+  value: 10737418240
+duration: 60s
+severity: critical
+notify:
+  webhook: true
+  email: []
+
+---
+name: cp.inode.root.crit
+description: "Control-plane rootfs inode usage > 90%"
+plugin: disks
+sensor: inode_used_pct
+labels:
+  mount: "/"
+match:
+  host_role: control_plane
+threshold:
+  op: ">="
+  value: 90
+duration: 60s
+severity: critical
+notify:
+  webhook: true
+  email: []
+
+---
+name: cp.mem.warn
+description: "Control-plane host memory used > 85%"
+plugin: memory
+sensor: used_pct
+match:
+  host_role: control_plane
+threshold:
+  op: ">="
+  value: 85
+duration: 300s
+severity: warn
+notify:
+  webhook: true
+  email: []
+
+---
+name: cp.mem.crit
+description: "Control-plane host memory used > 95%"
+plugin: memory
+sensor: used_pct
+match:
+  host_role: control_plane
+threshold:
+  op: ">="
+  value: 95
+duration: 120s
+severity: critical
+notify:
+  webhook: true
+  email: []
+
+---
+name: cp.psi.mem.warn
+description: "Control-plane PSI memory pressure (some avg10) > 20"
+plugin: psi
+sensor: cp.psi.mem_some_avg10
+match:
+  host_role: control_plane
+threshold:
+  op: ">="
+  value: 20
+duration: 300s
+severity: warn
+notify:
+  webhook: true
+  email: []
+
+---
+name: cp.psi.io.warn
+description: "Control-plane PSI I/O pressure (some avg10) > 30"
+plugin: psi
+sensor: cp.psi.io_some_avg10
+match:
+  host_role: control_plane
+threshold:
+  op: ">="
+  value: 30
+duration: 300s
+severity: warn
+notify:
+  webhook: true
+  email: []
+
+---
+name: cp.serverd.restart.crit
+description: "clustr-serverd systemd restart count elevated"
+plugin: systemd
+sensor: serverd_restarts
+match:
+  host_role: control_plane
+threshold:
+  op: ">="
+  value: 3
+duration: 600s
+severity: critical
+notify:
+  webhook: true
+  email: []
+
+---
+name: cp.serverd.down.crit
+description: "clustr-serverd systemd unit is not active"
+plugin: systemd
+sensor: serverd_active
+match:
+  host_role: control_plane
+threshold:
+  op: "=="
+  value: 0
+duration: 60s
+severity: critical
+notify:
+  webhook: true
+  email: []
+
+---
+name: cp.time.drift.warn
+description: "Control-plane NTP not synced or offset > 1s"
+plugin: ntp
+sensor: synced
+match:
+  host_role: control_plane
+threshold:
+  op: "=="
+  value: 0
+duration: 300s
+severity: warn
+notify:
+  webhook: true
+  email: []
+
+---
+name: cp.cert.expiry.warn
+description: "A clustr-managed certificate expires within 30 days"
+plugin: certs
+sensor: days_until_expiry
+match:
+  host_role: control_plane
+threshold:
+  op: "<"
+  value: 30
+duration: 300s
+severity: warn
+notify:
+  webhook: true
+  email: []
+
+---
+name: cp.cert.expiry.crit
+description: "A clustr-managed certificate expires within 7 days"
+plugin: certs
+sensor: days_until_expiry
+match:
+  host_role: control_plane
+threshold:
+  op: "<"
+  value: 7
+duration: 60s
+severity: critical
+notify:
+  webhook: true
+  email: []
+
+---
+name: cp.image_store.orphan.warn
+description: "Orphaned image bytes > 20% of data volume — run image garbage collection"
+plugin: images
+sensor: orphan_bytes
+match:
+  host_role: control_plane
+threshold:
+  op: ">="
+  value: 4294967296
+duration: 300s
+severity: warn
+notify:
+  webhook: true
+  email: []

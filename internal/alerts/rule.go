@@ -65,6 +65,30 @@ type Notify struct {
 	Email   []string `yaml:"email,omitempty"`
 }
 
+// HostRole selector values for Match.HostRole.
+const (
+	// HostRoleClusterNode is the default — rules without an explicit host_role
+	// target only cluster node stats (push via clientd WebSocket).
+	HostRoleClusterNode = "cluster_node"
+
+	// HostRoleControlPlane targets control-plane stats injected by the selfmon
+	// goroutine (#243).  Must be set explicitly in control-plane rule files.
+	HostRoleControlPlane = "control_plane"
+
+	// HostRoleAny matches both cluster nodes and the control plane.
+	HostRoleAny = "any"
+)
+
+// RuleMatch holds the optional selectors that restrict which hosts a rule
+// evaluates against.  An empty RuleMatch applies the rule to all cluster nodes
+// (backward-compatible default).
+type RuleMatch struct {
+	// HostRole restricts the rule to hosts with the given role.
+	// Allowed values: "cluster_node" (default), "control_plane", "any".
+	// Rules loaded from existing cluster.yaml files implicitly get "cluster_node".
+	HostRole string `yaml:"host_role,omitempty"`
+}
+
 // Rule is a parsed alert rule loaded from a YAML file.
 type Rule struct {
 	// Name is the stable identifier used in alert state keying.  Must be unique
@@ -83,6 +107,10 @@ type Rule struct {
 	// Labels is an optional map of regex patterns to match against each sample's
 	// labels.  An empty map (or nil) matches all samples.
 	Labels map[string]string `yaml:"labels,omitempty"`
+
+	// Match holds the optional host selectors.  Rules without a match block
+	// default to HostRole=cluster_node to preserve backward compatibility.
+	Match RuleMatch `yaml:"match,omitempty"`
 
 	// Threshold holds the comparison applied to each sample value.
 	Threshold Threshold `yaml:"threshold"`
@@ -105,6 +133,24 @@ type Rule struct {
 	sourceFile string
 }
 
+// EffectiveHostRole returns the resolved host role for this rule.
+// Empty string and unset both default to cluster_node for backward compatibility.
+func (r *Rule) EffectiveHostRole() string {
+	switch r.Match.HostRole {
+	case HostRoleControlPlane, HostRoleAny:
+		return r.Match.HostRole
+	default:
+		return HostRoleClusterNode
+	}
+}
+
+// AppliesToRole returns true when this rule should evaluate samples from a
+// host with the given role.
+func (r *Rule) AppliesToRole(role string) bool {
+	eff := r.EffectiveHostRole()
+	return eff == HostRoleAny || eff == role
+}
+
 // Validate checks the rule for logical consistency and compiles label regexes.
 // Returns a non-nil error for any misconfiguration.  Callers should skip rules
 // that fail validation rather than crashing.
@@ -125,6 +171,12 @@ func (r *Rule) Validate() error {
 	case SeverityInfo, SeverityWarn, SeverityCritical:
 	default:
 		return fmt.Errorf("rule %q: unknown severity %q (allowed: info, warn, critical)", r.Name, r.Severity)
+	}
+	switch r.Match.HostRole {
+	case "", HostRoleClusterNode, HostRoleControlPlane, HostRoleAny:
+		// valid
+	default:
+		return fmt.Errorf("rule %q: unknown match.host_role %q (allowed: cluster_node, control_plane, any)", r.Name, r.Match.HostRole)
 	}
 	if r.Duration < 0 {
 		return fmt.Errorf("rule %q: duration must be >= 0", r.Name)
