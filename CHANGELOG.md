@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.8 — 2026-05-04
+
+### Critical
+
+- **selfmon watchdog:** clustr-serverd now correctly notifies systemd via `sd_notify(WATCHDOG=1)` from inside the metrics collector goroutine. Prior to v0.1.8, `WatchdogSec=90` was declared in the systemd unit but never received a keepalive, so systemd was killing the service every 90 seconds with SIGABRT. Long-running operations (image builds, ISO downloads) could not complete on cloner.
+- **Restart rule delta:** `cp.serverd.restart.crit` now uses a 10-minute windowed delta of the systemd NRestarts counter rather than the absolute lifetime value. The rule no longer fires permanently after the first 3 restarts post-boot.
+
+### Fixes
+
+- **Web — alerts:** Silence dropdown now renders correctly. The Tailwind `overflow-hidden` on the table wrapper was clipping the absolute-positioned popover regardless of z-index.
+- **Web — image builds:** clicking an in-progress image to re-attach to the build progress panel now correctly replays current state (phase, bytes, serial log) on reconnect rather than displaying empty "Downloading… 0 B."
+
 ## 0.1.7 — 2026-05-03
 
 ### Critical
