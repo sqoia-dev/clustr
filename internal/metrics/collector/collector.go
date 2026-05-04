@@ -305,10 +305,17 @@ func (c *Collector) collectNTP(ctx context.Context, now time.Time) []Sample {
 // Uses os/exec (systemctl show) rather than D-Bus to avoid CGO and keep the
 // binary statically linkable. D-Bus via coreos/go-systemd is available for
 // future expansion but shells out here for portability and simplicity.
+//
+// A 5-second context timeout is applied so that a hung dbus / journald under
+// disk pressure cannot block the collection goroutine indefinitely (which would
+// delay the heartbeat past WatchdogSec and get clustr-serverd killed). On
+// timeout the function logs one ERR line and returns nil — other collectors
+// still report and the heartbeat is still touched.
 func (c *Collector) collectSystemd(ctx context.Context, now time.Time) []Sample {
 	const unit = "clustr-serverd.service"
+	const timeout = 5 * time.Second
 
-	cmdCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	out, err := exec.CommandContext(cmdCtx,
@@ -317,7 +324,15 @@ func (c *Collector) collectSystemd(ctx context.Context, now time.Time) []Sample 
 		"--no-pager",
 	).Output()
 	if err != nil {
-		// systemctl not available (e.g. in tests or containers) — skip silently.
+		if cmdCtx.Err() != nil {
+			// Timed out — log at error level so the operator notices.
+			log.Error().
+				Dur("timeout", timeout).
+				Msg("collectSystemd: systemctl show timed out; skipping systemd samples this cycle")
+		}
+		// systemctl not available (e.g. in tests or containers), or timed out —
+		// return zero values rather than propagating the error so the rest of the
+		// collection cycle still runs.
 		return nil
 	}
 
