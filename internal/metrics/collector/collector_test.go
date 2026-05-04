@@ -2,7 +2,9 @@ package collector
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -143,5 +145,86 @@ func TestCollectSystemd_NoSystemctl(t *testing.T) {
 		if s.Plugin != "systemd" {
 			t.Errorf("unexpected plugin: %s", s.Plugin)
 		}
+	}
+}
+
+// TestCollectSystemd_Timeout verifies that collectSystemd returns within the
+// 5-second deadline even when the underlying systemctl binary hangs indefinitely
+// (simulated by pointing PATH at a directory containing a "systemctl" wrapper
+// that is just /bin/sleep 30).
+//
+// The test asserts:
+//   - The call completes in well under 6 seconds (not at 30s when sleep would
+//     finish naturally).
+//   - The return value is nil (zero values — don't propagate the error).
+//   - The goroutine is not left blocked after return (checked implicitly by the
+//     test timeout).
+func TestCollectSystemd_Timeout(t *testing.T) {
+	sleepPath, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skip("sleep not found; skipping timeout test")
+	}
+
+	// Create a temp directory with a fake "systemctl" that delegates to sleep 30.
+	fakeDir := t.TempDir()
+	fakeSystemctl := filepath.Join(fakeDir, "systemctl")
+	script := "#!/bin/sh\nexec " + sleepPath + " 30\n"
+	if err := os.WriteFile(fakeSystemctl, []byte(script), 0755); err != nil {
+		t.Fatalf("write fake systemctl: %v", err)
+	}
+
+	// Prepend fakeDir to PATH so exec.LookPath finds our stub first.
+	orig := os.Getenv("PATH")
+	os.Setenv("PATH", fakeDir+":"+orig)
+	defer os.Setenv("PATH", orig)
+
+	c := New()
+
+	start := time.Now()
+	samples := c.collectSystemd(context.Background(), start)
+	elapsed := time.Since(start)
+
+	// Must return within 6 seconds (5s timeout + 1s margin).
+	if elapsed > 6*time.Second {
+		t.Errorf("collectSystemd took %v; expected to return within 6s after timeout", elapsed)
+	}
+
+	// On timeout, zero values are returned (nil slice).
+	if len(samples) != 0 {
+		t.Errorf("expected nil samples on timeout, got %d", len(samples))
+	}
+}
+
+// TestSelfmonHeartbeat_TouchedBeforeCollect verifies that TouchHeartbeat can be
+// called before any collection work, so a hung collector sub-function cannot
+// delay the heartbeat past WatchdogSec.
+//
+// This is a unit test for the TouchHeartbeat helper itself: it must succeed on
+// a path that does not yet exist and produce a non-empty timestamp file.
+func TestSelfmonHeartbeat_TouchedBeforeCollect(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "subdir", "selfmon.heartbeat")
+
+	// Call TouchHeartbeat simulating the "start of tick" pattern.
+	before := time.Now()
+	TouchHeartbeat(path)
+	after := time.Now()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("heartbeat file not created: %v", err)
+	}
+	content := strings.TrimSpace(string(data))
+	if content == "" {
+		t.Fatal("heartbeat file is empty")
+	}
+	// The file should contain a Unix timestamp within the window of the call.
+	var ts int64
+	if _, err := fmt.Sscanf(content, "%d", &ts); err != nil {
+		t.Fatalf("heartbeat content is not a unix timestamp: %q", content)
+	}
+	if ts < before.Unix() || ts > after.Unix()+1 {
+		t.Errorf("heartbeat timestamp %d is outside expected range [%d, %d]",
+			ts, before.Unix(), after.Unix()+1)
 	}
 }

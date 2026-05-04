@@ -49,6 +49,13 @@ func (s *Server) runSelfmon(ctx context.Context) {
 	c := collector.New()
 
 	collect := func() {
+		// Touch the heartbeat at the START of every tick so that a slow or
+		// hung collector (e.g. collectSystemd blocking on dbus) does not cause
+		// the meta-watchdog to fire a spurious WatchdogSec kill. The heartbeat
+		// signals "this goroutine is scheduled and running", not "all metrics
+		// collected successfully".
+		collector.TouchHeartbeat(selfmonHeartbeatPath)
+
 		tickCtx, cancel := context.WithTimeout(ctx, selfmonInterval/2)
 		defer cancel()
 
@@ -84,12 +91,7 @@ func (s *Server) runSelfmon(ctx context.Context) {
 				Str("host_id", cpHost.ID).
 				Int("samples", len(rows)).
 				Msg("selfmon: InsertStatsBatch failed")
-			// Do NOT return — still touch the heartbeat so the watchdog knows
-			// the goroutine is alive even if the DB write failed.
 		}
-
-		// Touch heartbeat file — monitored by clustr-selfmon-watchdog.timer.
-		collector.TouchHeartbeat(selfmonHeartbeatPath)
 
 		log.Debug().
 			Str("host_id", cpHost.ID).
