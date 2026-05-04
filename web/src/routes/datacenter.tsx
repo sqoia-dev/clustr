@@ -514,6 +514,7 @@ function EnclosureSlotDropZone({
   hostname,
   status,
   onNodeClick,
+  onEject,
 }: {
   enclosureId: string
   slotIndex: number
@@ -521,6 +522,8 @@ function EnclosureSlotDropZone({
   hostname?: string
   status?: string
   onNodeClick?: (nodeId: string) => void
+  /** Bug #247: eject/unassign the node from this slot back to the unassigned sidebar. */
+  onEject?: (enclosureId: string, slotIndex: number, hostname: string) => void
 }) {
   const { activeDrag } = React.useContext(DragContext)
   const { setNodeRef, isOver } = useDroppable({
@@ -535,25 +538,44 @@ function EnclosureSlotDropZone({
     <div
       ref={setNodeRef}
       className={cn(
-        "relative flex items-center gap-1 rounded border text-[10px] font-mono px-1 transition-colors",
-        "min-h-[22px] flex-1",
+        "relative flex items-center rounded border text-[10px] font-mono px-1 transition-colors",
+        "min-h-[22px] flex-1 min-w-0",
         occupied
-          ? "border-border bg-secondary/80 cursor-pointer hover:bg-secondary"
+          ? "border-border bg-secondary/80"
           : "border-dashed border-border/60 bg-card",
         isOver && !occupied && "bg-accent/30 border-accent",
         isOver && occupied && "bg-destructive/20",
         isDragging && !occupied && !isOver && "bg-accent/8",
       )}
-      onClick={() => nodeId && onNodeClick && onNodeClick(nodeId)}
     >
-      <span className="text-muted-foreground/50 shrink-0 text-[9px]">{slotIndex}</span>
+      {/* Slot index label — fixed width, doesn't flex */}
+      <span className="text-muted-foreground/50 shrink-0 text-[9px] w-3 text-right mr-0.5">{slotIndex}</span>
+
       {occupied ? (
+        /* Occupied slot: status dot + truncated hostname + eject button */
         <>
-          {statusDot(status ?? "offline")}
-          <span className="truncate flex-1">{hostname ?? nodeId?.slice(0, 8)}</span>
+          <button
+            className="flex items-center gap-1 flex-1 min-w-0 cursor-pointer hover:text-foreground text-left"
+            onClick={() => nodeId && onNodeClick && onNodeClick(nodeId)}
+            onPointerDown={e => e.stopPropagation()}
+          >
+            {statusDot(status ?? "offline")}
+            <span className="truncate flex-1 min-w-0">{hostname ?? nodeId?.slice(0, 8)}</span>
+          </button>
+          {onEject && (
+            <button
+              className="shrink-0 rounded p-0.5 ml-0.5 hover:bg-destructive/20 focus:outline-none"
+              title={`Eject ${hostname ?? nodeId?.slice(0, 8)} from slot ${slotIndex}`}
+              onPointerDown={e => e.stopPropagation()}
+              onClick={e => { e.stopPropagation(); onEject(enclosureId, slotIndex, hostname ?? nodeId?.slice(0, 8) ?? "") }}
+            >
+              <LogOut className="h-2 w-2 text-muted-foreground hover:text-destructive" />
+            </button>
+          )}
         </>
       ) : (
-        <span className="text-muted-foreground/40 italic text-[9px]">
+        /* Empty slot: placeholder text */
+        <span className="text-muted-foreground/40 italic text-[9px] flex-1">
           {isDragging ? "Drop here" : "Empty"}
         </span>
       )}
@@ -568,11 +590,14 @@ function EnclosureBlock({
   nodes,
   onNodeClick,
   onDelete,
+  onEjectSlot,
 }: {
   enclosure: Enclosure
   nodes: Map<string, NodeHealth>
   onNodeClick: (nodeId: string) => void
   onDelete: (enclosureId: string, label: string) => void
+  /** Bug #247: callback to eject (unassign) a node from a specific slot. */
+  onEjectSlot?: (enclosureId: string, slotIndex: number, hostname: string) => void
 }) {
   const et = enclosureTypeMeta[enclosure.type_id]
   const slotCount = et?.slot_count ?? (enclosure.slots?.length ?? 0)
@@ -630,6 +655,7 @@ function EnclosureBlock({
               hostname={node?.hostname}
               status={node?.status}
               onNodeClick={onNodeClick}
+              onEject={onEjectSlot}
             />
           )
         })}
@@ -697,6 +723,7 @@ function RackTile({
   onResize,
   onAddEnclosure,
   onDeleteEnclosure,
+  onEjectSlot,
 }: {
   rack: Rack
   nodes: Map<string, NodeHealth>
@@ -704,6 +731,7 @@ function RackTile({
   onResize: (nodeId: string, rackId: string, newHeightU: number) => void
   onAddEnclosure: (rackId: string) => void
   onDeleteEnclosure: (enclosureId: string, label: string) => void
+  onEjectSlot: (enclosureId: string, slotIndex: number, hostname: string) => void
 }) {
   const [powerModal, setPowerModal] = React.useState<PowerAction | null>(null)
   const { onSlotPaste } = React.useContext(DragContext)
@@ -905,6 +933,7 @@ function RackTile({
                 nodes={nodes}
                 onNodeClick={onNodeClick}
                 onDelete={onDeleteEnclosure}
+                onEjectSlot={onEjectSlot}
               />
             </div>
           )
@@ -1479,6 +1508,25 @@ export function DatacenterPage() {
     },
   })
 
+  // Bug #247: eject a node from an enclosure slot back to the unassigned sidebar.
+  // Calls DELETE /api/v1/enclosures/:id/slots/:slot_index.
+  const ejectSlotMut = useMutation({
+    mutationFn: ({ enclosureId, slotIndex }: { enclosureId: string; slotIndex: number }) =>
+      apiFetch(`/api/v1/enclosures/${enclosureId}/slots/${slotIndex}`, { method: "DELETE" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["racks"] })
+      qc.invalidateQueries({ queryKey: ["nodes-unassigned"] })
+    },
+    onError: (e: Error) => {
+      toast({ title: "Failed to eject node from slot", description: e.message, variant: "destructive" })
+    },
+  })
+
+  function handleEjectSlot(enclosureId: string, slotIndex: number, hostname: string) {
+    ejectSlotMut.mutate({ enclosureId, slotIndex })
+    toast({ title: `Ejected ${hostname} from slot ${slotIndex}`, description: "Node returned to unassigned sidebar." })
+  }
+
   function handleRemoveFromRack(nodeId: string, rackId: string, hostname: string, rackName: string) {
     setUnassignPending({ nodeId, rackId, hostname, rackName })
   }
@@ -1661,6 +1709,7 @@ export function DatacenterPage() {
                         }}
                         onAddEnclosure={(rackId) => setAddEnclosureRackId(rackId)}
                         onDeleteEnclosure={(encId, label) => setDeleteEnclosurePending({ id: encId, label })}
+                        onEjectSlot={handleEjectSlot}
                       />
                     ))}
                   </div>
