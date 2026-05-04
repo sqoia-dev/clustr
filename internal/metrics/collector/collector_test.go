@@ -3,6 +3,9 @@ package collector
 import (
 	"context"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -226,5 +229,158 @@ func TestSelfmonHeartbeat_TouchedBeforeCollect(t *testing.T) {
 	if ts < before.Unix() || ts > after.Unix()+1 {
 		t.Errorf("heartbeat timestamp %d is outside expected range [%d, %d]",
 			ts, before.Unix(), after.Unix()+1)
+	}
+}
+
+// TestSelfmonSdNotifyWired verifies that internal/server/selfmon.go contains a
+// call to daemon.SdNotify with the SdNotifyWatchdog constant.
+//
+// This is a compile-time wiring guard: it parses the AST of selfmon.go and
+// asserts that daemon.SdNotifyWatchdog is passed to daemon.SdNotify inside the
+// collect closure.  If the call is removed, this test fails immediately.
+//
+// Rationale: without daemon.SdNotify(WATCHDOG=1), systemd's WatchdogSec=90
+// directive kills the process every 90s regardless of process health (#248).
+func TestSelfmonSdNotifyWired(t *testing.T) {
+	// Path relative to this test file's package directory.
+	selfmonPath := filepath.Join("..", "..", "server", "selfmon.go")
+
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, selfmonPath, nil, 0)
+	if err != nil {
+		t.Fatalf("failed to parse selfmon.go: %v", err)
+	}
+
+	// Walk the AST looking for a call expression whose function is a selector
+	// "daemon.SdNotify" with an argument containing "daemon.SdNotifyWatchdog".
+	var found bool
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		pkg, ok := sel.X.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if pkg.Name != "daemon" || sel.Sel.Name != "SdNotify" {
+			return true
+		}
+		// Found daemon.SdNotify(...). Check that one of the args is
+		// daemon.SdNotifyWatchdog (a selector expression).
+		for _, arg := range call.Args {
+			argSel, ok := arg.(*ast.SelectorExpr)
+			if !ok {
+				continue
+			}
+			argPkg, ok := argSel.X.(*ast.Ident)
+			if !ok {
+				continue
+			}
+			if argPkg.Name == "daemon" && argSel.Sel.Name == "SdNotifyWatchdog" {
+				found = true
+			}
+		}
+		return true
+	})
+
+	if !found {
+		t.Error("selfmon.go: daemon.SdNotify(_, daemon.SdNotifyWatchdog) not found — " +
+			"WatchdogSec=90 keepalive is not wired; systemd will kill the process every 90s")
+	}
+}
+
+// ─── RestartWindow tests ─────────────────────────────────────────────────────
+
+// TestRestartWindow_ZeroBeforeFullWindow verifies that Delta returns 0 when
+// fewer than 2 samples have been collected (fresh install / first tick).
+func TestRestartWindow_ZeroBeforeFullWindow(t *testing.T) {
+	rw := NewRestartWindow(10 * time.Minute)
+
+	// No samples: must be 0.
+	if d := rw.Delta(); d != 0 {
+		t.Errorf("expected 0 with no samples, got %v", d)
+	}
+
+	// One sample: still must be 0.
+	rw.Add(5, time.Now())
+	if d := rw.Delta(); d != 0 {
+		t.Errorf("expected 0 with one sample, got %v", d)
+	}
+}
+
+// TestRestartWindow_DeltaComputed verifies that Delta reflects the increase in
+// NRestarts over the samples held in the window.
+func TestRestartWindow_DeltaComputed(t *testing.T) {
+	rw := NewRestartWindow(10 * time.Minute)
+	now := time.Now()
+
+	rw.Add(10, now)
+	rw.Add(12, now.Add(30*time.Second))
+	rw.Add(15, now.Add(60*time.Second))
+
+	// Delta should be 15 - 10 = 5.
+	if d := rw.Delta(); d != 5 {
+		t.Errorf("expected delta=5, got %v", d)
+	}
+}
+
+// TestRestartWindow_OldSamplesPruned verifies that samples older than the
+// window are pruned so the delta does not grow unboundedly.
+func TestRestartWindow_OldSamplesPruned(t *testing.T) {
+	window := 10 * time.Minute
+	rw := NewRestartWindow(window)
+
+	// Inject an old sample (12 minutes ago) and a recent one.
+	now := time.Now()
+	rw.Add(100, now.Add(-12*time.Minute)) // outside window — should be pruned
+	rw.Add(103, now)                       // inside window
+
+	// After pruning only one sample remains (the old one is evicted when the
+	// second Add prunes samples older than 10 minutes from 'now').
+	// With one remaining sample, Delta must return 0.
+	if d := rw.Delta(); d != 0 {
+		t.Errorf("expected 0 after pruning leaves <2 samples, got %v", d)
+	}
+}
+
+// TestRestartWindow_DeltaAfterPruning verifies correct delta when some samples
+// are inside the window and some fall outside.
+func TestRestartWindow_DeltaAfterPruning(t *testing.T) {
+	window := 5 * time.Minute
+	rw := NewRestartWindow(window)
+
+	now := time.Now()
+	// Old samples (outside window).
+	rw.Add(50, now.Add(-8*time.Minute))
+	rw.Add(55, now.Add(-6*time.Minute))
+	// Recent samples (inside window).
+	rw.Add(60, now.Add(-4*time.Minute))
+	rw.Add(65, now.Add(-2*time.Minute))
+	rw.Add(70, now)
+
+	// Old samples are pruned at the last Add call.
+	// Remaining: 60, 65, 70 → delta = 70 - 60 = 10.
+	if d := rw.Delta(); d != 10 {
+		t.Errorf("expected delta=10, got %v", d)
+	}
+}
+
+// TestRestartWindow_NegativeDeltaIsZero verifies that a decreasing NRestarts
+// (e.g. after a unit re-install that resets the counter) returns 0, not a
+// negative delta that would suppress a real alert.
+func TestRestartWindow_NegativeDeltaIsZero(t *testing.T) {
+	rw := NewRestartWindow(10 * time.Minute)
+	now := time.Now()
+
+	rw.Add(300, now.Add(-30*time.Second))
+	rw.Add(2, now) // counter reset
+
+	if d := rw.Delta(); d != 0 {
+		t.Errorf("expected 0 on counter reset, got %v", d)
 	}
 }
