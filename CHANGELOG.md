@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4 — 2026-05-03
+
+### Features
+
+- **Web UI:** The Add Image dialog now shows live download progress (bytes / total / %) with ETA estimated from a rolling 10-sample rate average, replacing the static "Downloading…" placeholder. When Content-Length is absent, an indeterminate spinner is shown instead.
+- **Web UI:** Install phases (generating_config through finalizing) show a scrollable monospace serial console panel streaming the last 500 lines of anaconda qemu output in real time. Auto-scrolls to bottom; stops auto-scroll when the user scrolls up (sticky-scroll).
+- **Server:** ISO download phase now emits `BuildHandle.SetProgress` events per-chunk during HTTP read. The `pullAsync` → `pullAndExtract` → `buildFromISOFile` chain wires `OnPhase`, `OnSerialLine`, and `OnStderrLine` callbacks through to the existing SSE event store.
+
 ## 0.1.3 — 2026-05-03
 
 ### Features
