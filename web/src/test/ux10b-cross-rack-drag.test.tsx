@@ -345,4 +345,41 @@ describe("UX-10b: cross-rack drag + tile layout", () => {
     // No PUT should have fired
     expect(mockApiFetch).not.toHaveBeenCalled()
   })
+
+  it("drag overlay shows hostname not ID slice (#247)", async () => {
+    const qc = makeQueryClient()
+    const nodeId = "cbf2c958-4172-47c3-9b0d-29caa4e21df4"
+    seedRacks(qc, [
+      makeRack("rack-a", "rack-a", 4, [
+        { node_id: nodeId, rack_id: "rack-a", slot_u: 1, height_u: 1 },
+      ]),
+    ])
+    seedNodes(qc, [makeNode(nodeId, "slurm-controller")])
+
+    await renderDatacenter(qc)
+
+    // Fire drag start — the overlay should now be visible
+    await act(async () => {
+      capturedOnDragStart!({
+        active: {
+          id: `node-${nodeId}`,
+          data: {
+            current: {
+              nodeId,
+              rackId: "rack-a",
+              slotU: 1,
+              heightU: 1,
+              fromUnassigned: false,
+            },
+          },
+        },
+      })
+    })
+
+    // The drag overlay must contain the hostname
+    const overlay = screen.getByTestId("drag-overlay")
+    expect(overlay.textContent).toContain("slurm-controller")
+    // Must NOT contain the bare ID prefix
+    expect(overlay.textContent).not.toContain("cbf2c958")
+  })
 })

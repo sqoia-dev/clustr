@@ -1675,7 +1675,8 @@ export function DatacenterPage() {
                     style={{ height: activeDrag.heightU * SLOT_HEIGHT_PX - 2, display: "flex", alignItems: "center" }}
                   >
                     <Server className="h-3 w-3 mr-2 shrink-0" />
-                    {activeDrag.heightU}U
+                    {nodeMap.get(activeDrag.nodeId)?.hostname ?? activeDrag.nodeId.slice(0, 8)}
+                    <span className="ml-1 text-muted-foreground">{activeDrag.heightU}U</span>
                   </div>
                 )}
               </DragOverlay>
