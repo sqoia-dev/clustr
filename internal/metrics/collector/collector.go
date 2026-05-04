@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -363,6 +364,72 @@ func (c *Collector) collectSystemd(ctx context.Context, now time.Time) []Sample 
 		{Plugin: "systemd", Sensor: "serverd_active", Value: activeVal, Unit: "bool", TS: now},
 		{Plugin: "systemd", Sensor: "serverd_restarts", Value: nRestarts, Unit: "count", TS: now},
 	}
+}
+
+// ─── Restart delta window ─────────────────────────────────────────────────────
+
+// restartSample is a single NRestarts observation timestamped for the window.
+type restartSample struct {
+	ts      time.Time
+	nrestart float64
+}
+
+// RestartWindow tracks a rolling 10-minute window of NRestarts samples and
+// derives a delta so that the cp.serverd.restart.crit rule fires on rate of
+// restarts, not the cumulative count (which is monotonic-since-boot).
+//
+// THREAD-SAFETY: RestartWindow is safe for concurrent use.  The metrics
+// collector goroutine calls Add on every tick; the alert engine may call
+// Delta concurrently.  All access to the samples slice is protected by mu.
+type RestartWindow struct {
+	mu      sync.Mutex
+	samples []restartSample
+	window  time.Duration
+}
+
+// NewRestartWindow returns a RestartWindow for the given lookback duration.
+// 10 minutes at a 30s collection interval yields ~20 samples.
+func NewRestartWindow(window time.Duration) *RestartWindow {
+	return &RestartWindow{window: window}
+}
+
+// Add records a new NRestarts observation and prunes samples older than the
+// window.  If the caller is not running under systemd, NRestarts is 0 and
+// the delta is also 0 — correct behaviour.
+func (rw *RestartWindow) Add(nrestarts float64, now time.Time) {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+
+	rw.samples = append(rw.samples, restartSample{ts: now, nrestart: nrestarts})
+
+	// Prune samples outside the window.
+	cutoff := now.Add(-rw.window)
+	i := 0
+	for i < len(rw.samples) && rw.samples[i].ts.Before(cutoff) {
+		i++
+	}
+	rw.samples = rw.samples[i:]
+}
+
+// Delta returns the increase in NRestarts over the window.
+// Returns 0 when fewer than 2 samples have been collected (i.e. in the first
+// window after process start) so that a fresh install does not immediately
+// fire the restart alert.
+func (rw *RestartWindow) Delta() float64 {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+
+	if len(rw.samples) < 2 {
+		return 0
+	}
+	first := rw.samples[0].nrestart
+	last := rw.samples[len(rw.samples)-1].nrestart
+	delta := last - first
+	if delta < 0 {
+		// systemd reset the counter (unit re-installed); treat as 0.
+		return 0
+	}
+	return delta
 }
 
 // ─── Certificate expiry ───────────────────────────────────────────────────────
