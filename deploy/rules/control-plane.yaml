@@ -200,9 +200,9 @@ notify:
 
 ---
 name: cp.serverd.restart.crit
-description: "clustr-serverd systemd restart count elevated"
+description: "clustr-serverd restarted >= 3 times in the last 10 minutes"
 plugin: systemd
-sensor: serverd_restarts
+sensor: serverd_restarts_delta_10m
 match:
   host_role: control_plane
 threshold:
