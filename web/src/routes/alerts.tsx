@@ -460,8 +460,8 @@ function AlertTable({
           <p className="text-sm">No alerts match the current filters.</p>
         </div>
       ) : (
-        <div className="rounded-md border border-border overflow-hidden">
-          <table className="w-full text-sm">
+        <div className="rounded-md border border-border overflow-visible">
+          <table className="w-full text-sm overflow-hidden">
             <thead className="bg-muted/50 border-b border-border">
               <tr>
                 <th className="text-left px-3 py-2 text-xs font-medium text-muted-foreground">Severity</th>
@@ -611,6 +611,10 @@ function HistoryTab({ silences, rules, onViewRule }: { silences: Silence[]; rule
     </div>
   )
 }
+
+// ─── Test exports ─────────────────────────────────────────────────────────────
+// Exported for unit testing only.  Do not use in production code.
+export { SilenceButton as _SilenceButton }
 
 // ─── Main page ────────────────────────────────────────────────────────────────
 
