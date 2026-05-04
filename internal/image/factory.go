@@ -251,9 +251,13 @@ func (f *Factory) pullAsync(imageID, url string) {
 		return
 	}
 
+	// ISO installer output needs identity scrubbing; other formats are already
+	// clean rootfses that should not be altered.
+	isISO := strings.ToLower(urlExt(url)) == ".iso"
+
 	_ = f.finalizeImageFromRootfs(ctx, imageID, rootfs, finalizeSourceMetadata{
 		BuildMethod: "pull",
-		Scrub:       false,
+		Scrub:       isISO,
 		Progress:    ph,
 	})
 }
@@ -265,6 +269,10 @@ func (f *Factory) pullAsync(imageID, url string) {
 // ph receives phase and progress events for the download and any subsequent
 // extraction. For .iso URLs the ISO build pipeline is used and ph is wired
 // into OnPhase/OnSerialLine/OnStderrLine callbacks in the QEMU VM.
+//
+// ISO URLs use the persistent per-URL cache at ISOCacheDir (sha256(url).iso)
+// with .partial resume so that interrupted downloads continue from where they
+// left off rather than restarting from zero. All other formats use a temp file.
 func (f *Factory) pullAndExtract(ctx context.Context, imageID, url string, ph BuildHandle) (rootfsPath string, sizeBytes int64, checksum string, err error) {
 	imageRoot := filepath.Join(f.ImageDir, imageID)
 	rootfsPath = filepath.Join(imageRoot, "rootfs")
@@ -272,7 +280,71 @@ func (f *Factory) pullAndExtract(ctx context.Context, imageID, url string, ph Bu
 		return "", 0, "", fmt.Errorf("create rootfs dir: %w", err)
 	}
 
-	// Download to a temp file.
+	ext := strings.ToLower(urlExt(url))
+
+	// ── ISO path: persistent cache + HTTP resume ───────────────────────────
+	// ISOs are multi-GB and downloads are frequently interrupted on CDN mirrors.
+	// We write into <ISOCacheDir>/<sha256(url)>.iso.partial and rename to
+	// .iso on completion. On retry the .partial offset is resumed with a Range
+	// request. The cached .iso is reused on subsequent requests for the same URL.
+	// Cache eviction is manual: operators can rm -rf ISOCacheDir if needed.
+	// Default ISOCacheDir: /var/lib/clustr/iso-cache
+	if ext == ".iso" {
+		isoPath, partialPath, cacheErr := f.isoCachePath(url)
+		if cacheErr != nil {
+			return "", 0, "", fmt.Errorf("resolve iso cache path: %w", cacheErr)
+		}
+
+		if fi, statErr := os.Stat(isoPath); statErr == nil && fi.Size() > 0 {
+			f.Logger.Info().Str("image_id", imageID).Str("path", isoPath).
+				Int64("bytes", fi.Size()).Msg("factory: using cached ISO, skipping download")
+			ph.SetPhase("downloading_iso")
+			ph.SetProgress(fi.Size(), fi.Size())
+		} else {
+			var resumeOffset int64
+			if pfi, pErr := os.Stat(partialPath); pErr == nil && pfi.Size() > 0 {
+				resumeOffset = pfi.Size()
+				f.Logger.Info().Str("image_id", imageID).Int64("resume_from", resumeOffset).
+					Msg("factory: resuming partial ISO download")
+			}
+
+			isoFile, openErr := os.OpenFile(partialPath, os.O_CREATE|os.O_WRONLY, 0o644)
+			if openErr != nil {
+				return "", 0, "", fmt.Errorf("open partial iso file: %w", openErr)
+			}
+			if resumeOffset > 0 {
+				if _, seekErr := isoFile.Seek(0, io.SeekEnd); seekErr != nil {
+					isoFile.Close()
+					return "", 0, "", fmt.Errorf("seek partial iso file: %w", seekErr)
+				}
+			}
+
+			f.Logger.Info().Str("image_id", imageID).Str("url", url).Msg("factory: downloading ISO")
+			ph.SetPhase("downloading_iso")
+			dlErr := downloadURLWithResume(ctx, url, isoFile, resumeOffset, func(done, total int64) {
+				ph.SetProgress(done, total)
+			})
+			isoFile.Close()
+			if dlErr != nil {
+				// Leave .partial in place so the next attempt can resume.
+				return "", 0, "", fmt.Errorf("download %s: %w", url, dlErr)
+			}
+
+			if renameErr := os.Rename(partialPath, isoPath); renameErr != nil {
+				return "", 0, "", fmt.Errorf("finalize iso cache: %w", renameErr)
+			}
+			f.Logger.Info().Str("image_id", imageID).Str("path", isoPath).
+				Msg("factory: ISO download complete, cached")
+		}
+
+		// Installer ISOs cannot be directly mounted as a deployable rootfs.
+		// Route to buildFromISOFile which runs the installer in a temp QEMU VM.
+		// We pass a zero BuildFromISORequest so the method uses defaults; the
+		// distro is auto-detected from the URL + cached ISO file.
+		return f.buildFromISOFile(ctx, imageID, url, isoPath, imageRoot, api.BuildFromISORequest{}, ph)
+	}
+
+	// ── Non-ISO path: temp file download ──────────────────────────────────
 	tmpFile, err := os.CreateTemp("", "clustr-pull-*"+urlExt(url))
 	if err != nil {
 		return "", 0, "", fmt.Errorf("create temp file: %w", err)
@@ -289,7 +361,6 @@ func (f *Factory) pullAndExtract(ctx context.Context, imageID, url string, ph Bu
 	}
 	tmpFile.Close()
 
-	ext := strings.ToLower(urlExt(url))
 	f.Logger.Info().Str("image_id", imageID).Str("ext", ext).Msg("factory: extracting image")
 
 	switch {
@@ -305,12 +376,6 @@ func (f *Factory) pullAndExtract(ctx context.Context, imageID, url string, ph Bu
 	case ext == ".tar.zst" || ext == ".tzst":
 		ph.SetPhase("extracting")
 		err = extractTarZst(ctx, tmpFile.Name(), rootfsPath)
-	case ext == ".iso":
-		// Installer ISOs cannot be directly mounted as a deployable rootfs.
-		// Route to buildFromISOFile which runs the installer in a temp QEMU VM.
-		// We pass a zero BuildFromISORequest so the method uses defaults; the
-		// distro is auto-detected from the URL.
-		return f.buildFromISOFile(ctx, imageID, url, tmpFile.Name(), imageRoot, api.BuildFromISORequest{}, ph)
 	default:
 		// Try treating unknown extensions as raw block images.
 		ph.SetPhase("extracting")
@@ -1928,23 +1993,18 @@ func (f *Factory) buildFromISOFile(
 		return "", 0, "", fmt.Errorf("extract rootfs: %w", err)
 	}
 
+	// Persist disk layout detected from the freshly extracted rootfs so the DB
+	// record is accurate before finalizeImageFromRootfs runs. Non-fatal: a wrong
+	// layout is better than a failed build.
 	diskLayout := f.detectDiskLayout(rootfsPath, req.Firmware)
 	if dbErr := f.Store.UpdateDiskLayout(ctx, imageID, diskLayout); dbErr != nil {
 		f.Logger.Warn().Err(dbErr).Str("image_id", imageID).Msg("factory: update disk layout (non-fatal)")
 	}
 
-	ph.SetPhase("scrubbing")
-	if err := ScrubNodeIdentity(rootfsPath); err != nil {
-		f.Logger.Warn().Err(err).Str("image_id", imageID).Msg("factory: scrub had warnings (continuing)")
-	}
-
-	ph.SetPhase("finalizing")
-	sizeBytes, checksum, err = checksumDir(rootfsPath)
-	if err != nil {
-		return "", 0, "", fmt.Errorf("checksum rootfs: %w", err)
-	}
-
-	return rootfsPath, sizeBytes, checksum, nil
+	// Scrubbing and the finalizing phase (checksumDir/bakeTar) are handled by
+	// the caller (pullAsync → finalizeImageFromRootfs) to avoid emitting those
+	// phases twice in the pull-ISO code path.
+	return rootfsPath, 0, "", nil
 }
 
 // ─── Resume support (Feature F2) ─────────────────────────────────────────────
