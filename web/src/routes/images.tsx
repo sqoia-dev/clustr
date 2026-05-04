@@ -578,6 +578,248 @@ export function AddImageSheet({ open, onClose }: AddImageSheetProps) {
   )
 }
 
+// ─── BuildProgressPanel ───────────────────────────────────────────────────────
+// Live progress panel for ISO download + QEMU install via build-progress SSE.
+
+interface BuildProgressState {
+  phase: string
+  bytesDown: number
+  bytesTotal: number   // -1 when Content-Length was absent
+  serialLines: string[]
+  errorMsg: string
+}
+
+const DOWNLOAD_PHASES = new Set(["downloading_iso", "downloading"])
+const BUILD_PHASES = new Set([
+  "generating_config", "creating_disk", "launching_vm",
+  "installing", "extracting", "scrubbing", "finalizing",
+])
+
+function phaseLabel(phase: string): string {
+  switch (phase) {
+    case "downloading_iso": case "downloading": return "Downloading ISO…"
+    case "generating_config": return "Generating installer config…"
+    case "creating_disk":     return "Creating virtual disk…"
+    case "launching_vm":      return "Launching installer VM…"
+    case "installing":        return "Installing OS (Anaconda)…"
+    case "extracting":        return "Extracting root filesystem…"
+    case "scrubbing":         return "Scrubbing node identity…"
+    case "finalizing":        return "Finalizing image…"
+    case "complete":          return "Complete"
+    case "failed":            return "Failed"
+    default:                  return phase ? phase.replace(/_/g, " ") : "Working…"
+  }
+}
+
+function fmtBytes(n: number): string {
+  if (n < 0) return "?"
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
+
+interface BuildProgressPanelProps {
+  imageId: string
+  url: string
+  onClose: () => void
+}
+
+function BuildProgressPanel({ imageId, url, onClose }: BuildProgressPanelProps) {
+  const [ps, setPs] = React.useState<BuildProgressState>({
+    phase: "downloading_iso",
+    bytesDown: 0,
+    bytesTotal: -1,
+    serialLines: [],
+    errorMsg: "",
+  })
+
+  // ETA estimation: keep a ring of (timestamp, bytesDown) samples.
+  const etaSamplesRef = React.useRef<Array<{ ts: number; bytes: number }>>([])
+
+  // Serial log: auto-scroll unless user has scrolled up.
+  const logEndRef = React.useRef<HTMLDivElement | null>(null)
+  const logContainerRef = React.useRef<HTMLDivElement | null>(null)
+  const userScrolledRef = React.useRef(false)
+
+  React.useEffect(() => {
+    if (!userScrolledRef.current) {
+      logEndRef.current?.scrollIntoView({ behavior: "smooth" })
+    }
+  }, [ps.serialLines])
+
+  // Open the SSE stream for this image's build progress.
+  React.useEffect(() => {
+    const es = new EventSource(`/api/v1/images/${imageId}/build-progress/stream`, { withCredentials: true })
+
+    // The server sends an initial "snapshot" event with the full BuildState,
+    // then incremental "message" events (default event type) with BuildEvent.
+    es.addEventListener("snapshot", (e: MessageEvent) => {
+      try {
+        const snap = JSON.parse(e.data)
+        setPs((prev) => ({
+          ...prev,
+          phase: snap.phase ?? prev.phase,
+          bytesDown: snap.bytes_done ?? prev.bytesDown,
+          bytesTotal: snap.bytes_total ?? prev.bytesTotal,
+          serialLines: snap.serial_tail ?? prev.serialLines,
+          errorMsg: snap.error_message ?? prev.errorMsg,
+        }))
+      } catch { /* ignore malformed snapshot */ }
+    })
+
+    es.onmessage = (e: MessageEvent) => {
+      try {
+        const ev = JSON.parse(e.data)
+        setPs((prev) => {
+          const next = { ...prev }
+
+          if (ev.phase) {
+            next.phase = ev.phase
+            if (ev.phase === "failed") {
+              next.errorMsg = ev.error ?? "Build failed"
+            }
+          }
+          if (ev.bytes_done !== undefined && ev.bytes_done > 0) {
+            next.bytesDown = ev.bytes_done
+            // Update ETA sample ring (keep last 10).
+            const samples = etaSamplesRef.current
+            samples.push({ ts: Date.now(), bytes: ev.bytes_done })
+            if (samples.length > 10) samples.shift()
+          }
+          if (ev.bytes_total !== undefined) {
+            next.bytesTotal = ev.bytes_total
+          }
+          if (ev.serial_line) {
+            // Cap at 500 lines client-side to avoid unbounded memory.
+            const lines = [...prev.serialLines, ev.serial_line]
+            next.serialLines = lines.length > 500 ? lines.slice(lines.length - 500) : lines
+          }
+          return next
+        })
+      } catch { /* ignore malformed event */ }
+    }
+
+    es.onerror = () => {
+      // SSE auto-reconnects; don't surface transient connection drops.
+    }
+
+    return () => { es.close() }
+  }, [imageId])
+
+  // Compute ETA from the last two rate samples.
+  function etaString(): string | null {
+    const samples = etaSamplesRef.current
+    if (samples.length < 2 || ps.bytesTotal <= 0) return null
+    const oldest = samples[0]
+    const newest = samples[samples.length - 1]
+    const elapsed = (newest.ts - oldest.ts) / 1000 // seconds
+    if (elapsed <= 0) return null
+    const rate = (newest.bytes - oldest.bytes) / elapsed // bytes/sec
+    if (rate <= 0) return null
+    const remaining = ps.bytesTotal - newest.bytes
+    if (remaining <= 0) return null
+    const secs = Math.round(remaining / rate)
+    if (secs < 60) return `~${secs}s`
+    if (secs < 3600) return `~${Math.round(secs / 60)}m`
+    return `~${Math.round(secs / 3600)}h`
+  }
+
+  const pct = ps.bytesTotal > 0 ? Math.min(100, Math.round((ps.bytesDown / ps.bytesTotal) * 100)) : null
+  const isDownloading = DOWNLOAD_PHASES.has(ps.phase)
+  const isBuilding = BUILD_PHASES.has(ps.phase)
+  const isFailed = ps.phase === "failed"
+  const isDone = ps.phase === "complete"
+  const eta = isDownloading ? etaString() : null
+
+  return (
+    <div className="space-y-3">
+      <div className="rounded-md border border-border bg-card p-4 space-y-3">
+        {/* Phase + status indicator */}
+        <div className="flex items-center gap-2 text-sm">
+          {isFailed ? (
+            <span className="h-2 w-2 rounded-full bg-destructive shrink-0" />
+          ) : isDone ? (
+            <span className="h-2 w-2 rounded-full bg-green-500 shrink-0" />
+          ) : (
+            <span className="h-2 w-2 rounded-full bg-status-warning animate-pulse shrink-0" />
+          )}
+          <span className="font-medium">{phaseLabel(ps.phase)}</span>
+        </div>
+
+        {/* URL */}
+        <p className="text-xs text-muted-foreground font-mono break-all">{url}</p>
+
+        {/* Download progress bar */}
+        {isDownloading && (
+          <div className="space-y-1">
+            <div className="h-1.5 rounded-full bg-secondary overflow-hidden">
+              {pct !== null ? (
+                <div
+                  className="h-full bg-status-warning transition-[width] duration-300"
+                  style={{ width: `${pct}%` }}
+                />
+              ) : (
+                <div className="h-full bg-status-warning animate-pulse" style={{ width: "40%" }} />
+              )}
+            </div>
+            <div className="flex items-center justify-between text-xs text-muted-foreground">
+              <span>
+                {fmtBytes(ps.bytesDown)}
+                {ps.bytesTotal > 0 && ` / ${fmtBytes(ps.bytesTotal)}`}
+                {pct !== null && ` (${pct}%)`}
+              </span>
+              {eta && <span>{eta} remaining</span>}
+            </div>
+          </div>
+        )}
+
+        {/* Indeterminate bar for non-download build phases */}
+        {isBuilding && (
+          <div className="h-1.5 rounded-full bg-secondary overflow-hidden">
+            <div className="h-full bg-blue-500 animate-pulse" style={{ width: "70%" }} />
+          </div>
+        )}
+
+        {/* Error message */}
+        {isFailed && ps.errorMsg && (
+          <p className="text-xs text-destructive font-mono break-all">{ps.errorMsg}</p>
+        )}
+      </div>
+
+      {/* Serial log panel — shown during install phases */}
+      {(isBuilding || isDone) && ps.serialLines.length > 0 && (
+        <div className="rounded-md border border-border bg-black/90">
+          <div className="px-3 py-1.5 border-b border-border/40 flex items-center gap-2">
+            <Terminal className="h-3.5 w-3.5 text-muted-foreground" />
+            <span className="text-xs text-muted-foreground font-medium">Serial console</span>
+            <span className="ml-auto text-xs text-muted-foreground">{ps.serialLines.length} lines</span>
+          </div>
+          <div
+            ref={logContainerRef}
+            className="h-48 overflow-y-auto p-2 font-mono text-[10px] leading-relaxed text-green-400"
+            onScroll={() => {
+              const el = logContainerRef.current
+              if (!el) return
+              const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 32
+              userScrolledRef.current = !atBottom
+            }}
+          >
+            {ps.serialLines.map((line, i) => (
+              <div key={i}>{line}</div>
+            ))}
+            <div ref={logEndRef} />
+          </div>
+        </div>
+      )}
+
+      <Button variant="ghost" size="sm" onClick={onClose} className="w-full">
+        Close (continues in background)
+      </Button>
+    </div>
+  )
+}
+
 // ─── AddImageFromURL ──────────────────────────────────────────────────────────
 // IMG-URL-4..5
 
@@ -587,9 +829,7 @@ function AddImageFromURL({ onSuccess }: { onSuccess: () => void }) {
   const [name, setName] = React.useState("")
   const [sha256, setSha256] = React.useState("")
   const [urlError, setUrlError] = React.useState("")
-  const [inProgress, setInProgress] = React.useState(false)
   const [progressImageId, setProgressImageId] = React.useState<string | null>(null)
-  const [progressStatus, setProgressStatus] = React.useState("")
 
   // Auto-suggest name from URL.
   React.useEffect(() => {
@@ -612,9 +852,7 @@ function AddImageFromURL({ onSuccess }: { onSuccess: () => void }) {
         }),
       }),
     onSuccess: (res) => {
-      setInProgress(true)
       setProgressImageId(res.id)
-      setProgressStatus("downloading")
       qc.invalidateQueries({ queryKey: ["images"] })
       toast({ title: "Download started", description: `${name || url} — downloading in background.` })
     },
@@ -628,14 +866,12 @@ function AddImageFromURL({ onSuccess }: { onSuccess: () => void }) {
   useEventSubscription<ImageEvent>("images", (event) => {
     if (!progressImageId || event.id !== progressImageId) return
     if (event.kind === "image.finalized") {
-      setProgressStatus("ready")
       qc.invalidateQueries({ queryKey: ["images"] })
       toast({ title: "Download complete", description: name || url })
       onSuccess()
     } else if (event.image?.status === "error") {
-      setProgressStatus("error")
       setUrlError(event.image.error_message || "Download failed")
-      setInProgress(false)
+      setProgressImageId(null)
     }
   })
 
@@ -650,25 +886,14 @@ function AddImageFromURL({ onSuccess }: { onSuccess: () => void }) {
     submitMutation.mutate()
   }
 
-  if (inProgress && progressStatus !== "error") {
+  // Show live progress panel once we have an image ID from the server.
+  if (progressImageId) {
     return (
-      <div className="space-y-4">
-        <div className="rounded-md border border-border bg-card p-4 space-y-3">
-          <div className="flex items-center gap-2 text-sm">
-            <span className="h-2 w-2 rounded-full bg-status-warning animate-pulse shrink-0" />
-            <span className="font-medium">{progressStatus === "ready" ? "Download complete" : "Downloading…"}</span>
-          </div>
-          <p className="text-xs text-muted-foreground font-mono break-all">{url}</p>
-          {progressStatus !== "ready" && (
-            <div className="h-1.5 rounded-full bg-secondary overflow-hidden">
-              <div className="h-full bg-status-warning animate-pulse" style={{ width: "60%" }} />
-            </div>
-          )}
-        </div>
-        <Button variant="ghost" size="sm" onClick={onSuccess} className="w-full">
-          Close (download continues in background)
-        </Button>
-      </div>
+      <BuildProgressPanel
+        imageId={progressImageId}
+        url={url}
+        onClose={onSuccess}
+      />
     )
   }
 
