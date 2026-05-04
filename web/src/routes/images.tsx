@@ -679,17 +679,21 @@ function BuildProgressPanel({ imageId, url, onClose }: BuildProgressPanelProps) 
 
     // The server sends an initial "snapshot" event with the full BuildState,
     // then incremental "message" events (default event type) with BuildEvent.
+    // On snapshot: REPLACE state entirely — the server's BuildState is the
+    // authoritative current truth for reconnect-mid-build scenarios.
+    // bytes_total=0 from the server means Content-Length was unknown; map it
+    // to -1 (the web sentinel for "no total") so the progress bar renders
+    // correctly instead of showing "0 B / [nothing]".
     es.addEventListener("snapshot", (e: MessageEvent) => {
       try {
         const snap = JSON.parse(e.data)
-        setPs((prev) => ({
-          ...prev,
-          phase: snap.phase ?? prev.phase,
-          bytesDown: snap.bytes_done ?? prev.bytesDown,
-          bytesTotal: snap.bytes_total ?? prev.bytesTotal,
-          serialLines: snap.serial_tail ?? prev.serialLines,
-          errorMsg: snap.error_message ?? prev.errorMsg,
-        }))
+        setPs({
+          phase:       snap.phase        || "downloading_iso",
+          bytesDown:   snap.bytes_done   || 0,
+          bytesTotal:  snap.bytes_total  > 0 ? snap.bytes_total : -1,
+          serialLines: Array.isArray(snap.serial_tail) ? snap.serial_tail : [],
+          errorMsg:    snap.error_message || "",
+        })
       } catch { /* ignore malformed snapshot */ }
     })
 

@@ -2,6 +2,7 @@
  * build-progress-panel.test.ts — UX: ISO build progress panel
  *
  * Covers the pure state-reduction logic extracted from BuildProgressPanel:
+ *   - applySnapshot: REPLACES state from a BuildState snapshot (reconnect path)
  *   - applyBuildEvent: updates state correctly for each BuildEvent field
  *   - phaseLabel: human-readable labels for each build phase string
  *   - fmtBytes: byte formatter edge cases
@@ -29,6 +30,16 @@ interface BuildEvent {
   error?: string
 }
 
+// BuildSnapshot mirrors the api.BuildState JSON shape sent by the server's
+// "snapshot" SSE event (all fields present, zero-valued when not set).
+interface BuildSnapshot {
+  phase?: string
+  bytes_done?: number
+  bytes_total?: number     // 0 when Content-Length was absent (server zero value)
+  serial_tail?: string[]
+  error_message?: string
+}
+
 // ─── Logic under test (extracted from BuildProgressPanel) ────────────────────
 
 const INITIAL_STATE: BuildProgressState = {
@@ -37,6 +48,24 @@ const INITIAL_STATE: BuildProgressState = {
   bytesTotal: -1,
   serialLines: [],
   errorMsg: "",
+}
+
+/**
+ * applySnapshot REPLACES the panel state with the server's BuildState snapshot.
+ * Called when the SSE "snapshot" event arrives (initial connect or reconnect).
+ *
+ * Mirrors the snapshot event handler in BuildProgressPanel:
+ *   - bytes_total=0 from Go means "unknown Content-Length"; map to -1 (web sentinel).
+ *   - Full replacement semantics: no stale incremental state leaks in.
+ */
+function applySnapshot(snap: BuildSnapshot): BuildProgressState {
+  return {
+    phase:       snap.phase       || "downloading_iso",
+    bytesDown:   snap.bytes_done  || 0,
+    bytesTotal:  (snap.bytes_total ?? 0) > 0 ? (snap.bytes_total as number) : -1,
+    serialLines: Array.isArray(snap.serial_tail) ? snap.serial_tail : [],
+    errorMsg:    snap.error_message || "",
+  }
 }
 
 /**
@@ -119,6 +148,114 @@ function estimateETA(
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
+
+// ─── applySnapshot — reconnect-mid-build coverage (#248) ─────────────────────
+
+describe("applySnapshot — full state replacement on reconnect", () => {
+  it("should replace state with mid-build snapshot (bytes_done + bytes_total populated)", () => {
+    // Simulate: component mounts mid-download; server sends snapshot with current progress.
+    const snap: BuildSnapshot = {
+      phase:      "downloading_iso",
+      bytes_done:  500 * 1024 * 1024,
+      bytes_total: 2 * 1024 * 1024 * 1024,
+      serial_tail: [],
+    }
+    const state = applySnapshot(snap)
+    expect(state.phase).toBe("downloading_iso")
+    expect(state.bytesDown).toBe(500 * 1024 * 1024)
+    expect(state.bytesTotal).toBe(2 * 1024 * 1024 * 1024)
+    expect(state.serialLines).toHaveLength(0)
+    expect(state.errorMsg).toBe("")
+  })
+
+  it("should map bytes_total=0 to -1 (Go zero value means unknown Content-Length)", () => {
+    // This is the root cause of the '0 B' bug: Go serializes int64=0 as 0,
+    // but the web uses -1 as the sentinel for 'no content-length'.
+    const snap: BuildSnapshot = {
+      phase:      "downloading_iso",
+      bytes_done:  100 * 1024 * 1024,
+      bytes_total: 0,   // server sent zero — no Content-Length header
+    }
+    const state = applySnapshot(snap)
+    expect(state.bytesTotal).toBe(-1)
+    // bytesDown should still reflect the actual progress
+    expect(state.bytesDown).toBe(100 * 1024 * 1024)
+  })
+
+  it("should replace state when reconnecting during install phase with serial lines", () => {
+    // Simulate reconnect during Anaconda install: snapshot has serial lines.
+    const serialLines = ["anaconda started", "fetching packages", "installing kernel"]
+    const snap: BuildSnapshot = {
+      phase:      "installing",
+      bytes_done:  0,
+      bytes_total: 0,
+      serial_tail: serialLines,
+    }
+    const state = applySnapshot(snap)
+    expect(state.phase).toBe("installing")
+    expect(state.serialLines).toEqual(serialLines)
+    expect(state.serialLines).toHaveLength(3)
+  })
+
+  it("should reflect terminal failed state on reconnect", () => {
+    // Reconnecting to a build that already failed while the panel was closed.
+    const snap: BuildSnapshot = {
+      phase:         "failed",
+      bytes_done:    200 * 1024 * 1024,
+      bytes_total:   2 * 1024 * 1024 * 1024,
+      error_message: "QEMU exited with code 1",
+    }
+    const state = applySnapshot(snap)
+    expect(state.phase).toBe("failed")
+    expect(state.errorMsg).toBe("QEMU exited with code 1")
+  })
+
+  it("should reflect terminal complete state on reconnect", () => {
+    const snap: BuildSnapshot = {
+      phase:      "complete",
+      bytes_done:  2 * 1024 * 1024 * 1024,
+      bytes_total: 2 * 1024 * 1024 * 1024,
+    }
+    const state = applySnapshot(snap)
+    expect(state.phase).toBe("complete")
+    expect(state.bytesDown).toBe(2 * 1024 * 1024 * 1024)
+    expect(state.bytesTotal).toBe(2 * 1024 * 1024 * 1024)
+  })
+
+  it("should not carry over stale incremental state after reconnect", () => {
+    // Simulate: user had panel open during download (500MB), closed it,
+    // then re-opened mid-install. Stale bytesDown must not persist.
+    // The snapshot is the fresh source of truth — full replacement.
+    const stalePrev: BuildProgressState = {
+      phase:       "downloading_iso",
+      bytesDown:   500 * 1024 * 1024,
+      bytesTotal:  2 * 1024 * 1024 * 1024,
+      serialLines: ["stale line"],
+      errorMsg:    "",
+    }
+    const snap: BuildSnapshot = {
+      phase:      "installing",
+      bytes_done:  0,
+      bytes_total: 0,
+      serial_tail: ["anaconda started"],
+    }
+    // applySnapshot is a pure replacement — stalePrev is not an input.
+    const state = applySnapshot(snap)
+    // The stale bytesDown from the closed panel does NOT carry over.
+    expect(state.bytesDown).toBe(0)
+    expect(state.bytesTotal).toBe(-1)
+    expect(state.phase).toBe("installing")
+    expect(state.serialLines).toEqual(["anaconda started"])
+    // Verify stalePrev is unchanged (applySnapshot is pure).
+    expect(stalePrev.bytesDown).toBe(500 * 1024 * 1024)
+  })
+
+  it("should handle missing serial_tail gracefully (null or absent)", () => {
+    const snap: BuildSnapshot = { phase: "creating_disk" }
+    const state = applySnapshot(snap)
+    expect(state.serialLines).toEqual([])
+  })
+})
 
 describe("applyBuildEvent — phase transitions", () => {
   it("should update phase on phase event", () => {
