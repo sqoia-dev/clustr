@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.5 — 2026-05-03
+
+### Features
+
+- **Server:** ISO downloads via the `from-url` import are now cached at `/var/lib/clustr/iso-cache/` and resume on interruption. Re-importing the same URL hits cache instantly. Operators can `rm -rf` the cache dir to reclaim space (no eviction policy yet — v0.1.6 follow-up).
+- **Server:** Build serial-log ring bumped 100 → 1000 lines server-side to match UI capacity. Anaconda output no longer truncated.
+
+### Refactor
+
+- **Server:** ISO build phase emission deduplicated. Each phase fires exactly once now.
+
 ## 0.1.4 — 2026-05-03
 
 ### Features
