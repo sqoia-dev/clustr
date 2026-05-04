@@ -233,9 +233,20 @@ func (f *Factory) pullAsync(imageID, url string) {
 
 	ctx := f.ctx
 
-	rootfs, _, _, err := f.pullAndExtract(ctx, imageID, url)
+	// Acquire a progress handle if a reporter is wired in. pullAsync calls
+	// pullAndExtract which may route to buildFromISOFile (for .iso URLs); both
+	// paths emit progress events through this handle.
+	var ph BuildHandle
+	if f.BuildProgress != nil {
+		ph = f.BuildProgress.Start(imageID)
+	} else {
+		ph = noopBuildHandle{}
+	}
+
+	rootfs, _, _, err := f.pullAndExtract(ctx, imageID, url, ph)
 	if err != nil {
 		f.Logger.Error().Err(err).Str("image_id", imageID).Msg("factory: pull failed")
+		ph.Fail(err.Error())
 		_ = f.Store.UpdateBaseImageStatus(ctx, imageID, api.ImageStatusError, err.Error())
 		return
 	}
@@ -243,13 +254,18 @@ func (f *Factory) pullAsync(imageID, url string) {
 	_ = f.finalizeImageFromRootfs(ctx, imageID, rootfs, finalizeSourceMetadata{
 		BuildMethod: "pull",
 		Scrub:       false,
+		Progress:    ph,
 	})
 }
 
 // pullAndExtract downloads url, detects its format, extracts the root
 // filesystem into <ImageDir>/<imageID>/rootfs/, and returns the rootfs path,
 // the total byte-count of the rootfs tree, and a sha256 of that tree.
-func (f *Factory) pullAndExtract(ctx context.Context, imageID, url string) (rootfsPath string, sizeBytes int64, checksum string, err error) {
+//
+// ph receives phase and progress events for the download and any subsequent
+// extraction. For .iso URLs the ISO build pipeline is used and ph is wired
+// into OnPhase/OnSerialLine/OnStderrLine callbacks in the QEMU VM.
+func (f *Factory) pullAndExtract(ctx context.Context, imageID, url string, ph BuildHandle) (rootfsPath string, sizeBytes int64, checksum string, err error) {
 	imageRoot := filepath.Join(f.ImageDir, imageID)
 	rootfsPath = filepath.Join(imageRoot, "rootfs")
 	if err = os.MkdirAll(rootfsPath, 0o755); err != nil {
@@ -264,7 +280,10 @@ func (f *Factory) pullAndExtract(ctx context.Context, imageID, url string) (root
 	defer os.Remove(tmpFile.Name())
 
 	f.Logger.Info().Str("image_id", imageID).Str("url", url).Msg("factory: downloading blob")
-	if err = downloadURL(ctx, url, tmpFile); err != nil {
+	ph.SetPhase("downloading_iso")
+	if err = downloadURLWithResume(ctx, url, tmpFile, 0, func(done, total int64) {
+		ph.SetProgress(done, total)
+	}); err != nil {
 		tmpFile.Close()
 		return "", 0, "", fmt.Errorf("download %s: %w", url, err)
 	}
@@ -275,21 +294,26 @@ func (f *Factory) pullAndExtract(ctx context.Context, imageID, url string) (root
 
 	switch {
 	case ext == ".qcow2":
+		ph.SetPhase("extracting")
 		err = f.extractQcow2(ctx, imageID, tmpFile.Name(), rootfsPath)
 	case ext == ".img" || ext == ".raw":
+		ph.SetPhase("extracting")
 		err = f.extractRaw(ctx, imageID, tmpFile.Name(), rootfsPath)
 	case ext == ".tar.gz" || ext == ".tgz" || ext == ".tar":
+		ph.SetPhase("extracting")
 		err = extractTar(tmpFile.Name(), rootfsPath)
 	case ext == ".tar.zst" || ext == ".tzst":
+		ph.SetPhase("extracting")
 		err = extractTarZst(ctx, tmpFile.Name(), rootfsPath)
 	case ext == ".iso":
 		// Installer ISOs cannot be directly mounted as a deployable rootfs.
-		// Route to BuildFromISO which runs the installer in a temp QEMU VM.
+		// Route to buildFromISOFile which runs the installer in a temp QEMU VM.
 		// We pass a zero BuildFromISORequest so the method uses defaults; the
 		// distro is auto-detected from the URL.
-		return f.buildFromISOFile(ctx, imageID, url, tmpFile.Name(), imageRoot, api.BuildFromISORequest{})
+		return f.buildFromISOFile(ctx, imageID, url, tmpFile.Name(), imageRoot, api.BuildFromISORequest{}, ph)
 	default:
 		// Try treating unknown extensions as raw block images.
+		ph.SetPhase("extracting")
 		err = f.extractRaw(ctx, imageID, tmpFile.Name(), rootfsPath)
 	}
 	if err != nil {
@@ -1816,6 +1840,10 @@ func (f *Factory) ProbeISO(ctx context.Context, rawURL string) (environments []a
 // .iso URL. It hands off to the full installer pipeline using the already-
 // downloaded temp file, avoiding a second download.
 //
+// ph receives phase and progress events (generating_config, creating_disk,
+// launching_vm, installing, extracting, scrubbing) so the operator can monitor
+// the QEMU installer and serial console output in the web UI.
+//
 // Returns the rootfs path, size, and checksum just like the other extract paths.
 func (f *Factory) buildFromISOFile(
 	ctx context.Context,
@@ -1824,6 +1852,7 @@ func (f *Factory) buildFromISOFile(
 	tmpISOPath string,
 	imageRoot string,
 	req api.BuildFromISORequest,
+	ph BuildHandle,
 ) (rootfsPath string, sizeBytes int64, checksum string, err error) {
 	rootfsPath = filepath.Join(imageRoot, "rootfs")
 	if err = os.MkdirAll(rootfsPath, 0o755); err != nil {
@@ -1877,6 +1906,12 @@ func (f *Factory) buildFromISOFile(
 		DefaultPassword: defaultIfEmpty(req.DefaultPassword, "clustr"),
 		SELinuxMode:     defaultIfEmpty(req.SELinuxMode, "disabled"),
 		BaseEnvironment: req.BaseEnvironment, // empty → kickstart.go defaults to "minimal-environment"
+		BuildID:         imageID,             // used to name the systemd-run scope unit
+		// Wire progress callbacks into the build handle so the operator sees
+		// phase transitions and serial console output in the web UI.
+		OnPhase:      ph.SetPhase,
+		OnSerialLine: ph.AddSerialLine,
+		OnStderrLine: ph.AddStderrLine,
 	}
 
 	result, err := isoinstaller.Build(ctx, buildOpts)
@@ -1884,11 +1919,12 @@ func (f *Factory) buildFromISOFile(
 		return "", 0, "", fmt.Errorf("installer VM: %w", err)
 	}
 
+	ph.SetPhase("extracting")
 	extractOpts := isoinstaller.ExtractOptions{
 		RawDiskPath:   result.RawDiskPath,
 		RootfsDestDir: rootfsPath,
 	}
-	if err := isoinstaller.ExtractViaSubprocess(ctx, imageID, extractOpts, nil, nil); err != nil {
+	if err := isoinstaller.ExtractViaSubprocess(ctx, imageID, extractOpts, ph.AddSerialLine, ph.AddStderrLine); err != nil {
 		return "", 0, "", fmt.Errorf("extract rootfs: %w", err)
 	}
 
@@ -1897,10 +1933,12 @@ func (f *Factory) buildFromISOFile(
 		f.Logger.Warn().Err(dbErr).Str("image_id", imageID).Msg("factory: update disk layout (non-fatal)")
 	}
 
+	ph.SetPhase("scrubbing")
 	if err := ScrubNodeIdentity(rootfsPath); err != nil {
 		f.Logger.Warn().Err(err).Str("image_id", imageID).Msg("factory: scrub had warnings (continuing)")
 	}
 
+	ph.SetPhase("finalizing")
 	sizeBytes, checksum, err = checksumDir(rootfsPath)
 	if err != nil {
 		return "", 0, "", fmt.Errorf("checksum rootfs: %w", err)
