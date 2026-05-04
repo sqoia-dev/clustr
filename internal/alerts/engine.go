@@ -252,6 +252,13 @@ func loadRuleFile(path string) ([]*Rule, error) {
 		if err := yaml.Unmarshal(doc, &r); err != nil {
 			return nil, err
 		}
+		// Skip comment-only documents: a block of YAML comments (e.g. the file
+		// header above the first --- separator) unmarshal to a zero-value Rule.
+		// Calling Validate() on such a document would fail with "name is required",
+		// but that is a false positive — the document carries no rule data.
+		if r.Name == "" && r.Plugin == "" && r.Sensor == "" {
+			continue
+		}
 		r.sourceFile = path
 		if err := r.Validate(); err != nil {
 			return nil, err
