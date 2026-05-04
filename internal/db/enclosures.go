@@ -72,6 +72,13 @@ func (db *DB) GetEnclosure(ctx context.Context, id string) (api.Enclosure, error
 }
 
 // ListEnclosuresByRack returns all enclosures in the given rack, each with slot occupancy.
+//
+// Implementation note: SQLite with MaxOpenConns=1 serialises all statements on a
+// single connection. Calling ListSlotsByEnclosure (which opens two queries of its
+// own) while the outer enclosure cursor is still open triggers "cannot start a
+// transaction within a transaction" / context-cancelled panics. The fix is the
+// standard two-pass pattern: materialise all enclosure rows first, explicitly close
+// the cursor, then populate slot occupancy in a second pass.
 func (db *DB) ListEnclosuresByRack(ctx context.Context, rackID string) ([]api.Enclosure, error) {
 	rows, err := db.sql.QueryContext(ctx, `
 		SELECT id, rack_id, rack_slot_u, height_u, type_id, label, created_at, updated_at
@@ -81,22 +88,32 @@ func (db *DB) ListEnclosuresByRack(ctx context.Context, rackID string) ([]api.En
 	if err != nil {
 		return nil, fmt.Errorf("db: list enclosures by rack: %w", err)
 	}
-	defer rows.Close()
 
+	// Pass 1: materialise all enclosure rows before opening any nested queries.
 	var out []api.Enclosure
 	for rows.Next() {
 		enc, sErr := scanEnclosure(rows)
 		if sErr != nil {
+			rows.Close()
 			return nil, sErr
 		}
-		slots, sErr := db.ListSlotsByEnclosure(ctx, enc.ID)
+		out = append(out, enc)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("db: list enclosures by rack scan: %w", err)
+	}
+	rows.Close() // explicit close BEFORE the per-enclosure slot queries
+
+	// Pass 2: populate slot occupancy now that the outer cursor is fully closed.
+	for i := range out {
+		slots, sErr := db.ListSlotsByEnclosure(ctx, out[i].ID)
 		if sErr != nil {
 			return nil, sErr
 		}
-		enc.Slots = slots
-		out = append(out, enc)
+		out[i].Slots = slots
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // UpdateEnclosure updates the label and/or rack_slot_u of an enclosure.
