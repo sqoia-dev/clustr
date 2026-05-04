@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.6 — 2026-05-03
+
+### Fixes
+
+- **Datacenter chassis (Sprint 31 followups):** `ListEnclosuresByRack` no longer panics on rack refresh after a chassis is added (was caused by nested SQLite queries while the outer cursor was still open). Migration 100 relaxes `node_rack_position` columns (`rack_id`, `slot_u`, `height_u`) to nullable so nodes can actually be placed inside chassis — Sprint 31's NOT NULL constraint was incompatible with its own XOR trigger, making nodes unplaceable in any enclosure since Sprint 31 shipped.
+- **SELF-MON:** `collectSystemd` now logs an ERR when its 5s timeout fires (was silently returning nil, invisible in logs). Heartbeat write moved to the start of each collect cycle so slow collectors no longer trip `WatchdogSec=90`.
+
 ## 0.1.5 — 2026-05-03
 
 ### Features
