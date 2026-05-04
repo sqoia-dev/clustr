@@ -121,7 +121,7 @@ func (s *BuildProgressStore) Start(imageID string) *BuildHandle {
 			StartedAt: now,
 			UpdatedAt: now,
 		},
-		serialRing: newSerialRing(100),
+		serialRing: newSerialRing(1000),
 		stderrRing: newSerialRing(50),
 	}
 
