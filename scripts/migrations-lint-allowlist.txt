@@ -1,0 +1,37 @@
+# scripts/migrations-lint-allowlist.txt
+#
+# Format: <destroyer>:<dependent>
+#   destroyer  — migration filename whose DROP TABLE leaves a name with no live
+#                table at the same name in the same file
+#   dependent  — migration filename whose REFERENCES clause targets the dropped table
+#
+# Comments (# ...) and blank lines are ignored.
+#
+# Standing entries
+# ----------------
+# (none — the linter is currently clean against the live tree.)
+#
+# Note on 058 / 059 / 103
+# -----------------------
+# Migrations 058 and 059 use the rename-and-recreate idiom on `users`:
+#
+#     ALTER TABLE users RENAME TO _users_old;
+#     CREATE TABLE users ( ... new CHECK ... );
+#     INSERT INTO users SELECT * FROM _users_old;
+#     DROP TABLE _users_old;
+#
+# Statically this is a REBUILD of `users` (a fresh CREATE TABLE follows the
+# rename), so the linter does not flag it.  The runtime dangling-FK issue we
+# repaired in migration 103 was a SQLite-version interaction (>=3.26.0 rewrites
+# FK targets in sqlite_master during RENAME unless legacy_alter_table=ON), not
+# a static SQL bug.  db.go's migration runner now sets legacy_alter_table=ON
+# before applying any migration, so this class of bug is mitigated at the
+# runtime layer; the post-migration foreign_key_check guard in db.go is the
+# belt-and-braces backstop for migrations the linter cannot reason about.
+#
+# What the linter catches
+# -----------------------
+# Any FUTURE migration that DROPs a table without rebuilding it (no CREATE TABLE
+# of the same name in the same file, no RENAME _new TO original) while another
+# migration has REFERENCES <table> in a still-live CREATE TABLE.  That is the
+# exact bug class we're forward-protecting against.

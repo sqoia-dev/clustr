@@ -47,6 +47,13 @@ jobs:
       - name: go build (verify compilation)
         run: go build -tags webdist ./...
 
+      # #250 Q6a — static linter for SQLite migrations.  Catches the bug class
+      # we hit in 058/059: a DROP TABLE that leaves no live table at the same
+      # name, while another migration has REFERENCES <table>(...) — produces
+      # dangling FK references in sqlite_master that crash any later INSERT.
+      - name: migrations linter
+        run: bash scripts/migrations-lint.sh
+
   test:
     name: Test
     runs-on: ubuntu-latest
