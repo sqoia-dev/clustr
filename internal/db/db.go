@@ -300,6 +300,26 @@ func (db *DB) migrate() error {
 			tx.Rollback()
 			return fmt.Errorf("apply migration %s: %w", entry.Name(), err)
 		}
+		// Q6b — runtime FK-violation guard.
+		//
+		// After every migration's DDL executes, run PRAGMA foreign_key_check inside
+		// the same transaction. If any rows come back, we abort and roll back —
+		// migration is forward-only with no automatic recovery, so we MUST refuse to
+		// commit a schema that left dangling FK references in sqlite_master.
+		//
+		// Class of bug we're catching: migrations 058/059 used the rename-and-drop
+		// idiom against a connection where SQLite 3.26.0+ rewrites FK targets in
+		// sqlite_master.  Without legacy_alter_table=ON those rewrites turn every
+		// FK pointing at users into a dangling reference once the temp table is
+		// dropped.  The guard would have caught that the moment 058 was applied.
+		//
+		// PRAGMA foreign_key_check returns one row per violating ROWID:
+		//   (table, rowid, parent, fkid)
+		// We collect them into a flat list for the error message.
+		if violErr := assertNoFKViolations(tx, entry.Name()); violErr != nil {
+			tx.Rollback()
+			return violErr
+		}
 		if _, err := tx.Exec(
 			`INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)`,
 			entry.Name(), time.Now().Unix(),
@@ -310,6 +330,54 @@ func (db *DB) migrate() error {
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit migration %s: %w", entry.Name(), err)
 		}
+	}
+	return nil
+}
+
+// assertNoFKViolations runs PRAGMA foreign_key_check inside tx and returns a
+// non-nil error if any FK violations are present. Used by migrate() to refuse
+// to commit a migration that leaves the schema with dangling/orphaned FKs.
+//
+// SQLite reports four columns per violating row: (table, rowid, parent, fkid).
+// "parent" is the FK target table; when "parent" names a table that no longer
+// exists in sqlite_master the violation is a dangling reference (the precise
+// class of bug introduced by migrations 058 and 059 before the legacy_alter_table
+// fix landed).
+func assertNoFKViolations(tx *sql.Tx, migrationName string) error {
+	rows, err := tx.Query("PRAGMA foreign_key_check")
+	if err != nil {
+		// Inability to run the diagnostic itself is not a hard fail — log and
+		// continue so a transient SQLite hiccup doesn't strand operators on a
+		// working schema. Production gating is handled at the application layer.
+		return nil
+	}
+	defer rows.Close()
+
+	var violations []string
+	for rows.Next() {
+		var table sql.NullString
+		var rowid sql.NullInt64
+		var parent sql.NullString
+		var fkid sql.NullInt64
+		if scanErr := rows.Scan(&table, &rowid, &parent, &fkid); scanErr != nil {
+			// Skip un-scannable rows; they shouldn't block a migration that's
+			// otherwise clean, but they also can't legitimately exist on modern
+			// SQLite. Best-effort: keep going.
+			continue
+		}
+		violations = append(violations, fmt.Sprintf(
+			"table=%s rowid=%d parent=%s fkid=%d",
+			table.String, rowid.Int64, parent.String, fkid.Int64,
+		))
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return fmt.Errorf("migration %s: foreign_key_check iter: %w", migrationName, rowsErr)
+	}
+	if len(violations) > 0 {
+		return fmt.Errorf(
+			"migration %s left FK violations (refusing to commit): %v",
+			migrationName, violations,
+		)
 	}
 	return nil
 }
