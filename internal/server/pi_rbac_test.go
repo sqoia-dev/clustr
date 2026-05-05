@@ -84,7 +84,15 @@ func TestPICannotReachAdmin(t *testing.T) {
 }
 
 // TestPINodeGroupOwnership verifies the DB ownership check.
+//
+// SKIPPED — #250: migration 103 dropped node_groups.pi_user_id (dangling FK to
+// _users_old).  The PI workflow tested here (SetNodeGroupPI / IsNodeGroupOwnedByPI)
+// is dead code per the founder's "wiped scope stays wiped" directive; this test
+// and its sibling TestPIMemberRequestCreate exercise that code path and break
+// when the column is dropped.  Removing the dead Go code is a separate scope
+// (identity-model redesign-by-another-name) deliberately deferred from #250.
 func TestPINodeGroupOwnership(t *testing.T) {
+	t.Skip("PI workflow wiped 2026-04-29; column dropped in migration 103; dead Go code awaits follow-up cleanup")
 	database := newTestDB(t)
 
 	// Create two users.
@@ -134,7 +142,10 @@ func TestPINodeGroupOwnership(t *testing.T) {
 }
 
 // TestPIMemberRequestCreate verifies creating and resolving a PI member request.
+//
+// SKIPPED — see TestPINodeGroupOwnership above.  Same dead-workflow scope.
 func TestPIMemberRequestCreate(t *testing.T) {
+	t.Skip("PI workflow wiped 2026-04-29; column dropped in migration 103; dead Go code awaits follow-up cleanup")
 	database := newTestDB(t)
 
 	piID := "pi-user-001"

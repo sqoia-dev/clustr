@@ -358,6 +358,39 @@ func (s *Server) StartBackgroundWorkers(ctx context.Context) {
 	go s.runImageReconciler(ctx, reconcileInterval())
 	// #243: SELF-MON — control-plane host self-monitoring.
 	go s.runSelfmon(ctx)
+	// #250 Q2: api_keys expiration sweeper.
+	// Reaps any api_keys row whose expires_at is in the past so the table doesn't
+	// accumulate dead node-scope tokens (24h TTL each, minted on every PXE boot).
+	go s.runAPIKeySweeper(ctx)
+}
+
+// runAPIKeySweeper ticks every 5 minutes and DELETEs api_keys rows whose
+// expires_at is in the past. Lifecycle: started by StartBackgroundWorkers,
+// cancelled when ctx is cancelled (graceful shutdown via the SIGTERM/SIGINT
+// handler in cmd/clustr-serverd/main.go).  Issues only DELETEs against the
+// shared *sql.DB, so no goroutine-local state to protect — modernc.org/sqlite
+// serialises writes via the single-conn pool already (db.go:62).
+func (s *Server) runAPIKeySweeper(ctx context.Context) {
+	const interval = 5 * time.Minute
+	log.Info().Str("interval", interval.String()).Msg("api-key sweeper: started")
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info().Msg("api-key sweeper: stopping")
+			return
+		case <-ticker.C:
+			n, err := s.db.SweepExpiredAPIKeys(ctx, time.Now())
+			if err != nil {
+				log.Error().Err(err).Msg("api-key sweeper: failed")
+				continue
+			}
+			if n > 0 {
+				log.Info().Int64("rows", n).Msg("api-key sweeper: deleted expired rows")
+			}
+		}
+	}
 }
 
 // runDigestProcessor polls the notification digest queue every hour and sends
@@ -2472,8 +2505,20 @@ func (s *Server) buildUsersHandler() *handlers.UsersHandler {
 
 // buildAPIKeysHandler constructs the APIKeysHandler with closures that call into
 // the server's DB and key-generation functions without causing circular imports.
+//
+// user_id ownership: web UI mints carry the session user's id (every web caller
+// hits this through apiKeyAuth which populates ctxKeyUserID).  Bearer-token
+// callers (admin keys hitting POST /admin/api-keys directly) carry the user_id
+// of the key they authenticated with, which itself was minted by some user.
+// Falls back to the bootstrap admin only as a last resort — that only fires when
+// dev-mode auth is enabled (CLUSTR_AUTH_DEV_MODE=1), where there is no real
+// caller identity at all.
 func (s *Server) buildAPIKeysHandler() *handlers.APIKeysHandler {
 	mintFn := func(r *http.Request, scope api.KeyScope, nodeID, label, createdBy string, expiresAt *time.Time) (string, string, string, error) {
+		userID, err := s.resolveCallerUserID(r)
+		if err != nil {
+			return "", "", "", err
+		}
 		raw, err := generateRawKey()
 		if err != nil {
 			return "", "", "", err
@@ -2486,6 +2531,7 @@ func (s *Server) buildAPIKeysHandler() *handlers.APIKeysHandler {
 			KeyHash:   keyHash,
 			Label:     label,
 			CreatedBy: createdBy,
+			UserID:    userID,
 			CreatedAt: time.Now(),
 			ExpiresAt: expiresAt,
 		}
@@ -2504,6 +2550,29 @@ func (s *Server) buildAPIKeysHandler() *handlers.APIKeysHandler {
 		MintKey:       mintFn,
 		GetActorLabel: actorLabelFn,
 	}
+}
+
+// resolveCallerUserID extracts the user_id associated with the current request.
+// Resolution order:
+//
+//  1. Session cookie auth → ctxKeyUserID directly.
+//  2. Bearer token auth → user_id of the api_keys row that auth'd the request.
+//  3. Fallback (dev-mode, auto-register, or stale chains) → bootstrap admin.
+//
+// The fallback exists because pre-103 keys carried no user_id and the migration
+// backfilled all of them to the bootstrap admin; we extend the same convention
+// to in-flight requests where no chain identity is recoverable.
+func (s *Server) resolveCallerUserID(r *http.Request) (string, error) {
+	ctx := r.Context()
+	if uid := userIDFromContext(ctx); uid != "" {
+		return uid, nil
+	}
+	if kid := keyIDFromContext(ctx); kid != "" {
+		if rec, err := s.db.GetAPIKey(ctx, kid); err == nil && rec.UserID != "" {
+			return rec.UserID, nil
+		}
+	}
+	return resolveBootstrapAdminID(ctx, s.db)
 }
 
 // repoCacheMiddleware wraps a repo file-server handler and sets Cache-Control

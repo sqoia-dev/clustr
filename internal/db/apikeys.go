@@ -11,6 +11,13 @@ import (
 )
 
 // APIKeyRecord is the persisted representation of an API key (hash only, never the raw key).
+//
+// UserID — the users(id) of the operator who owns this key.  Required (NOT NULL
+// at the schema level since migration 103).  The token invariant: every api_keys
+// row must trace back to an app user; admin-scope keys minted via the web UI carry
+// the session user's id, node-scope keys minted at PXE serve time carry the
+// bootstrap admin's id (or the operator-of-record once the boot handler grows
+// session attribution).
 type APIKeyRecord struct {
 	ID          string
 	Scope       api.KeyScope
@@ -19,6 +26,7 @@ type APIKeyRecord struct {
 	Description string
 	Label       string     // human-readable operator label, e.g. "robert-laptop"
 	CreatedBy   string     // label of key/session that created this key (audit attribution)
+	UserID      string     // users(id) of the owning operator; required
 	CreatedAt   time.Time
 	ExpiresAt   *time.Time // nil = no expiry
 	RevokedAt   *time.Time // non-nil = soft-deleted, rejected by middleware
@@ -37,7 +45,15 @@ type APIKeyLookupResult struct {
 var ErrRevoked = fmt.Errorf("api key revoked")
 
 // CreateAPIKey inserts a new hashed API key record.
+//
+// Pre-condition: rec.UserID must reference an extant users(id).  Migration 103
+// made api_keys.user_id NOT NULL; INSERTs without a user_id will fail at the
+// SQLite layer with a NOT NULL constraint violation.  Callers thread the user_id
+// from the session (web UI) or from the bootstrap admin (boot handler / CLI).
 func (db *DB) CreateAPIKey(ctx context.Context, rec APIKeyRecord) error {
+	if rec.UserID == "" {
+		return fmt.Errorf("db: create api_key: user_id is required (post-103 invariant)")
+	}
 	var expiresAt interface{}
 	if rec.ExpiresAt != nil {
 		expiresAt = rec.ExpiresAt.Unix()
@@ -55,9 +71,9 @@ func (db *DB) CreateAPIKey(ctx context.Context, rec APIKeyRecord) error {
 		createdBy = rec.CreatedBy
 	}
 	_, err := db.sql.ExecContext(ctx,
-		`INSERT INTO api_keys (id, scope, node_id, key_hash, description, label, created_by, created_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		rec.ID, string(rec.Scope), nodeID, rec.KeyHash, rec.Description, label, createdBy, rec.CreatedAt.Unix(), expiresAt,
+		`INSERT INTO api_keys (id, scope, node_id, key_hash, description, label, created_by, created_at, expires_at, user_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		rec.ID, string(rec.Scope), nodeID, rec.KeyHash, rec.Description, label, createdBy, rec.CreatedAt.Unix(), expiresAt, rec.UserID,
 	)
 	if err != nil {
 		return fmt.Errorf("db: create api_key: %w", err)
@@ -133,7 +149,12 @@ func (db *DB) RevokeNodeScopedKeys(ctx context.Context, nodeID string) error {
 // RevokeAndCreateNodeScopedKey atomically revokes all existing node-scoped keys for
 // nodeID and inserts rec in a single SQLite transaction. This closes the window between
 // the revoke and create steps where the node would momentarily have no valid key.
+//
+// Pre-condition: rec.UserID must reference an extant users(id) (NOT NULL since 103).
 func (db *DB) RevokeAndCreateNodeScopedKey(ctx context.Context, nodeID string, rec APIKeyRecord) error {
+	if rec.UserID == "" {
+		return fmt.Errorf("db: revoke-and-create node scoped key: user_id is required (post-103 invariant)")
+	}
 	tx, err := db.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("db: begin revoke-and-create tx: %w", err)
@@ -166,9 +187,9 @@ func (db *DB) RevokeAndCreateNodeScopedKey(ctx context.Context, nodeID string, r
 		createdBy = rec.CreatedBy
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO api_keys (id, scope, node_id, key_hash, description, label, created_by, created_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		rec.ID, string(rec.Scope), nodeIDVal, rec.KeyHash, rec.Description, label, createdBy, rec.CreatedAt.Unix(), expiresAt,
+		`INSERT INTO api_keys (id, scope, node_id, key_hash, description, label, created_by, created_at, expires_at, user_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		rec.ID, string(rec.Scope), nodeIDVal, rec.KeyHash, rec.Description, label, createdBy, rec.CreatedAt.Unix(), expiresAt, rec.UserID,
 	); err != nil {
 		tx.Rollback() //nolint:errcheck
 		return fmt.Errorf("db: create node scoped key (tx): %w", err)
@@ -200,7 +221,7 @@ func (db *DB) CountAPIKeysByScope(ctx context.Context, scope api.KeyScope) (int,
 // ListAPIKeys returns all non-revoked API key records (without the hash, for display).
 func (db *DB) ListAPIKeys(ctx context.Context) ([]APIKeyRecord, error) {
 	rows, err := db.sql.QueryContext(ctx,
-		`SELECT id, scope, node_id, key_hash, description, label, created_by, created_at, expires_at, revoked_at, last_used_at
+		`SELECT id, scope, node_id, key_hash, description, label, created_by, user_id, created_at, expires_at, revoked_at, last_used_at
 		 FROM api_keys WHERE revoked_at IS NULL ORDER BY created_at DESC`,
 	)
 	if err != nil {
@@ -215,11 +236,12 @@ func (db *DB) ListAPIKeys(ctx context.Context) ([]APIKeyRecord, error) {
 		var nodeID sql.NullString
 		var label sql.NullString
 		var createdBy sql.NullString
+		var userID sql.NullString
 		var createdAt int64
 		var expiresAt sql.NullInt64
 		var revokedAt sql.NullInt64
 		var lastUsedAt sql.NullInt64
-		if err := rows.Scan(&rec.ID, &scope, &nodeID, &rec.KeyHash, &rec.Description, &label, &createdBy, &createdAt, &expiresAt, &revokedAt, &lastUsedAt); err != nil {
+		if err := rows.Scan(&rec.ID, &scope, &nodeID, &rec.KeyHash, &rec.Description, &label, &createdBy, &userID, &createdAt, &expiresAt, &revokedAt, &lastUsedAt); err != nil {
 			return nil, fmt.Errorf("db: scan api_key: %w", err)
 		}
 		rec.Scope = api.KeyScope(scope)
@@ -232,6 +254,9 @@ func (db *DB) ListAPIKeys(ctx context.Context) ([]APIKeyRecord, error) {
 		}
 		if createdBy.Valid {
 			rec.CreatedBy = createdBy.String
+		}
+		if userID.Valid {
+			rec.UserID = userID.String
 		}
 		if expiresAt.Valid {
 			t := time.Unix(expiresAt.Int64, 0)
@@ -257,15 +282,16 @@ func (db *DB) GetAPIKey(ctx context.Context, id string) (APIKeyRecord, error) {
 	var nodeID sql.NullString
 	var label sql.NullString
 	var createdBy sql.NullString
+	var userID sql.NullString
 	var createdAt int64
 	var expiresAt sql.NullInt64
 	var revokedAt sql.NullInt64
 	var lastUsedAt sql.NullInt64
 
 	err := db.sql.QueryRowContext(ctx,
-		`SELECT id, scope, node_id, key_hash, description, label, created_by, created_at, expires_at, revoked_at, last_used_at
+		`SELECT id, scope, node_id, key_hash, description, label, created_by, user_id, created_at, expires_at, revoked_at, last_used_at
 		 FROM api_keys WHERE id = ?`, id,
-	).Scan(&rec.ID, &scope, &nodeID, &rec.KeyHash, &rec.Description, &label, &createdBy, &createdAt, &expiresAt, &revokedAt, &lastUsedAt)
+	).Scan(&rec.ID, &scope, &nodeID, &rec.KeyHash, &rec.Description, &label, &createdBy, &userID, &createdAt, &expiresAt, &revokedAt, &lastUsedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return APIKeyRecord{}, sql.ErrNoRows
 	}
@@ -282,6 +308,9 @@ func (db *DB) GetAPIKey(ctx context.Context, id string) (APIKeyRecord, error) {
 	}
 	if createdBy.Valid {
 		rec.CreatedBy = createdBy.String
+	}
+	if userID.Valid {
+		rec.UserID = userID.String
 	}
 	if expiresAt.Valid {
 		t := time.Unix(expiresAt.Int64, 0)
@@ -325,6 +354,27 @@ func (db *DB) DeleteAPIKey(ctx context.Context, id string) error {
 		return fmt.Errorf("db: delete api_key: %w", err)
 	}
 	return nil
+}
+
+// SweepExpiredAPIKeys hard-deletes any api_keys row whose expires_at is set and
+// already in the past. Returns the number of rows removed.
+//
+// Called periodically by the token sweeper goroutine in clustr-serverd
+// (#250 Q2). Soft-revoked keys (revoked_at IS NOT NULL) without an expires_at
+// remain in place; only past-expiry rows are reaped.
+func (db *DB) SweepExpiredAPIKeys(ctx context.Context, now time.Time) (int64, error) {
+	res, err := db.sql.ExecContext(ctx,
+		`DELETE FROM api_keys WHERE expires_at IS NOT NULL AND expires_at < ?`,
+		now.Unix(),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("db: sweep expired api_keys: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("db: sweep expired api_keys rows: %w", err)
+	}
+	return n, nil
 }
 
 // UpdateAPIKeyExpiry sets the expires_at column for a key by ID. Used in tests to force expiry.
